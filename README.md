@@ -3,7 +3,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/source/assets/logos/angelslim_logo_light.png">
-    <img alt="AngelSlim" src="./docs/source/assets/logos/angelslim_logo.png" width=45%>
+    <img alt="AngelSlim" src="./docs/source/assets/logos/angelslim_logo.png" width=55%>
   </picture>
 </p>
 
@@ -30,7 +30,7 @@
 - [引用](#引用)
 - [技术交流](#技术交流)
 
-## 📣 最新进展
+## 📣最新进展
 
 - [25/07/04] 我们支持了`Hunyuan/Qwen2.5/Qwen3/DeepSeek-R1-Distill-Qwen`等模型的量化，包含INT8、FP8、INT4等算法。
 我们还开源了`Qwen3-8B`模型的Eagle3权重。
@@ -40,13 +40,13 @@ Coming soon：
 - [ ] 多模态Qwen-VL模型的量化支持
 - [ ] 投机采样新算法发布
 
-## 🌟 主要特性
+## 🌟主要特性
 
 - **高度集成化**：本工具将主流的压缩算法集成到工具，开发者可一键式调用，具有很好的易用性。
 - **持续算法创新**：本工具除了集成工业界使用最广的算法，还持续自研更好的压缩算法，并且会陆续开源。
 - **追求极致性能**：在模型压缩流程、压缩算法部署方面，本工具持续端到端优化，例如单卡GPU可量化Qwen3-235B和Deepseek-R1。
 
-## 💼 支持模型
+## 💼支持模型
 
 ### 量化
 目前已支持文生文任务Hunyuan-Dense、Hunyuan-MoE、Qwen3-Dense、Qwen3-MoE、Qwen2.5、DeepSeek-R1蒸馏Qwen模型、QwQ等系列的主要模型：
@@ -70,7 +70,7 @@ Coming soon：
 | Qwen3-14B | coming soon |
 | Qwen3-32B | coming soon |
 
-## 🛎️ 如何使用
+## 🛎️如何使用
 
 ### 安装 AngelSlim
 
@@ -120,7 +120,7 @@ cd AngelSlim && python setup.py install
 
 详情请参考[快速开始文档](./docs/source/getting_started/quickstrat.md)。
 
-### 🖥️ 部署与测试
+### 部署与测试
 
 #### 1. 服务部署
 
@@ -160,7 +160,7 @@ bash deploy/lm_eval.sh $MODEL_PATH
 
 详细操作指南请参阅[部署文档](./docs/source/deployment/deploy.md)。
 
-## 📈 Benchmark
+## 📈Benchmark
 
 ### 量化
 
@@ -265,10 +265,10 @@ Qwen3系列的Eagle3模型在MT-bench/HunmanEval/GSM8K/Alpaca上的加速结果�
 | T=1         | Eagle3 | 1.98x    | 2.75         | 2.25x     | 3.11            | 2.31x   | 3.15          | 2.10x   | 2.76   |
 
 
-## 📝 许可协议
+## 📝许可协议
 本项目的代码依照 [License for AngelSlim](LICENSE) 协议开源。
 
-## 🔗 引用
+## 🔗引用
 ```
 @software{AngelSlim2025,
     title={{AngelSlim}},
@@ -279,6 +279,6 @@ Qwen3系列的Eagle3模型在MT-bench/HunmanEval/GSM8K/Alpaca上的加速结果�
 }
 ```
 
-## 💬 技术交流
+## 💬技术交流
 
 - AngelSlim正在快速迭代更新中，后续会推出更多的功能，有问题或建议欢迎通过GitHub Issues给我们提issue，或者加入[微信技术交流群](./docs/source/assets/angel_slim_wechat.png)。

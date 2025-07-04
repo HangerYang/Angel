@@ -3,7 +3,7 @@ English | [简体中文](README.md)
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/source/assets/logos/angelslim_logo_light.png">
-    <img alt="AngelSlim" src="./docs/source/assets/logos/angelslim_logo.png" width=45%>
+    <img alt="AngelSlim" src="./docs/source/assets/logos/angelslim_logo.png" width=55%>
   </picture>
 </p>
 
@@ -18,37 +18,36 @@ Dedicated to building a more intuitive, comprehensive, and efficient LLMs compre
 
 ## Table of Contents
 
-* [Latest Updates](#latest-updates)
-* [Key Features](#key-features)
-* [Supported Models](#supported-models)
-* [How to Use](#how-to-use)
+- [Latest Updates](#latest-updates)
+- [Key Features](#key-features)
+- [Supported Models](#supported-models)
+- [How to Use](#how-to-use)
+  - [Install AngelSlim](#install-angelslim)
+  - [Quick Start](#quick-start)
+  - [deployment & Evaluation](#deployment)
+- [Benchmark](#benchmark)
+- [License](#license)
+- [Citation](#citation)
+- [Technical Discussion](#technical-discussion)
 
-  * [Install AngelSlim](#install-angelslim)
-  * [Quick Start](#quick-start)
-  * [deployment & Evaluation](#deployment)
-* [Benchmark](#benchmark)
-* [License](#license)
-* [Citation](#citation)
-* [Technical Discussion](#technical-discussion)
+## 📣Latest Updates
 
-## 📣 Latest Updates
-
-* \[25/07/04] We now support quantization for Hunyuan/Qwen2.5/Qwen3/DeepSeek-R1-Distill-Qwen and other models, including INT8/FP8/INT4 algorithms.
+- [25/07/04] We now support quantization for Hunyuan/Qwen2.5/Qwen3/DeepSeek-R1-Distill-Qwen and other models, including INT8/FP8/INT4 algorithms.
               We also opensource Qwen3-8B`s Eagle3 model weight.
 
 Coming soon:
 
-* [ ] Support W4A8 quantization for DeepSeek-R1.
-* [ ] Support quantization for multimodal models like Qwen-VL.
-* [ ] Release of new algorithm for speculative sampling.
+- [ ] Support W4A8 quantization for DeepSeek-R1.
+- [ ] Support quantization for multimodal models like Qwen-VL.
+- [ ] Release of new algorithm for speculative sampling.
 
-## 🌟 Key Features
+## 🌟Key Features
 
-* **Highly Integrated**: This toolkit integrates mainstream compression algorithms into a unified framework, offering developers one-click access with exceptional ease of use.
-* **Continuous Innovation**: Beyond integrating widely-used industry algorithms, we are continuously researching better compression algorithms, which will be gradually open-sourced in the future.
-* **Performance-Driven**: We continuously optimize end-to-end performance in model compression workflows and algorithm deployment, such as enabling quantization of models like Qwen3-235B and DeepSeek-R1 on a single GPU.
+- **Highly Integrated**: This toolkit integrates mainstream compression algorithms into a unified framework, offering developers one-click access with exceptional ease of use.
+- **Continuous Innovation**: Beyond integrating widely-used industry algorithms, we are continuously researching better compression algorithms, which will be gradually open-sourced in the future.
+- **Performance-Driven**: We continuously optimize end-to-end performance in model compression workflows and algorithm deployment, such as enabling quantization of models like Qwen3-235B and DeepSeek-R1 on a single GPU.
 
-## 💼 Supported Models
+## 💼Supported Models
 
 ### Quantization
 Currently supports the following LLMs, including Hunyuan-Dense, Hunyuan-MoE, Qwen3-Dense, Qwen3-MoE, Qwen2.5, DeepSeek-R1 distilled Qwen models, and QwQ::
@@ -72,7 +71,7 @@ The Eagle3 weights for the Qwen3-8B model are now available, with Eagle3 weights
 | Qwen3-14B | coming soon |
 | Qwen3-32B | coming soon |
 
-## 🛎️ How to Use
+## 🛎️How to Use
 
 ### Install AngelSlim
 
