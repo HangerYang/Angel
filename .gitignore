@@ -1,0 +1,17 @@
+*.DS_Store
+*.egg-info
+build/
+./dist/
+*.pyc
+dist/
+*.data
+*.log
+*.tar
+*.tar.gz
+*.zip
+*.exc.*
+eval/
+*_ckpt*/
+output/
+outs/
+__pycache__/
