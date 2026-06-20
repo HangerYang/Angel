@@ -110,6 +110,7 @@ class BaseLLMModel(metaclass=ABCMeta):
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=trust_remote_code
         )
+        print_info("Finish load model.")
 
     def init_ptq(self, slim_config):
         """
@@ -219,6 +220,37 @@ class BaseLLMModel(metaclass=ABCMeta):
     def get_observer_values(self):
         self.weight_observer_amax_dict = copy.deepcopy(self.weight_scales_dict)
         self.input_observer_amax_dict = copy.deepcopy(self.act_scales_dict)
+
+    def fuse_observer_amax_weight_only(self, name):
+        """Fuse weight observer amax for weight-only quantization.
+
+        For gate_proj/up_proj pairs (and qkv groups), returns the max amax
+        across the group so they share the same weight_scale_2, matching
+        vLLM's fused gate_up_proj kernel expectation.
+        """
+        if "gate_proj" in name or "up_proj" in name:
+            prefix = name.rsplit(".", 1)[0]
+            gate_name = f"{prefix}.gate_proj"
+            up_name = f"{prefix}.up_proj"
+
+            weight_scales = []
+            for key in [gate_name, up_name]:
+                if key in self.weight_observer_amax_dict:
+                    weight_scales.append(self.weight_observer_amax_dict[key])
+            if weight_scales:
+                return max(weight_scales)
+        elif "q_proj" in name or "k_proj" in name or "v_proj" in name:
+            prefix = name.rsplit(".", 1)[0]
+            qkv_names = [f"{prefix}.q_proj", f"{prefix}.k_proj", f"{prefix}.v_proj"]
+
+            weight_scales = []
+            for key in qkv_names:
+                if key in self.weight_observer_amax_dict:
+                    weight_scales.append(self.weight_observer_amax_dict[key])
+            if weight_scales:
+                return max(weight_scales)
+
+        return self.weight_observer_amax_dict[name]
 
     def get_kvcache_observer_layers_names(self, observe_names):
         names = ["self_attn.k_proj", "self_attn.v_proj"]
