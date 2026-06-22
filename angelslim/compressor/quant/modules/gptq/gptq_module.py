@@ -46,7 +46,11 @@ class GPTQModule:
         # Handle 4D input (e.g., Conv2d or multi-head attention internals)
         if len(inp.shape) == 4:
             inp = inp[0, 0, :, :]
-        # Flatten to 2D: [total_tokens, feature_dim]
+        if len(inp.shape) == 3 and inp.shape[0] == 1:
+            inp = inp[0]
+        if len(inp.shape) == 2:
+            inp = inp.unsqueeze(0)
+        tmp = inp.shape[0]
         if len(inp.shape) == 3:
             inp = inp.reshape((-1, inp.shape[-1]))
         inp = inp.float()
@@ -56,6 +60,14 @@ class GPTQModule:
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp
         self.h += inp.matmul(inp.t())
+
+    def compute_quant_params(self, x, bits, sym):
+        return compute_scales_with_zero(x, bits=bits, sym=sym)
+
+    def quant_dequant(self, x, weight_scale, weight_zero):
+        maxq = torch.tensor(2**self.quant_bits - 1, device=x.device)
+        q = torch.clamp(torch.round(x / weight_scale) + weight_zero, 0, maxq)
+        return weight_scale * (q - weight_zero)
 
     def fasterquant(
         self,
@@ -69,7 +81,7 @@ class GPTQModule:
 
         tick = time.time()
 
-        hessian = self.h
+        hessian = self.h.float()
         if torch.isnan(hessian).any():
             print_info("[error] Hessian contains nan!")
             exit()
@@ -79,25 +91,27 @@ class GPTQModule:
         hessian[dead, dead] = 1
         w_weight[:, dead] = 0
 
-        g_idx = []
         scale = []
         zero = []
         now_idx = 1
         static_groups = True
+        effective_group_size = group_size if group_size != -1 else self.columns
+        input_perm = None
+
+        if actorder:
+            input_perm = torch.argsort(torch.diag(hessian), descending=True)
+            w_weight = w_weight[:, input_perm]
+            hessian = hessian[input_perm][:, input_perm]
 
         if static_groups:
-            for i in range(0, self.columns, group_size):
-                weight_scale, weight_zero = compute_scales_with_zero(
-                    w_weight[:, i : (i + group_size)], bits=self.quant_bits, sym=sym
+            for i in range(0, self.columns, effective_group_size):
+                weight_scale, weight_zero = self.compute_quant_params(
+                    w_weight[:, i : (i + effective_group_size)],
+                    bits=self.quant_bits,
+                    sym=sym,
                 )
                 scale.append(weight_scale)
                 zero.append(weight_zero)
-
-        if actorder:
-            perm = torch.argsort(torch.diag(hessian), descending=True)
-            w_weight = w_weight[:, perm]
-            hessian = hessian[perm][:, perm]
-            invperm = torch.argsort(perm)
 
         losses = torch.zeros_like(w_weight)
         q_weight = torch.zeros_like(w_weight)
@@ -131,29 +145,23 @@ class GPTQModule:
                 w = w1[:, i]
                 d = hinv1[i, i]
 
-                if group_size != -1:
-                    if not static_groups:
-                        if (i1 + i) % group_size == 0:
-                            weight_scale, weight_zero = compute_scales_with_zero(
-                                w_weight[:, (i1 + i) : (i1 + i + group_size)],
-                                bits=self.quant_bits,
-                                sym=sym,
-                            )
+                if not static_groups:
+                    if (i1 + i) % effective_group_size == 0:
+                        weight_scale, weight_zero = self.compute_quant_params(
+                            w_weight[:, (i1 + i) : (i1 + i + effective_group_size)],
+                            bits=self.quant_bits,
+                            sym=sym,
+                        )
 
-                        if ((i1 + i) // group_size) - now_idx == -1:
-                            scale.append(weight_scale)
-                            zero.append(weight_zero)
-                            now_idx += 1
-                    else:
-                        idx = i1 + i
-                        if actorder:
-                            idx = perm[idx]
-                        weight_scale = scale[idx // group_size]
-                        weight_zero = zero[idx // group_size]
+                    if ((i1 + i) // effective_group_size) - now_idx == -1:
+                        scale.append(weight_scale)
+                        zero.append(weight_zero)
+                        now_idx += 1
+                else:
+                    weight_scale = scale[(i1 + i) // effective_group_size]
+                    weight_zero = zero[(i1 + i) // effective_group_size]
 
-                maxq = torch.tensor(2**self.quant_bits - 1)
-                q = torch.clamp(torch.round(w.unsqueeze(1) / weight_scale) + weight_zero, 0, maxq)
-                q = weight_scale * (q - weight_zero)
+                q = self.quant_dequant(w.unsqueeze(1), weight_scale, weight_zero)
                 q = q.flatten()
                 q1[:, i] = q
                 losses1[:, i] = (w - q) ** 2 / d**2
@@ -167,22 +175,16 @@ class GPTQModule:
 
             w_weight[:, i2:] -= err1.matmul(hinv[i1:i2, i2:])
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         print_info(f" duration: {(time.time() - tick)}")
+        print_info(f" avg loss: {torch.sum(losses).item() / self.nsamples}")
 
-        group_size = group_size if group_size != -1 else self.columns
-        if static_groups and actorder:
-            g_idx = perm // group_size
-        else:
-            g_idx = torch.arange(self.columns, device=q_weight.device) // group_size
-        g_idx = g_idx.to(dtype=torch.int32)
-        if actorder:
-            q_weight = q_weight[:, invperm]
-            g_idx = g_idx[invperm]
-
+        target_weight = self.layer.weight.data
+        if input_perm is not None:
+            target_weight = target_weight[:, input_perm]
         norm_loss = torch.norm(
-            q_weight.reshape(self.layer.weight.shape).type_as(self.layer.weight.data)
-            - self.layer.weight.data
+            q_weight.reshape(self.layer.weight.shape).type_as(target_weight) - target_weight
         )
 
         all_norm_loss = [norm_loss]
@@ -206,11 +208,13 @@ class GPTQModule:
         del losses, q_weight, w_weight, hessian, hinv
         self.w = self.w.cpu()
         del self.w
-        torch.cuda.empty_cache()
-        return scale, zero, g_idx
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return scale, zero, input_perm
 
     def free(self):
         self.h = None
         self.w = None
         self.losses = None
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
