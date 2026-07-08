@@ -55,12 +55,20 @@ class PTQ:
         # trasform first, then run quantization
         self.transform_runner.run()
 
-        if "fp8" in self.quant_algo or "int8" in self.quant_algo or "nvfp4" in self.quant_algo:
+        # NVFP4 weight-only GPTQ (``nvfp4_gptq``) is driven by the GPTQ runner
+        # and computes its scales directly from weights, so it must NOT install
+        # the activation/weight observer hook even though "nvfp4" is in algo.
+        is_gptq = "gptq" in self.quant_algo or "gptaq" in self.quant_algo
+        if (
+            "fp8" in self.quant_algo
+            or "int8" in self.quant_algo
+            or ("nvfp4" in self.quant_algo and not is_gptq)
+        ):
             # Add ptq observer hook
             self.ptq_hook = PTQHook(self.quant_model)
             self.ptq_hook.apply_hook()
 
-        if "gptq" in self.quant_algo or "gptaq" in self.quant_algo:
+        if is_gptq:
             max_seq_length = self.quant_model.quant_config.max_seq_length
             hidden_size = self.quant_model.quant_config.hidden_size
             self.gptq = GPTQ(
