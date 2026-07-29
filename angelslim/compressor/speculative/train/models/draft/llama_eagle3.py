@@ -15,7 +15,7 @@
 import math
 import os
 from collections import Counter
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +30,18 @@ from ...data.data_utils import process_token_dict_to_mappings
 from ..model_utils import apply_rotary_pos_emb, apply_rotary_pos_emb_mrope, repeat_kv
 from .base_model import Eagle3BaseDraftModel
 from .draft_model_factory import DraftModelFactory
+
+
+def infer_target_layer_weight_prefix(embed_weight_key: str) -> str:
+    """Derive target decoder layer prefix from the embedding weight key."""
+    suffix = "embed_tokens.weight"
+    if not embed_weight_key.endswith(suffix):
+        raise ValueError(
+            f"Cannot infer layer prefix from embed_weight_key={embed_weight_key!r}; "
+            "expected a key ending with 'embed_tokens.weight', or pass "
+            "target_layer_weight_prefix explicitly."
+        )
+    return embed_weight_key[: -len(suffix)] + "layers"
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
@@ -232,9 +244,10 @@ class MRotaryEmbedding(nn.Module):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx: int = 0):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = getattr(
@@ -244,12 +257,14 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        self.q_proj = nn.Linear(self.hidden_size * 2, self.num_heads * self.head_dim, bias=False)
+        # Eagle layer 0 attends over cat(embeds, fused_hs) → 2H; later layers are H.
+        qkv_in = self.hidden_size * 2 if layer_idx == 0 else self.hidden_size
+        self.q_proj = nn.Linear(qkv_in, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            qkv_in, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            qkv_in, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self._init_rope()
@@ -468,18 +483,20 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayeremb(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx: int = 0):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
+        self.layer_idx = layer_idx
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
         self.mlp = LlamaMLP(config)
+        # Layer 0: dual-norm Eagle path (embeds + fused HS). Later layers: standard Llama.
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        input_emb: torch.Tensor,
+        input_emb: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         cache_hidden: Optional[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -507,19 +524,22 @@ class LlamaDecoderLayeremb(nn.Module):
 
         residual = hidden_states
 
-        hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
-
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
-
-        return_hidden = hidden_states
-
-        # cache_hidden.append(hidden_states)
+        if self.layer_idx == 0:
+            if input_emb is None:
+                raise ValueError("Eagle layer 0 requires input_emb (token embeds).")
+            attn_input = torch.cat(
+                (self.input_layernorm(input_emb), self.hidden_norm(hidden_states)),
+                dim=-1,
+            )
+            return_hidden = attn_input
+        else:
+            attn_input = self.input_layernorm(hidden_states)
+            return_hidden = attn_input
 
         # Self Attention
         hidden_states, latest_hidden_cache = self.self_attn(
             cache_hidden=cache_hidden,
-            hidden_states=hidden_states,
+            hidden_states=attn_input,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -545,7 +565,10 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.midlayer = LlamaDecoderLayeremb(config)
+        num_layers = getattr(config, "num_hidden_layers", 1)
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayeremb(config, layer_idx=i) for i in range(num_layers)]
+        )
 
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = config.draft_vocab_size
@@ -566,30 +589,56 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         # Required by new transformers gradient checkpointing format
         self.gradient_checkpointing = False
 
+    @property
+    def midlayer(self):
+        """Legacy alias for the first draft layer (Eagle 2H block)."""
+        return self.layers[0]
+
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.fc(hidden_states)
+
+    def init_cache_hidden(self):
+        """Per-draft-layer KV cache containers for the speculative train loop."""
+        return [[[], []] for _ in range(len(self.layers))]
 
     def encode_layers(
         self,
         inputs_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: Optional[Tuple[List[torch.Tensor], List[torch.Tensor]]],
+        cache_hidden: Optional[List],
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         use_cache: bool,
     ):
-        layer_outputs, cache_hidden = self.midlayer(
-            inputs_embeds,
-            hidden_states,
-            cache_hidden,
-            attention_mask,
-            position_ids,
-            past_key_value=None,
-            output_attentions=False,
-            use_cache=use_cache,
-        )
-        hidden_states_out = layer_outputs[0]
-        return hidden_states_out, cache_hidden
+        # Accept legacy single-layer cache [[ks], [vs]] when num_hidden_layers==1.
+        if cache_hidden is None:
+            cache_hidden = self.init_cache_hidden()
+        elif (
+            len(self.layers) == 1
+            and len(cache_hidden) == 2
+            and isinstance(cache_hidden[0], list)
+            and (len(cache_hidden[0]) == 0 or torch.is_tensor(cache_hidden[0][0]))
+        ):
+            cache_hidden = [cache_hidden]
+        elif len(cache_hidden) != len(self.layers):
+            raise ValueError(
+                f"cache_hidden length {len(cache_hidden)} != "
+                f"num draft layers {len(self.layers)}"
+            )
+
+        for layer_idx, layer in enumerate(self.layers):
+            layer_outputs, cache_hidden[layer_idx] = layer(
+                inputs_embeds if layer_idx == 0 else None,
+                hidden_states,
+                cache_hidden[layer_idx],
+                attention_mask,
+                position_ids,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=use_cache,
+            )
+            hidden_states = layer_outputs[0]
+        return hidden_states, cache_hidden
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         norm_hidden_states = self.norm(hidden_states)
@@ -599,6 +648,126 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
     def embed_input_ids(self, input_ids):
         inputs_embeds = self.embed_tokens(input_ids)
         return inputs_embeds
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Remap legacy `midlayer.*` keys to `layers.0.*` for older checkpoints."""
+        if any(k.startswith("midlayer.") for k in state_dict):
+            remapped = {}
+            for k, v in state_dict.items():
+                if k.startswith("midlayer."):
+                    remapped["layers.0." + k[len("midlayer.") :]] = v
+                else:
+                    remapped[k] = v
+            state_dict = remapped
+        return super().load_state_dict(state_dict, strict=strict)
+
+    def load_layer_weights_from_target(
+        self,
+        target_model_name_or_path: str,
+        layer_ids: List[int],
+        embed_weight_key: Optional[str] = None,
+        target_layer_weight_prefix: Optional[str] = None,
+    ):
+        """
+        Initialize draft layers from selected target decoder layers.
+
+        Layer 0 (2H QKV): copy norms/MLP/o_proj; put target QKV on the HS half of
+        the 2H projection and zero the embed half.
+        Later layers: full H→H copy of attn/MLP/norms.
+        """
+        if layer_ids is None:
+            return
+        if len(layer_ids) != len(self.layers):
+            raise ValueError(
+                f"draft_layer_init_from_target length ({len(layer_ids)}) must equal "
+                f"num_hidden_layers ({len(self.layers)})"
+            )
+
+        if not os.path.exists(target_model_name_or_path):
+            target_model_name_or_path = snapshot_download(repo_id=target_model_name_or_path)
+
+        if target_layer_weight_prefix is None:
+            if embed_weight_key is None:
+                raise ValueError(
+                    "Need embed_weight_key or target_layer_weight_prefix to locate "
+                    "target layer weights."
+                )
+            target_layer_weight_prefix = infer_target_layer_weight_prefix(embed_weight_key)
+
+        # Collect keys we need, then load once.
+        needed: List[str] = []
+        plan: List[Tuple[int, int, Dict[str, str]]] = []  # draft_idx, target_idx, name_map
+        for draft_idx, target_idx in enumerate(layer_ids):
+            prefix = f"{target_layer_weight_prefix}.{target_idx}"
+            name_map = {
+                "self_attn.q_proj.weight": f"{prefix}.self_attn.q_proj.weight",
+                "self_attn.k_proj.weight": f"{prefix}.self_attn.k_proj.weight",
+                "self_attn.v_proj.weight": f"{prefix}.self_attn.v_proj.weight",
+                "self_attn.o_proj.weight": f"{prefix}.self_attn.o_proj.weight",
+                "mlp.gate_proj.weight": f"{prefix}.mlp.gate_proj.weight",
+                "mlp.up_proj.weight": f"{prefix}.mlp.up_proj.weight",
+                "mlp.down_proj.weight": f"{prefix}.mlp.down_proj.weight",
+                "input_layernorm.weight": f"{prefix}.input_layernorm.weight",
+                "post_attention_layernorm.weight": f"{prefix}.post_attention_layernorm.weight",
+            }
+            needed.extend(name_map.values())
+            plan.append((draft_idx, target_idx, name_map))
+
+        tensors = self._load_weight_tensors(target_model_name_or_path, needed)
+        missing = [k for k in needed if k not in tensors]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing {len(missing)} target layer weight(s), e.g. {missing[0]}. "
+                f"Check target_layer_weight_prefix={target_layer_weight_prefix!r}."
+            )
+
+        h = self.hidden_size
+        with torch.no_grad():
+            for draft_idx, target_idx, name_map in plan:
+                layer = self.layers[draft_idx]
+                src = {k: tensors[v] for k, v in name_map.items()}
+
+                def _copy(param: torch.nn.Parameter, tensor: torch.Tensor):
+                    if param.shape != tensor.shape:
+                        raise ValueError(
+                            f"Shape mismatch when init draft layer {draft_idx} "
+                            f"from target layer {target_idx}: "
+                            f"{tuple(param.shape)} vs {tuple(tensor.shape)}"
+                        )
+                    param.copy_(tensor.to(dtype=param.dtype, device=param.device))
+
+                # Norms / MLP / o_proj: always full copy.
+                _copy(layer.mlp.gate_proj.weight, src["mlp.gate_proj.weight"])
+                _copy(layer.mlp.up_proj.weight, src["mlp.up_proj.weight"])
+                _copy(layer.mlp.down_proj.weight, src["mlp.down_proj.weight"])
+                _copy(layer.post_attention_layernorm.weight, src["post_attention_layernorm.weight"])
+                _copy(layer.self_attn.o_proj.weight, src["self_attn.o_proj.weight"])
+
+                if draft_idx == 0:
+                    # HS stream norm ← target input_layernorm; embed norm also seeded from it.
+                    _copy(layer.hidden_norm.weight, src["input_layernorm.weight"])
+                    _copy(layer.input_layernorm.weight, src["input_layernorm.weight"])
+                    # QKV: [out, 2H] with cat(emb, hs) → put target weights on HS half.
+                    for proj_name in ("q_proj", "k_proj", "v_proj"):
+                        draft_w = getattr(layer.self_attn, proj_name).weight
+                        tgt_w = src[f"self_attn.{proj_name}.weight"]
+                        if draft_w.shape[-1] != 2 * h or tgt_w.shape[-1] != h:
+                            raise ValueError(
+                                f"Expected draft layer0 {proj_name} in_features=2H and "
+                                f"target in_features=H; got {draft_w.shape} / {tgt_w.shape}"
+                            )
+                        draft_w.zero_()
+                        draft_w[:, h:].copy_(tgt_w.to(dtype=draft_w.dtype, device=draft_w.device))
+                else:
+                    _copy(layer.input_layernorm.weight, src["input_layernorm.weight"])
+                    _copy(layer.self_attn.q_proj.weight, src["self_attn.q_proj.weight"])
+                    _copy(layer.self_attn.k_proj.weight, src["self_attn.k_proj.weight"])
+                    _copy(layer.self_attn.v_proj.weight, src["self_attn.v_proj.weight"])
+
+        print(
+            f"Initialized draft layers from target layers {layer_ids} "
+            f"(prefix={target_layer_weight_prefix})"
+        )
 
     def forward(
         self,
@@ -658,34 +827,23 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             if use_cache:
                 use_cache = False
 
-        cache_hidden = [[], []]
+        cache_hidden = self.init_cache_hidden()
 
         inputs_embeds = self.embed_tokens(input_ids)
         if self.training and self.gradient_checkpointing and not inputs_embeds.requires_grad:
             inputs_embeds.requires_grad = True
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
-        def create_custom_forward(module):
-            def custom_forward(*inputs):
-                # None for past_key_value
-                return module(*inputs, None, output_attentions)
-
-            return custom_forward
-
-        layer_outputs, cache_hidden = torch.utils.checkpoint.checkpoint(
-            create_custom_forward(self.midlayer),
-            inputs_embeds,
-            hidden_states,
-            cache_hidden,
-            attention_mask,
-            position_ids,
+        hidden_states, cache_hidden = self.encode_layers(
+            inputs_embeds=inputs_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=bool(use_cache),
         )
 
-        hidden_states_out = layer_outputs[0]
-
-        hidden_states = hidden_states_out
-
-        hidden_states_out = self.norm(hidden_states_out)
+        hidden_states_out = self.norm(hidden_states)
 
         logits = self.lm_head(hidden_states_out)
         logits = logits.float()

@@ -126,6 +126,15 @@ def parse_args():
         help="Number of max samples for data preprocessing",
     )
     data_group.add_argument(
+        "--load_from_cache_file",
+        type=lambda v: str(v).lower() in ("1", "true", "t", "yes", "y"),
+        default=False,
+        help=(
+            "Reuse HuggingFace datasets map/filter cache for tokenization "
+            "(true/false, default: false). Set true to skip re-preprocess on restart."
+        ),
+    )
+    data_group.add_argument(
         "--shuffle_seed", type=int, default=42, help="Random seed for shuffling dataset"
     )
     data_group.add_argument(
@@ -288,6 +297,23 @@ def train():
     draft_model = create_draft_model(draft_model_config)
     draft_model.load_embed_weights(args.target_model_name_or_path, args.embed_weight_key)
     draft_model.freeze_embed_weights()
+    init_from_target = getattr(draft_model_config, "draft_layer_init_from_target", None)
+    if init_from_target:
+        draft_model.load_layer_weights_from_target(
+            args.target_model_name_or_path,
+            list(init_from_target),
+            embed_weight_key=args.embed_weight_key,
+            target_layer_weight_prefix=getattr(
+                draft_model_config, "target_layer_weight_prefix", None
+            ),
+        )
+    # vLLM reads eagle_aux_hidden_state_layer_ids from the saved draft config.
+    aux_ids = getattr(draft_model_config, "aux_hidden_states_layer_ids", None) or getattr(
+        draft_model_config, "eagle_aux_hidden_state_layer_ids", None
+    )
+    if aux_ids is not None:
+        draft_model.config.aux_hidden_states_layer_ids = list(aux_ids)
+        draft_model.config.eagle_aux_hidden_state_layer_ids = list(aux_ids)
     rank0_print("Draft model loaded successfully")
 
     # Create datasets using DatasetManager

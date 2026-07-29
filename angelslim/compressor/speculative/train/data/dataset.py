@@ -183,6 +183,9 @@ class DatasetManager:
         # Create training dataset
         train_dataset = None
         train_path = getattr(self.data_args, "train_data_path", None)
+        load_from_cache_file = bool(
+            getattr(self.data_args, "load_from_cache_file", False)
+        )
         if train_path is not None:
             train_dataset = self.online_dataset_builder.build_dataset(
                 train_path,
@@ -190,6 +193,7 @@ class DatasetManager:
                 shuffle=True,
                 sample_num=getattr(self.data_args, "sample_num", None),
                 min_loss_tokens=min_loss_tokens,
+                load_from_cache_file=load_from_cache_file,
             )
 
         # Create evaluation dataset
@@ -202,6 +206,7 @@ class DatasetManager:
                 shuffle=False,
                 sample_num=getattr(self.data_args, "sample_num", None),
                 min_loss_tokens=min_loss_tokens,
+                load_from_cache_file=load_from_cache_file,
             )
 
         data_collator = self.online_dataset_builder.get_data_collator()

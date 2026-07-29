@@ -133,6 +133,7 @@ class OnlineDatasetBuilder(DatasetBuilder):
         shuffle: bool = True,
         sample_num: Optional[int] = None,
         min_loss_tokens: Optional[int] = None,
+        load_from_cache_file: bool = False,
     ) -> Dataset:
         try:
             # Load dataset
@@ -156,7 +157,7 @@ class OnlineDatasetBuilder(DatasetBuilder):
                 batched=True,
                 num_proc=num_proc,
                 remove_columns=original_columns,
-                load_from_cache_file=False,
+                load_from_cache_file=load_from_cache_file,
                 desc="Processing conversations",
             )
 

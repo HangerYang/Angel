@@ -162,6 +162,64 @@ class Eagle3BaseDraftModel(PreTrainedModel, ABC):
             print(f"Failed to load from pytorch_model.bin: {e}")
             return None
 
+    def _load_weight_tensors(self, model_path, weight_keys):
+        """Load multiple named weights from safetensors or pytorch bin shards."""
+        from collections import defaultdict
+
+        weight_keys = list(dict.fromkeys(weight_keys))
+        loaded = {}
+
+        index_file = os.path.join(model_path, "model.safetensors.index.json")
+        single_st = os.path.join(model_path, "model.safetensors")
+        if os.path.exists(index_file) or os.path.exists(single_st):
+            if os.path.exists(index_file):
+                with open(index_file, "r") as f:
+                    weight_map = json.load(f)["weight_map"]
+            else:
+                weight_map = {k: "model.safetensors" for k in weight_keys}
+
+            by_file = defaultdict(list)
+            for key in weight_keys:
+                if key not in weight_map:
+                    continue
+                by_file[weight_map[key]].append(key)
+
+            for rel_path, keys in by_file.items():
+                with safe_open(
+                    os.path.join(model_path, rel_path), framework="pt", device="cpu"
+                ) as f:
+                    for key in keys:
+                        loaded[key] = f.get_tensor(key)
+            return loaded
+
+        index_file = os.path.join(model_path, "pytorch_model.bin.index.json")
+        single_bin = os.path.join(model_path, "pytorch_model.bin")
+        if os.path.exists(index_file):
+            with open(index_file, "r") as f:
+                weight_map = json.load(f)["weight_map"]
+            by_file = defaultdict(list)
+            for key in weight_keys:
+                if key not in weight_map:
+                    continue
+                by_file[weight_map[key]].append(key)
+            for rel_path, keys in by_file.items():
+                shard = torch.load(os.path.join(model_path, rel_path), map_location="cpu")
+                for key in keys:
+                    if key in shard:
+                        loaded[key] = shard[key]
+            return loaded
+
+        if os.path.exists(single_bin):
+            shard = torch.load(single_bin, map_location="cpu")
+            for key in weight_keys:
+                if key in shard:
+                    loaded[key] = shard[key]
+            return loaded
+
+        raise FileNotFoundError(
+            f"No safetensors/pytorch weights found under {model_path}"
+        )
+
     def build_vocab_mapping(self, dataset, cache_path):
         """
         Build vocab mapping from full vocabulary to draft vocabulary

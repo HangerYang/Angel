@@ -45,6 +45,12 @@ Output format (one JSON object per line)
 
 Examples
 --------
+  Filters:
+    - assistant answers shorter than ``--min-answer-words`` (default 5)
+    - ``<image>`` tokens without a matching image path (or more tokens than images)
+    - multi-image rows, leftover ``<image>`` in text, broken role order, empty turns
+    - missing local image files (unless ``--allow-missing-images``)
+
   # ShareGPT (text) + LLaVA Instruct (VL, absolute image paths) -> JSONL
   # Filters answers shorter than 5 words; randomly samples the requested counts.
   python dataset/build_mixed_text_vl_jsonl.py \\
@@ -156,12 +162,19 @@ def parse_image_root_args(values: list[str] | None) -> ImageRootMap:
     return ImageRootMap(prefix_roots=prefix_roots, default_root=default_root)
 
 
+IMAGE_TOKEN = "<image>"
+
+
 def text_content(text: str) -> dict:
     return {"type": "text", "text": text}
 
 
 def strip_image_token(text: str) -> str:
-    return text.replace("<image>", "").strip().lstrip("\n").strip()
+    return text.replace(IMAGE_TOKEN, "").strip().lstrip("\n").strip()
+
+
+def count_image_tokens(text: str) -> int:
+    return str(text).count(IMAGE_TOKEN)
 
 
 def word_count(text: str) -> int:
@@ -178,6 +191,95 @@ def content_text(content) -> str:
                 parts.append(str(item.get("text") or ""))
         return "".join(parts)
     return str(content or "")
+
+
+def count_images_in_field(image_field) -> int:
+    if not image_field:
+        return 0
+    if isinstance(image_field, (list, tuple)):
+        return len(image_field)
+    return 1
+
+
+def raw_conversation_image_tokens(convs_raw: list) -> int:
+    n = 0
+    for turn in convs_raw or []:
+        if not isinstance(turn, dict):
+            continue
+        val = turn.get("value") or turn.get("content") or ""
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    if item.get("type") == "image":
+                        n += 1
+                    elif item.get("type") == "text":
+                        n += count_image_tokens(item.get("text") or "")
+                else:
+                    n += count_image_tokens(str(item))
+        else:
+            n += count_image_tokens(str(val))
+    return n
+
+
+def validate_converted_conversation(convs: list[dict]) -> str | None:
+    """
+    Return a short rejection reason, or None if the conversation is usable.
+
+    Catches format issues that break VLM processors, e.g. leftover ``<image>``
+    tokens in text with no / too few attached images.
+    """
+    if not convs:
+        return "empty_conversation"
+
+    expected = "user"
+    n_images = 0
+    for turn in convs:
+        role = turn.get("role")
+        if role not in ("user", "assistant"):
+            return f"bad_role:{role}"
+        if role != expected:
+            return f"role_order_expected_{expected}_got_{role}"
+        expected = "assistant" if expected == "user" else "user"
+
+        content = turn.get("content")
+        if not isinstance(content, list) or not content:
+            return "empty_or_nonlist_content"
+
+        turn_text_parts: list[str] = []
+        turn_images = 0
+        for item in content:
+            if not isinstance(item, dict):
+                return "non_dict_content_item"
+            itype = item.get("type")
+            if itype == "image":
+                turn_images += 1
+                n_images += 1
+                if not item.get("image"):
+                    return "empty_image_path"
+            elif itype == "text":
+                text = item.get("text")
+                if text is None:
+                    return "null_text"
+                text = str(text)
+                if IMAGE_TOKEN in text:
+                    return "leftover_image_token_in_text"
+                turn_text_parts.append(text)
+            else:
+                return f"unsupported_content_type:{itype}"
+
+        text_joined = "".join(turn_text_parts).strip()
+        if role == "assistant" and not text_joined:
+            return "empty_assistant_text"
+        if role == "user" and turn_images == 0 and not text_joined:
+            return "empty_user_turn"
+
+    if expected == "assistant":
+        # ended on user without an assistant reply
+        return "missing_assistant_reply"
+    if n_images > 1:
+        # Current mixed builder / SmolVLM smoke path expects a single image.
+        return f"too_many_images:{n_images}"
+    return None
 
 
 def answers_meet_min_words(convs: list[dict], min_words: int) -> bool:
@@ -217,16 +319,26 @@ def normalize_sharegpt_turns(convs: list) -> list | None:
                 for x in val
                 if isinstance(x, dict) and x.get("type") == "text"
             ]
+            # Reject multimodal ShareGPT rows that embed images in content lists
+            # without going through the LLaVA image-field path.
+            if any(isinstance(x, dict) and x.get("type") == "image" for x in val):
+                return None
             val = "".join(texts)
-        if not str(val).strip():
+        raw = str(val)
+        # Text-only samples must not contain image placeholders.
+        if count_image_tokens(raw) > 0:
+            return None
+        if not raw.strip():
             continue
-        out.append({"role": role, "content": [text_content(str(val))]})
+        out.append({"role": role, "content": [text_content(raw)]})
 
     while out and out[0]["role"] != "user":
         out.pop(0)
     if not out or out[0]["role"] != "user":
         return None
     if not any(t["role"] == "assistant" for t in out):
+        return None
+    if validate_converted_conversation(out) is not None:
         return None
     return out
 
@@ -245,13 +357,28 @@ def normalize_llava_instruct_item(
     """
     convs_raw = item.get("conversations") or []
     image_field = item.get("image")
+    n_img_field = count_images_in_field(image_field)
+    n_img_tokens = raw_conversation_image_tokens(convs_raw)
 
     # Text-only ShareGPT-style entries in mix665k have no ``image`` field.
-    if not image_field:
+    if n_img_field == 0:
+        # Image tokens without an image path → processor error later.
+        if n_img_tokens > 0:
+            return None
         convs = normalize_sharegpt_turns(convs_raw)
         if not convs:
             return None
         return "text", convs
+
+    # Multi-image rows are not supported by this mixed builder.
+    if n_img_field != 1:
+        return None
+    # More placeholders than available images (e.g. 2x <image>, 1 path).
+    if n_img_tokens > n_img_field:
+        return None
+
+    if isinstance(image_field, (list, tuple)):
+        image_field = image_field[0]
 
     abs_img = image_roots.resolve(str(image_field))
     if abs_img is None:
@@ -285,11 +412,7 @@ def normalize_llava_instruct_item(
 
     while out_convs and out_convs[0]["role"] != "user":
         out_convs.pop(0)
-    if not out_convs or out_convs[0]["role"] != "user":
-        return None
-    if "image" not in [c.get("type") for c in out_convs[0]["content"]]:
-        return None
-    if not any(t["role"] == "assistant" for t in out_convs):
+    if validate_converted_conversation(out_convs) is not None:
         return None
     return "vl", out_convs
 
@@ -326,9 +449,11 @@ def sample_sharegpt(
 
     pool: list[dict] = []
     skipped_short = 0
+    skipped_format = 0
     for item in data:
         convs = normalize_sharegpt_turns(item.get("conversations") or [])
         if not convs:
+            skipped_format += 1
             continue
         if not answers_meet_min_words(convs, min_answer_words):
             skipped_short += 1
@@ -337,7 +462,8 @@ def sample_sharegpt(
 
     records = random_sample(pool, n, rng)
     print(
-        f"  pool={len(pool)} eligible (skipped {skipped_short} short answers); "
+        f"  pool={len(pool)} eligible "
+        f"(skipped {skipped_short} short answers, {skipped_format} format); "
         f"randomly selected {len(records)}"
     )
     return records
@@ -369,6 +495,7 @@ def sample_llava_instruct_json(
     vl_pool: list[dict] = []
     skipped_missing = 0
     skipped_short = 0
+    skipped_format = 0
 
     for item in data:
         if not isinstance(item, dict):
@@ -381,8 +508,19 @@ def sample_llava_instruct_json(
             require_existing_image=require_existing_image,
         )
         if parsed is None:
-            if has_image:
-                skipped_missing += 1
+            if has_image and require_existing_image:
+                # Could be missing file or format; count missing only when path
+                # does not resolve to an existing file.
+                image_field = item.get("image")
+                if isinstance(image_field, (list, tuple)):
+                    image_field = image_field[0] if image_field else None
+                resolved = image_roots.resolve(str(image_field)) if image_field else None
+                if resolved is not None and not resolved.is_file():
+                    skipped_missing += 1
+                else:
+                    skipped_format += 1
+            else:
+                skipped_format += 1
             continue
         kind, convs = parsed
         if not answers_meet_min_words(convs, min_answer_words):
@@ -397,7 +535,8 @@ def sample_llava_instruct_json(
     vl_recs = random_sample(vl_pool, num_vl, rng)
     print(
         f"  pools: text={len(text_pool)} vl={len(vl_pool)} "
-        f"(skipped {skipped_missing} missing images, {skipped_short} short answers); "
+        f"(skipped {skipped_missing} missing images, {skipped_short} short answers, "
+        f"{skipped_format} format); "
         f"randomly selected {len(text_recs)} text + {len(vl_recs)} vl"
     )
     return text_recs, vl_recs
