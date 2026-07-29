@@ -149,6 +149,17 @@ MODEL_TYPE_PARAM_MAP: dict = {
         "model.embed_tokens.weight",
         "hunyuan_vl",
     ),
+    # SmolVLM-256M / Idefics3: text tower is model.text_model
+    "smolvlm": (
+        "lm_head.weight",
+        "model.text_model.embed_tokens.weight",
+        "smolvlm",
+    ),
+    "idefics3": (
+        "lm_head.weight",
+        "model.text_model.embed_tokens.weight",
+        "smolvlm",
+    ),
     "llama": (
         "lm_head.weight",
         "model.embed_tokens.weight",

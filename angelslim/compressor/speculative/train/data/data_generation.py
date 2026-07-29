@@ -10,7 +10,11 @@ from datasets import load_dataset
 
 from angelslim.utils.lazy_imports import openai
 
-from .data_utils import convert_sharegpt_data, convert_ultrachat_data
+from .data_utils import (
+    convert_openai_vl_data,
+    convert_sharegpt_data,
+    convert_ultrachat_data,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -153,7 +157,7 @@ class DataGenerator:
                 if message.get("role") != "user":
                     continue
 
-                # Add user message
+                # Add user message (content may be str or multimodal list)
                 user_msg = {"role": "user", "content": message["content"]}
                 converted_messages.append(user_msg)
 
@@ -162,7 +166,12 @@ class DataGenerator:
                 if response is None:
                     break
 
-                assistant_msg = {"role": "assistant", "content": response}
+                # Keep multimodal-friendly content shape when user used list content
+                if isinstance(message["content"], list):
+                    assistant_content: str | list = [{"type": "text", "text": response}]
+                else:
+                    assistant_content = response
+                assistant_msg = {"role": "assistant", "content": assistant_content}
                 converted_messages.append(assistant_msg)
 
             # Validate output
@@ -223,10 +232,14 @@ def data_generation_work_flow(args):
     """Main execution function."""
     # args = parse_arguments()
 
-    # Load input data
+    # Load input data (HF hub name, dataset dir, or local json/jsonl file)
     logger.info(f"Loading data from {args.data_name_or_path}")
     try:
-        dataset = load_dataset(args.data_name_or_path, split="all")
+        path = args.data_name_or_path
+        if os.path.isfile(path) and path.endswith((".jsonl", ".json")):
+            dataset = load_dataset("json", data_files=path, split="train")
+        else:
+            dataset = load_dataset(path, split="all")
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
         return
@@ -236,6 +249,8 @@ def data_generation_work_flow(args):
         convert_func = convert_sharegpt_data
     elif args.data_format == "ultrachat":
         convert_func = convert_ultrachat_data
+    elif args.data_format == "openai_vl":
+        convert_func = convert_openai_vl_data
     else:
         raise ValueError(f"Invalid data format: {args.data_format}")
     dataset = dataset.map(convert_func, desc="Converting data format..")

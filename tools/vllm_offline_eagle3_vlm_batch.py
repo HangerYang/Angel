@@ -27,6 +27,21 @@ for task in "Lin-Chen/MMStar" "HuggingFaceH4/MATH-500" "MMMU/MMMU" "/path/to/loc
         --output_len 1024 \
         --output_file "$OUTPUT_FILE"
 done
+
+Debugging without Cursor (server / SSH / tmux):
+  # 1) In-process vLLM so breakpoints inside third_party/vllm hit
+  python3 tools/vllm_offline_eagle3_vlm_batch.py ... --debug --pdb \\
+      --breakpoint-before-generate --num_prompts 2 --output_len 64
+
+  # 2) Or drop this in eagle.py / eval script, then run with --debug:
+  #      breakpoint()          # uses ipdb if --pdb, else pdb
+  #      import ipdb; ipdb.set_trace()
+
+  # 3) Classic pdb from the start:
+  VLLM_ENABLE_V1_MULTIPROCESSING=0 python3 -m pdb \\
+      tools/vllm_offline_eagle3_vlm_batch.py ... --debug --num_prompts 1
+
+  pdb/ipdb keys: n(ext)  s(tep)  c(ontinue)  l(ist)  p <expr>  bt  q
 """
 
 import argparse
@@ -100,11 +115,102 @@ def parse_args():
         default=1024,
         help="Minimum pixels for image processing (e.g. 1024)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Debug mode: run vLLM EngineCore in-process so breakpoints in "
+            "third_party/vllm (e.g. v1/spec_decode) are hit."
+        ),
+    )
+    parser.add_argument(
+        "--pdb",
+        action="store_true",
+        help=(
+            "Use ipdb (fallback: pdb) for breakpoint(). Implies --debug. "
+            "Best for SSH/tmux servers without an IDE."
+        ),
+    )
+    parser.add_argument(
+        "--debug-port",
+        type=int,
+        default=None,
+        help="Optional: listen for debugpy on this port (remote IDE attach via SSH -L).",
+    )
+    parser.add_argument(
+        "--wait-for-debugger",
+        action="store_true",
+        help="Block until a debugpy client attaches (requires --debug-port).",
+    )
+    parser.add_argument(
+        "--breakpoint-before-generate",
+        action="store_true",
+        help="Drop into breakpoint() right before llm.chat(...).",
+    )
     return parser.parse_args()
+
+
+def _setup_debug(args):
+    """Enable in-process vLLM + terminal/remote debugger hooks."""
+    want_debug = (
+        args.debug
+        or args.pdb
+        or args.debug_port is not None
+        or args.wait_for_debugger
+        or args.breakpoint_before_generate
+    )
+    if not want_debug:
+        return
+
+    # Speculative decode runs in EngineCore; disable multiproc so breakpoints hit.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    print(
+        "[debug] VLLM_ENABLE_V1_MULTIPROCESSING=0 "
+        "(EngineCore in-process; breakpoints in vllm work)"
+    )
+    print(
+        "[debug] Eagle3 on this stack uses V2 Model Runner path: "
+        "vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py"
+    )
+
+    if args.pdb:
+        # PYTHONBREAKPOINT controls what breakpoint() calls.
+        try:
+            import ipdb  # noqa: F401
+
+            os.environ["PYTHONBREAKPOINT"] = "ipdb.set_trace"
+            print("[debug] breakpoint() -> ipdb.set_trace")
+        except ImportError:
+            os.environ["PYTHONBREAKPOINT"] = "pdb.set_trace"
+            print("[debug] ipdb not installed; breakpoint() -> pdb.set_trace")
+
+    if args.debug_port is None and not args.wait_for_debugger:
+        return
+
+    port = args.debug_port if args.debug_port is not None else 5678
+    try:
+        import debugpy
+    except ImportError as e:
+        raise ImportError(
+            "debugpy is required for --debug-port / --wait-for-debugger. "
+            "Install with: pip install debugpy"
+        ) from e
+
+    if debugpy.is_client_connected():
+        print("[debug] debugger already attached")
+        return
+
+    print(f"[debug] debugpy listening on 0.0.0.0:{port}")
+    debugpy.listen(("0.0.0.0", port))
+    if args.wait_for_debugger:
+        print("[debug] waiting for debugger to attach...")
+        debugpy.wait_for_client()
+        print("[debug] debugger attached")
 
 
 def main():
     args = parse_args()
+    _setup_debug(args)
 
     # Load dataset
     is_local_dataset = os.path.exists(args.dataset)
@@ -277,6 +383,10 @@ def main():
     )
 
     sampling_params = SamplingParams(temperature=args.temp, max_tokens=args.output_len)
+
+    if args.breakpoint_before_generate:
+        print("[debug] breakpoint before generate — continue in debugger")
+        breakpoint()
 
     print("Starting generation...")
     start_time = time.perf_counter()

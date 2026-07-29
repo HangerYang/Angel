@@ -22,3 +22,6 @@ wandb/
 tools/results/
 __pycache__/outputs/
 __pycache__/
+
+# Local editable vLLM checkout (full upstream clone + wheel .so overlays)
+third_party/vllm/

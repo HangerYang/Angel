@@ -24,9 +24,11 @@ __all__ = [
     "process_token_dict_to_mappings",
     "convert_sharegpt_data",
     "convert_ultrachat_data",
+    "convert_openai_vl_data",
     "DataCollatorWithPadding",
     "VLMDataCollatorWithPadding",
     "VLMHunyuanDataCollatorWithPadding",
+    "VLMSmolVLMDataCollatorWithPadding",
     "AudioDataCollatorWithPadding",
     "CosyVoice3DataCollatorWithPadding",
     "build_image_processor_kwargs",
@@ -89,6 +91,65 @@ def convert_ultrachat_data(row, dataset_column="messages"):
     for message in messages:
         converted_messages.append({"role": message["role"], "content": message["content"]})
     return {"conversations": converted_messages, "id": row["prompt_id"]}
+
+
+def _pil_file_to_data_url(path: str) -> str:
+    """Encode a local image file as an OpenAI-compatible data URL."""
+    import base64
+    import mimetypes
+
+    mime, _ = mimetypes.guess_type(path)
+    if mime is None:
+        mime = "image/jpeg"
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def convert_openai_vl_data(row, dataset_column="conversations"):
+    """
+    Passthrough for OpenAI-style VLM conversations used by AngelSlim Eagle docs.
+
+    Input content parts may use:
+      {"type": "text", "text": "..."}
+      {"type": "image", "image": "/abs/path.jpg"}
+
+    Images are converted to OpenAI image_url data-URLs for vLLM chat.completions.
+    """
+    converted_messages = []
+    for message in row[dataset_column]:
+        role = message["role"]
+        content = message["content"]
+        if isinstance(content, str):
+            converted_messages.append({"role": role, "content": content})
+            continue
+
+        new_parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text":
+                new_parts.append({"type": "text", "text": part.get("text", "")})
+            elif ptype == "image":
+                img = part.get("image") or part.get("image_url")
+                if isinstance(img, dict):
+                    # already {"url": "..."}
+                    new_parts.append({"type": "image_url", "image_url": img})
+                elif isinstance(img, str) and img.startswith(("http://", "https://", "data:")):
+                    new_parts.append({"type": "image_url", "image_url": {"url": img}})
+                elif isinstance(img, str):
+                    new_parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _pil_file_to_data_url(img)},
+                        }
+                    )
+            elif ptype == "image_url":
+                new_parts.append(part)
+        converted_messages.append({"role": role, "content": new_parts})
+
+    return {"conversations": converted_messages, "id": str(row["id"])}
 
 
 def process_token_dict_to_mappings(
@@ -372,6 +433,92 @@ class VLMDataCollatorWithPadding:
                 [item["position_ids"] for item in features]
             )
 
+        return batch
+
+
+class VLMSmolVLMDataCollatorWithPadding:
+    """Collator for SmolVLM / Idefics3 online Eagle3 training.
+
+    Recomputes ``pixel_values`` / ``pixel_attention_mask`` from ``image_paths``
+    (input_ids are already image-token-expanded in the dataset builder).
+    """
+
+    def __init__(self, processor=None, image_processor_kwargs=None):
+        self.processor = processor
+        self._resolved_image_processor_kwargs = image_processor_kwargs or {}
+
+    @staticmethod
+    def _pad_tile_batch(tensor_list, pad_value=0):
+        """Pad list of (1, N_i, ...) tensors along the tile dim, then cat batch."""
+        if not tensor_list:
+            return None
+        max_n = max(t.shape[1] for t in tensor_list)
+        padded = []
+        for t in tensor_list:
+            if t.shape[1] == max_n:
+                padded.append(t)
+                continue
+            pad_shape = list(t.shape)
+            pad_shape[1] = max_n - t.shape[1]
+            pad = t.new_full(pad_shape, pad_value)
+            padded.append(torch.cat([t, pad], dim=1))
+        return torch.cat(padded, dim=0)
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        max_length = max(item["input_ids"].shape[1] for item in features)
+        batch = {
+            "input_ids": torch.cat(
+                [paddingtensor2D(item["input_ids"], max_length) for item in features]
+            ),
+            "attention_mask": torch.cat(
+                [paddingtensor2D(item["attention_mask"], max_length) for item in features]
+            ),
+            "loss_mask": torch.cat(
+                [paddingtensor2D(item["loss_mask"], max_length) for item in features]
+            ),
+            "hidden_states": None,
+            "target_hiddens": None,
+            "inputs_embeds": None,
+            "position_ids": None,
+        }
+
+        if self.processor is not None and "image_paths" in features[0]:
+            all_pixel_values, all_pixel_attention_mask = [], []
+            for item in features:
+                image_paths = json.loads(item["image_paths"])
+                if not image_paths:
+                    continue
+                images = [load_image(p) for p in image_paths]
+                if hasattr(self.processor, "image_processor"):
+                    vision_enc = self.processor.image_processor(
+                        images=images,
+                        return_tensors="pt",
+                        **self._resolved_image_processor_kwargs,
+                    )
+                else:
+                    vision_enc = self.processor(
+                        images=images,
+                        return_tensors="pt",
+                        **self._resolved_image_processor_kwargs,
+                    )
+                if "pixel_values" in vision_enc:
+                    all_pixel_values.append(vision_enc["pixel_values"])
+                if "pixel_attention_mask" in vision_enc:
+                    all_pixel_attention_mask.append(vision_enc["pixel_attention_mask"])
+            if all_pixel_values:
+                batch["pixel_values"] = self._pad_tile_batch(all_pixel_values, pad_value=0)
+            if all_pixel_attention_mask:
+                batch["pixel_attention_mask"] = self._pad_tile_batch(
+                    all_pixel_attention_mask, pad_value=0
+                )
+
+        if all("hidden_states" in item and "target_hiddens" in item for item in features):
+            batch["hidden_states"] = torch.cat(
+                [paddingtensor(item["hidden_states"], max_length) for item in features]
+            )
+            batch["target_hiddens"] = torch.cat(
+                [paddingtensor(item["target_hiddens"], max_length) for item in features]
+            )
         return batch
 
 

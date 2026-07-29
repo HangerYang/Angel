@@ -14,7 +14,7 @@
 
 from .chat_templates import get_supported_chat_template_type_strings
 from .data_generation import data_generation_work_flow
-from .data_utils import convert_sharegpt_data, convert_ultrachat_data
+from .data_utils import convert_openai_vl_data, convert_sharegpt_data, convert_ultrachat_data
 from .dataset import DatasetManager
 from .noise_transforms import GaussianNoise, TransformDataset
 
@@ -24,6 +24,7 @@ __all__ = [
     "TransformDataset",
     "convert_sharegpt_data",
     "convert_ultrachat_data",
+    "convert_openai_vl_data",
     "data_generation_work_flow",
     "get_supported_chat_template_type_strings",
 ]
