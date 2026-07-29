@@ -33,6 +33,8 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-1}
 SAMPLE_NUM=${SAMPLE_NUM:-}
 DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-}
+# Reuse HF datasets preprocess cache across restarts (true/false).
+LOAD_FROM_CACHE_FILE=${LOAD_FROM_CACHE_FILE:-true}
 
 export CUDA_VISIBLE_DEVICES
 
@@ -63,6 +65,7 @@ torchrun --nproc_per_node="${NPROC}" tools/train_eagle3_online.py \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --num_proc 4 \
+    --load_from_cache_file "${LOAD_FROM_CACHE_FILE}" \
     --save_strategy "no" \
     --learning_rate 1e-4 \
     --weight_decay 0.0 \

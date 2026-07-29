@@ -374,7 +374,10 @@ class OnlineTTSEagle3Trainer(Eagle3Trainer):
     ):
         # Step 6: Initialize containers for losses, accuracies and cache
         plosses, acces = [], []
-        cache_hidden = [[], []]
+        if hasattr(self.draft_model, "init_cache_hidden"):
+            cache_hidden = self.draft_model.init_cache_hidden()
+        else:
+            cache_hidden = [[], []]
 
         # Step 7: Iterative speculative decoding training loop
         for idx in range(self.length):

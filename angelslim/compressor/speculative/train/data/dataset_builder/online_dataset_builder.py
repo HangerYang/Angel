@@ -123,6 +123,7 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
         shuffle: bool = True,
         sample_num: Optional[int] = None,
         min_loss_tokens: Optional[int] = None,
+        load_from_cache_file: bool = False,
     ) -> Dataset:
         try:
             # Load dataset
@@ -164,7 +165,7 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
                 batched=True,
                 num_proc=num_proc,
                 remove_columns=original_columns,
-                load_from_cache_file=False,
+                load_from_cache_file=load_from_cache_file,
                 desc="Processing conversations",
             )
 
@@ -457,6 +458,7 @@ class OnlineVLMHunyuanVLDatasetBuilder(OnlineDatasetBuilder):
         shuffle: bool = True,
         sample_num: Optional[int] = None,
         min_loss_tokens: Optional[int] = None,
+        load_from_cache_file: bool = False,
     ) -> Dataset:
         try:
             # Load dataset
@@ -496,7 +498,7 @@ class OnlineVLMHunyuanVLDatasetBuilder(OnlineDatasetBuilder):
                 batched=True,
                 num_proc=num_proc,
                 remove_columns=original_columns,
-                load_from_cache_file=False,
+                load_from_cache_file=load_from_cache_file,
                 desc="Processing conversations",
             )
 
@@ -738,6 +740,7 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
         shuffle: bool = True,
         sample_num: Optional[int] = None,
         min_loss_tokens: Optional[int] = None,
+        load_from_cache_file: bool = False,
     ) -> Dataset:
         try:
             # Do not pin Features: generated openai_vl data uses image_url.
@@ -752,18 +755,21 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                 ds = ds.select(range(sample_num))
 
             original_columns = ds.column_names
+            # When True, reuse HF datasets map/filter cache across restarts.
+            # Collator still rebuilds pixel_* each step from image_paths.
             processed_ds = ds.map(
                 self._preprocess_function,
                 batched=True,
                 num_proc=num_proc,
                 remove_columns=original_columns,
-                load_from_cache_file=False,
+                load_from_cache_file=load_from_cache_file,
                 desc="Processing SmolVLM conversations",
             )
             processed_ds = processed_ds.filter(
                 lambda batch: [ids is not None for ids in batch["input_ids"]],
                 batched=True,
                 num_proc=num_proc,
+                load_from_cache_file=load_from_cache_file,
                 desc="Filtering empty input_ids",
             )
             if min_loss_tokens is not None:
@@ -774,6 +780,7 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                     ],
                     batched=True,
                     num_proc=num_proc,
+                    load_from_cache_file=load_from_cache_file,
                     desc=f"Filtering sequences with loss tokens < {min_loss_tokens}",
                 )
 
@@ -901,6 +908,64 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                         images.append(load_image(src))
         return images, image_paths
 
+    @staticmethod
+    def _sanitize_messages_for_processor(messages: List[Dict]) -> Optional[List[Dict]]:
+        """
+        Strip leftover ``<image>`` from text and keep only image/text items.
+
+        Returns None if the conversation is malformed for the VLM processor
+        (e.g. image placeholders in text with no image content items).
+        """
+        sanitized: List[Dict] = []
+        n_image_items = 0
+        for message in messages:
+            content = message.get("content", [])
+            if isinstance(content, str):
+                if "<image>" in content and n_image_items == 0:
+                    # defer check until end using total counts
+                    pass
+                text = content.replace("<image>", "").strip()
+                if not text and message.get("role") == "assistant":
+                    return None
+                sanitized.append({"role": message["role"], "content": text})
+                continue
+            if not isinstance(content, list):
+                return None
+            new_content = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "image":
+                    n_image_items += 1
+                    new_content.append({"type": "image"})
+                elif item.get("type") == "text":
+                    text = str(item.get("text") or "").replace("<image>", "").strip()
+                    new_content.append({"type": "text", "text": text})
+            if not new_content:
+                return None
+            sanitized.append({"role": message["role"], "content": new_content})
+
+        # Count leftover placeholders in any remaining string fields / text items
+        leftover = 0
+        for message in messages:
+            content = message.get("content", [])
+            if isinstance(content, str):
+                leftover += content.count("<image>")
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        leftover += str(item.get("text") or "").count("<image>")
+
+        # After sanitize, text no longer has placeholders; chat template will insert
+        # one ``<image>`` per image content item. Reject if original text had
+        # placeholders but we have no images to pass.
+        if leftover > 0 and n_image_items == 0:
+            return None
+        if leftover > n_image_items > 0:
+            # e.g. 2x <image> in text but only 1 image attached
+            return None
+        return sanitized
+
     def _process_single_conversation(self, conversation_data: List[Dict]) -> Optional[Dict]:
         if not conversation_data or not isinstance(conversation_data, list):
             return None
@@ -912,23 +977,18 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                 return None
 
             images, image_paths = self._extract_images(messages)
-
-            # Processor chat-template expects content items shaped as
-            # {"type": "image"} / {"type": "text", "text": "..."} without nulls.
-            for message in messages:
-                if isinstance(message["content"], str):
-                    continue
-                new_content = []
-                for item in message["content"]:
-                    if item.get("type") == "image":
-                        new_content.append({"type": "image"})
-                    elif item.get("type") == "text":
-                        new_content.append({"type": "text", "text": item.get("text", "")})
-                message["content"] = new_content
+            sanitized = self._sanitize_messages_for_processor(messages)
+            if sanitized is None:
+                return None
+            messages = sanitized
 
             text = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False
             )
+            n_tokens_in_text = text.count("<image>")
+            if n_tokens_in_text != len(images):
+                # Processor requires a 1:1 match between placeholders and images.
+                return None
 
             encode_kwargs = {
                 "text": text,
@@ -1004,6 +1064,7 @@ class OnlineAudioDatasetBuilder(OnlineDatasetBuilder):
         shuffle: bool = True,
         sample_num: Optional[int] = None,
         min_loss_tokens: Optional[int] = None,
+        load_from_cache_file: bool = False,
     ) -> Dataset:
         try:
             # Load dataset
@@ -1044,7 +1105,7 @@ class OnlineAudioDatasetBuilder(OnlineDatasetBuilder):
                 batched=True,
                 num_proc=num_proc,
                 remove_columns=original_columns,
-                load_from_cache_file=False,
+                load_from_cache_file=load_from_cache_file,
                 desc="Processing conversations",
             )
 
@@ -1331,6 +1392,7 @@ class OnlineTTSDatasetBuilder(OnlineDatasetBuilder):
         shuffle: bool = True,
         sample_num: Optional[int] = None,
         min_loss_tokens: Optional[int] = None,
+        load_from_cache_file: bool = False,
     ) -> Dataset:
         try:
             if not isinstance(datapath, list):
