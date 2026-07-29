@@ -46,10 +46,13 @@ Output format (one JSON object per line)
 Examples
 --------
   # ShareGPT (text) + LLaVA Instruct (VL, absolute image paths) -> JSONL
+  # Filters answers shorter than 5 words; randomly samples the requested counts.
   python dataset/build_mixed_text_vl_jsonl.py \\
     --sharegpt dataset/ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json \\
     --llava-json /path/to/llava_v1_5_mix665k.json \\
     --num-text 18 --num-vl 18 \\
+    --min-answer-words 5 \\
+    --seed 42 \\
     --output-dir dataset/mixed_text_vl_36 \\
     --output-name mixed_text_vl_36.jsonl
 
@@ -77,6 +80,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import random
 import re
 from pathlib import Path
 from typing import Optional
@@ -158,6 +162,44 @@ def text_content(text: str) -> dict:
 
 def strip_image_token(text: str) -> str:
     return text.replace("<image>", "").strip().lstrip("\n").strip()
+
+
+def word_count(text: str) -> int:
+    return len(re.findall(r"\S+", text.strip()))
+
+
+def content_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+        return "".join(parts)
+    return str(content or "")
+
+
+def answers_meet_min_words(convs: list[dict], min_words: int) -> bool:
+    """True iff every assistant reply has at least ``min_words`` words."""
+    if min_words <= 0:
+        return True
+    found = False
+    for turn in convs:
+        if turn.get("role") != "assistant":
+            continue
+        found = True
+        if word_count(content_text(turn.get("content"))) < min_words:
+            return False
+    return found
+
+
+def random_sample(records: list[dict], n: int, rng: random.Random) -> list[dict]:
+    if n <= 0:
+        return []
+    if len(records) <= n:
+        return list(records)
+    return rng.sample(records, n)
 
 
 def normalize_sharegpt_turns(convs: list) -> list | None:
@@ -268,22 +310,36 @@ def load_pil_from_parquet_image(image_obj) -> Image.Image | None:
     return None
 
 
-def sample_sharegpt(path: Path, n: int) -> list[dict]:
+def sample_sharegpt(
+    path: Path,
+    n: int,
+    *,
+    min_answer_words: int = 5,
+    rng: random.Random | None = None,
+) -> list[dict]:
     if n <= 0:
         return []
+    rng = rng or random.Random()
     print(f"Loading ShareGPT from {path} ...")
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    records: list[dict] = []
+    pool: list[dict] = []
+    skipped_short = 0
     for item in data:
         convs = normalize_sharegpt_turns(item.get("conversations") or [])
         if not convs:
             continue
-        records.append({"conversations": convs})
-        if len(records) >= n:
-            break
-    print(f"  selected {len(records)} text samples")
+        if not answers_meet_min_words(convs, min_answer_words):
+            skipped_short += 1
+            continue
+        pool.append({"conversations": convs})
+
+    records = random_sample(pool, n, rng)
+    print(
+        f"  pool={len(pool)} eligible (skipped {skipped_short} short answers); "
+        f"randomly selected {len(records)}"
+    )
     return records
 
 
@@ -294,33 +350,31 @@ def sample_llava_instruct_json(
     num_vl: int,
     *,
     require_existing_image: bool = True,
+    min_answer_words: int = 5,
+    rng: random.Random | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Sample text / VL records from LLaVA Instruct JSON (llava_v1_5_mix665k style).
 
     Images are resolved via ``image_roots`` to absolute paths (files are not copied).
+    Eligible entries are filtered then randomly sampled.
     """
+    rng = rng or random.Random()
     print(f"Loading LLaVA Instruct JSON from {path} ...")
     print(f"  image roots: {image_roots.describe()}")
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    text_recs: list[dict] = []
-    vl_recs: list[dict] = []
+    text_pool: list[dict] = []
+    vl_pool: list[dict] = []
     skipped_missing = 0
+    skipped_short = 0
 
     for item in data:
-        if len(text_recs) >= num_text and len(vl_recs) >= num_vl:
-            break
         if not isinstance(item, dict):
             continue
 
         has_image = bool(item.get("image"))
-        if has_image and len(vl_recs) >= num_vl:
-            continue
-        if (not has_image) and len(text_recs) >= num_text:
-            continue
-
         parsed = normalize_llava_instruct_item(
             item,
             image_roots,
@@ -331,86 +385,129 @@ def sample_llava_instruct_json(
                 skipped_missing += 1
             continue
         kind, convs = parsed
+        if not answers_meet_min_words(convs, min_answer_words):
+            skipped_short += 1
+            continue
         if kind == "vl":
-            vl_recs.append({"conversations": convs})
+            vl_pool.append({"conversations": convs})
         else:
-            text_recs.append({"conversations": convs})
+            text_pool.append({"conversations": convs})
 
+    text_recs = random_sample(text_pool, num_text, rng)
+    vl_recs = random_sample(vl_pool, num_vl, rng)
     print(
-        f"  selected {len(text_recs)} text + {len(vl_recs)} vl "
-        f"(skipped {skipped_missing} missing images)"
+        f"  pools: text={len(text_pool)} vl={len(vl_pool)} "
+        f"(skipped {skipped_missing} missing images, {skipped_short} short answers); "
+        f"randomly selected {len(text_recs)} text + {len(vl_recs)} vl"
     )
     return text_recs, vl_recs
 
 
-def sample_llava_parquet(path: Path, n: int, img_dir: Path) -> list[dict]:
+def sample_llava_parquet(
+    path: Path,
+    n: int,
+    img_dir: Path,
+    *,
+    min_answer_words: int = 5,
+    rng: random.Random | None = None,
+) -> list[dict]:
+    """Reservoir-sample ``n`` VL rows after short-answer filtering."""
+    rng = rng or random.Random()
+    if n <= 0:
+        return []
     print(f"Reading LLaVA-NeXT parquet from {path} ...")
     img_dir.mkdir(parents=True, exist_ok=True)
     pf = pq.ParquetFile(path)
 
-    records: list[dict] = []
+    reservoir: list[dict] = []
+    seen_eligible = 0
+    skipped_short = 0
+
+    def _build_convs(convs_raw, abs_img: str) -> list[dict] | None:
+        out_convs: list[dict] = []
+        first_user = True
+        for turn in convs_raw:
+            if not isinstance(turn, dict):
+                continue
+            role = ROLE_MAP.get(turn.get("from") or turn.get("role"))
+            if role is None:
+                continue
+            text = strip_image_token(str(turn.get("value") or ""))
+            if role == "user" and first_user:
+                out_convs.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": abs_img},
+                            text_content(text),
+                        ],
+                    }
+                )
+                first_user = False
+            else:
+                if not text and role == "user":
+                    continue
+                out_convs.append({"role": role, "content": [text_content(text)]})
+        while out_convs and out_convs[0]["role"] != "user":
+            out_convs.pop(0)
+        if not out_convs or out_convs[0]["role"] != "user":
+            return None
+        if "image" not in [c.get("type") for c in out_convs[0]["content"]]:
+            return None
+        if not any(t["role"] == "assistant" for t in out_convs):
+            return None
+        return out_convs
+
     for batch in pf.iter_batches(batch_size=64):
         df = batch.to_pandas()
         for _, row in df.iterrows():
-            if len(records) >= n:
-                break
-
             img = load_pil_from_parquet_image(row.get("image"))
             if img is None:
                 continue
-
             convs_raw = row["conversations"]
             if hasattr(convs_raw, "tolist"):
                 convs_raw = convs_raw.tolist()
 
-            sid = str(row.get("id", f"llava_{len(records)}"))
+            # Probe answer length before writing image.
+            probe = _build_convs(convs_raw, abs_img="__probe__")
+            if probe is None:
+                continue
+            if not answers_meet_min_words(probe, min_answer_words):
+                skipped_short += 1
+                continue
+
+            seen_eligible += 1
+            replace_idx = None
+            if len(reservoir) < n:
+                replace_idx = len(reservoir)
+            else:
+                j = rng.randrange(seen_eligible)
+                if j < n:
+                    replace_idx = j
+                    old = reservoir[j].get("_img_path")
+                    if old is not None:
+                        Path(old).unlink(missing_ok=True)
+            if replace_idx is None:
+                continue
+
+            sid = str(row.get("id", f"llava_{seen_eligible}"))
             safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", sid)
-            img_path = img_dir / f"{len(records):04d}_{safe}.jpg"
+            img_path = img_dir / f"{replace_idx:04d}_{safe}.jpg"
             img.save(img_path, format="JPEG", quality=95)
             abs_img = str(img_path.resolve())
+            out_convs = _build_convs(convs_raw, abs_img=abs_img)
+            assert out_convs is not None
+            entry = {"conversations": out_convs, "_img_path": img_path}
+            if replace_idx == len(reservoir):
+                reservoir.append(entry)
+            else:
+                reservoir[replace_idx] = entry
 
-            out_convs: list[dict] = []
-            first_user = True
-            for turn in convs_raw:
-                if not isinstance(turn, dict):
-                    continue
-                role = ROLE_MAP.get(turn.get("from") or turn.get("role"))
-                if role is None:
-                    continue
-                text = strip_image_token(str(turn.get("value") or ""))
-                if role == "user" and first_user:
-                    out_convs.append(
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": abs_img},
-                                text_content(text),
-                            ],
-                        }
-                    )
-                    first_user = False
-                else:
-                    if not text and role == "user":
-                        continue
-                    out_convs.append({"role": role, "content": [text_content(text)]})
-
-            while out_convs and out_convs[0]["role"] != "user":
-                out_convs.pop(0)
-            if not out_convs or out_convs[0]["role"] != "user":
-                img_path.unlink(missing_ok=True)
-                continue
-            if "image" not in [c.get("type") for c in out_convs[0]["content"]]:
-                img_path.unlink(missing_ok=True)
-                continue
-            if not any(t["role"] == "assistant" for t in out_convs):
-                img_path.unlink(missing_ok=True)
-                continue
-
-            records.append({"conversations": out_convs})
-        if len(records) >= n:
-            break
-
-    print(f"  selected {len(records)} VL samples; images -> {img_dir}")
+    records = [{"conversations": rec["conversations"]} for rec in reservoir]
+    print(
+        f"  eligible={seen_eligible} (skipped {skipped_short} short answers); "
+        f"randomly selected {len(records)}; images -> {img_dir}"
+    )
     return records
 
 
@@ -456,8 +553,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep VL samples even if resolved image file is missing.",
     )
-    p.add_argument("--num-text", type=int, default=18, help="Number of text samples")
-    p.add_argument("--num-vl", type=int, default=18, help="Number of VL samples")
+    p.add_argument("--num-text", type=int, default=18, help="Number of text samples to randomly select")
+    p.add_argument("--num-vl", type=int, default=18, help="Number of VL samples to randomly select")
+    p.add_argument(
+        "--min-answer-words",
+        type=int,
+        default=5,
+        help="Drop samples whose any assistant answer has fewer than this many words (0 disables).",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="RNG seed for random sampling",
+    )
     p.add_argument(
         "--output-dir",
         type=Path,
@@ -479,6 +588,7 @@ def main() -> None:
     img_dir = out_dir / "images"
     out_jsonl = out_dir / args.output_name
     out_dir.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(args.seed)
 
     if not args.sharegpt and not args.llava_json and not args.llava_parquet:
         raise SystemExit("Provide at least one of --sharegpt, --llava-json, --llava-parquet")
@@ -493,7 +603,14 @@ def main() -> None:
 
     # 1) Prefer dedicated ShareGPT for text if provided.
     if args.sharegpt is not None:
-        text_recs.extend(sample_sharegpt(args.sharegpt, args.num_text))
+        text_recs.extend(
+            sample_sharegpt(
+                args.sharegpt,
+                args.num_text,
+                min_answer_words=args.min_answer_words,
+                rng=rng,
+            )
+        )
 
     # 2) LLaVA Instruct JSON (text and/or VL from one file).
     if args.llava_json is not None:
@@ -505,6 +622,8 @@ def main() -> None:
             num_text=need_text,
             num_vl=need_vl,
             require_existing_image=not args.allow_missing_images,
+            min_answer_words=args.min_answer_words,
+            rng=rng,
         )
         text_recs.extend(t)
         vl_recs.extend(v)
@@ -516,7 +635,15 @@ def main() -> None:
                 old.unlink()
         img_dir.mkdir(parents=True, exist_ok=True)
         need_vl = args.num_vl - len(vl_recs)
-        vl_recs.extend(sample_llava_parquet(args.llava_parquet, need_vl, img_dir))
+        vl_recs.extend(
+            sample_llava_parquet(
+                args.llava_parquet,
+                need_vl,
+                img_dir,
+                min_answer_words=args.min_answer_words,
+                rng=rng,
+            )
+        )
 
     text_recs = text_recs[: args.num_text]
     vl_recs = vl_recs[: args.num_vl]
@@ -533,7 +660,10 @@ def main() -> None:
         any(c.get("type") == "image" for t in r["conversations"] for c in t["content"])
         for r in records
     )
-    print(f"Wrote {len(records)} lines ({len(records) - n_vl} text + {n_vl} vl) -> {out_jsonl}")
+    print(
+        f"Wrote {len(records)} lines ({len(records) - n_vl} text + {n_vl} vl) "
+        f"[min_answer_words={args.min_answer_words}, seed={args.seed}] -> {out_jsonl}"
+    )
 
 
 if __name__ == "__main__":
