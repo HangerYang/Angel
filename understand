@@ -1,0 +1,112 @@
+No — **RMSNorm size is not the difference**. Every RMSNorm is still width **H** (576). The dim change is only in **layer-0 Q/K/V**: they read **2H**.
+
+### Regular Llama layer (target too)
+
+Two RMSNorms, both **H**:
+
+```text
+h: [B, S, H]                         # residual stream
+
+residual = h
+h = input_layernorm(h)               # [B, S, H]   ← norm #1
+h = Attention(h)                     # QKV: H → … ; o_proj → H
+h = residual + h                     # [B, S, H]
+
+residual = h
+h = post_attention_layernorm(h)      # [B, S, H]   ← norm #2
+h = MLP(h)                           # H → I → H
+h = residual + h                     # [B, S, H]
+```
+
+Example (`How can I do`, S=4, H=576):
+
+```text
+h0: [How] [can] [I] [do]     each [576]
+```
+
+Attn/MLP always see width **576**.
+
+---
+
+### Eagle draft **layer 0**
+
+**Three** RMSNorms — still all **H** (576). Different **inputs**, not different widths:
+
+| Norm | On what | Dim | ≈ Llama? |
+|---|---|---|---|
+| `input_layernorm` | token embeds `e` | **H** | new (extra input) |
+| `hidden_norm` | fused target HS `h` | **H** | ≈ Llama’s pre-attn norm on the residual |
+| `post_attention_layernorm` | residual before MLP | **H** | same as Llama |
+
+```text
+e: [B, S, H]     # token embeds (shifted: emb of next token)
+h: [B, S, H]     # fused target HS
+
+residual = h                                    # residual stays on HS stream only
+
+e' = input_layernorm(e)                         # [B, S, H]
+h' = hidden_norm(h)                             # [B, S, H]
+x  = cat(e', h')                                # [B, S, 2H]  ← only place width doubles
+
+attn_out = Attention(x)                         # QKV: 2H → … ; o_proj → H
+h = residual + attn_out                         # [B, S, H]
+
+residual = h
+h = post_attention_layernorm(h)                 # [B, S, H]
+h = residual + MLP(h)                           # [B, S, H]
+```
+
+**Only dim change vs Llama:** layer-0 **Q/K/V input is 2H**.  
+All three RMSNorms stay **H**. Norms are same width, different **inputs** (and separate weights).
+
+---
+
+### Concrete walk-through (step 0)
+
+Original sequence:
+
+```text
+t:     0      1      2      3
+token: How    can    I      do
+hs:    h0     h1     h2     h3      each [576]
+logits: L0     L1     L2     L3      L_t predicts token t+1
+```
+
+After `padding` on `input_ids` / `target_logits` (HS unchanged):
+
+```text
+t:        0         1         2         3
+embed:    emb(can)  emb(I)    emb(do)   0
+HS:       h0(How)   h1(can)   h2(I)     h3(do)
+target:   L1→"I"    L2→"do"   L3→…      0
+```
+
+At **t=1** (the interesting one):
+
+```text
+input:   emb(I) [576] ⊕ h1(can) [576]  →  [1152]
+QKV:     Linear(1152 → …)
+output:  update residual h1 → still [576]
+loss vs: target dist for "do"
+```
+
+---
+
+### Norms: same dim, different roles
+
+All norms are width **H=576**. None is 2H.
+
+**Regular Llama — 2 norms, both H:**
+
+1. `input_layernorm` — on residual `h` before attn  
+2. `post_attention_layernorm` — on residual `h` before MLP  
+
+**Eagle layer 0 — 3 norms, all still H:**
+
+1. `input_layernorm` — on **token embeds**  
+2. `hidden_norm` — on **fused target HS** (≈ Llama’s pre-attn norm on the residual)  
+3. `post_attention_layernorm` — on residual before MLP (same as Llama)
+
+So: same **width (H)**; layer 0 has one **extra** RMSNorm. The two pre-attn norms are both H, different **inputs** (and separate weights). The real dim change is **Q/K/V in: 2H**, not the norms.
+
+**Draft layers 1…N−1:** same as Llama — 2 norms at **H**, QKV **H→…**.
