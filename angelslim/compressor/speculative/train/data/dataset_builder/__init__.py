@@ -21,6 +21,7 @@ from .offline_dataset_builder import (
 from .online_dataset_builder import (
     OnlineAudioDatasetBuilder,
     OnlineLLMDatasetBuilder,
+    OnlineSmolVLMDatasetBuilder,
     OnlineTTSDatasetBuilder,
     OnlineVLMDatasetBuilder,
     OnlineVLMHunyuanVLDatasetBuilder,
@@ -31,6 +32,7 @@ __all__ = [
     "OnlineVLMDatasetBuilder",
     "OnlineTTSDatasetBuilder",
     "OnlineVLMHunyuanVLDatasetBuilder",
+    "OnlineSmolVLMDatasetBuilder",
     "OfflineLLMDatasetBuilder",
     "OfflineVLMDatasetBuilder",
     "OfflineVLMHunyuanVLDatasetBuilder",

@@ -811,7 +811,7 @@ class TransformersBackend(BaseBackend):
 class VLMTransformersBackend(BaseBackend):
     """VLM HuggingFace Transformers backend"""
 
-    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl", "qwen2_5_vl"]
+    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl", "qwen2_5_vl", "smolvlm", "idefics3"]
 
     def load_model(self):
         if self.target_model_type is None or self.target_model_type not in self.SUPPORT_MODEL_TYPE:
@@ -833,7 +833,7 @@ class VLMTransformersBackend(BaseBackend):
 
             # Load processor
             self.tokenizer = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
-        elif self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+        elif self.target_model_type in ("qwen3_vl", "qwen2_5_vl", "smolvlm", "idefics3"):
             from transformers import AutoModelForImageTextToText, AutoProcessor
 
             device = decide_device_for_distributed()
@@ -877,6 +877,52 @@ class VLMTransformersBackend(BaseBackend):
         default_kwargs.update(self.kwargs)
         return default_kwargs
 
+    def _register_language_model_hook(self, hook):
+        """Register a forward pre-hook on the language / text tower."""
+        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+            return self.model.model.language_model.register_forward_pre_hook(
+                hook, with_kwargs=True
+            )
+        if self.target_model_type in ("smolvlm", "idefics3"):
+            return self.model.model.text_model.register_forward_pre_hook(hook, with_kwargs=True)
+        if self.target_model_type == "hunyuan_vl":
+            return self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
+        raise ValueError(f"Unsupported target model type: {self.target_model_type}")
+
+    def _build_vlm_forward_kwargs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        **kwargs,
+    ) -> dict:
+        """Build model.forward kwargs, branching on VLM family."""
+        forward_kwargs = {
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "output_logits": True,
+        }
+        input_position_ids = kwargs.get("input_position_ids", None)
+        if input_position_ids is not None:
+            forward_kwargs["position_ids"] = input_position_ids
+
+        pixel_values = kwargs.get("pixel_values", None)
+        if self.target_model_type in ("smolvlm", "idefics3"):
+            # Idefics3 / SmolVLM expects (B, num_tiles, C, H, W) — do not squeeze.
+            if pixel_values is not None:
+                forward_kwargs["pixel_values"] = pixel_values
+            pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+            if pixel_attention_mask is not None:
+                forward_kwargs["pixel_attention_mask"] = pixel_attention_mask
+        else:
+            if pixel_values is not None:
+                pixel_values = pixel_values.squeeze(0)
+            forward_kwargs["pixel_values"] = pixel_values
+            image_grid_thw = kwargs.get("image_grid_thw", None)
+            if image_grid_thw is not None:
+                forward_kwargs["image_grid_thw"] = image_grid_thw
+
+        return forward_kwargs
+
     def get_hidden_states_and_logits(
         self,
         input_ids: torch.Tensor,
@@ -903,29 +949,10 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
-            handle = self.model.model.language_model.register_forward_pre_hook(
-                hook, with_kwargs=True
-            )
-        elif self.target_model_type == "hunyuan_vl":
-            handle = self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
-        else:
-            raise ValueError(f"Unsupported target model type: {self.target_model_type}")
-        pixel_values = kwargs.get("pixel_values", None)
-        if pixel_values is not None:
-            pixel_values = pixel_values.squeeze(0)
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        input_position_ids = kwargs.get("input_position_ids", None)
+        handle = self._register_language_model_hook(hook)
+        forward_kwargs = self._build_vlm_forward_kwargs(input_ids, attention_mask, **kwargs)
         with torch.no_grad():
-            outputs = self.model(
-                input_ids,
-                attention_mask=attention_mask,
-                position_ids=input_position_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                output_hidden_states=True,
-                output_logits=True,
-            )
+            outputs = self.model(input_ids, **forward_kwargs)
 
         handle.remove()
         inputs_embeds = inputs_embeds_list[0].to(input_ids.device) if inputs_embeds_list else None
@@ -975,30 +1002,10 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
-            handle = self.model.model.language_model.register_forward_pre_hook(
-                hook, with_kwargs=True
-            )
-        elif self.target_model_type == "hunyuan_vl":
-            handle = self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
-        else:
-            raise ValueError(f"Unsupported target model type: {self.target_model_type}")
-
-        pixel_values = kwargs.get("pixel_values", None)
-        if pixel_values is not None:
-            pixel_values = pixel_values.squeeze(0)
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        input_position_ids = kwargs.get("input_position_ids", None)
+        handle = self._register_language_model_hook(hook)
+        forward_kwargs = self._build_vlm_forward_kwargs(input_ids, attention_mask, **kwargs)
         with torch.no_grad():
-            outputs = self.model(
-                input_ids,
-                pixel_values=pixel_values,
-                position_ids=input_position_ids,
-                image_grid_thw=image_grid_thw,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                output_logits=True,
-            )
+            outputs = self.model(input_ids, **forward_kwargs)
 
         handle.remove()
         inputs_embeds = inputs_embeds_list[0].to(input_ids.device) if inputs_embeds_list else None

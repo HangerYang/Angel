@@ -34,6 +34,7 @@ class ChatTemplateType(Enum):
     QWEN3_VL = "qwen3_vl"
     HUNYUAN_7B = "hunyuan_7b"
     HUNYUAN_VL = "hunyuan_vl"
+    SMOLVLM = "smolvlm"
 
 
 # String to ChatTemplateType mapping
@@ -46,6 +47,8 @@ CHAT_TEMPLATE_TYPE_MAPPING = {
     "hunyuan_7b": ChatTemplateType.HUNYUAN_7B,
     "qwen3_vl": ChatTemplateType.QWEN3_VL,
     "hunyuan_vl": ChatTemplateType.HUNYUAN_VL,
+    "smolvlm": ChatTemplateType.SMOLVLM,
+    "idefics3": ChatTemplateType.SMOLVLM,
 }
 
 
@@ -185,6 +188,12 @@ class ChatTemplateManager:
                         "text": "",
                     }
                 ],
+            ),
+            # SmolVLM / Idefics3: "<|im_start|>User: ...<end_of_utterance>\nAssistant: ..."
+            ChatTemplateType.SMOLVLM: ChatTemplate(
+                user_header="User:",
+                assistant_header="Assistant:",
+                system_prompt="",
             ),
         }
 
