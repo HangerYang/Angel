@@ -41,9 +41,6 @@ SAVE_STRATEGY=${SAVE_STRATEGY:-epoch}
 SAVE_STEPS=${SAVE_STEPS:-}
 
 export CUDA_VISIBLE_DEVICES
-# Short-circuit broken single-rank NCCL gather/barrier under torchrun nproc=1.
-# Set to 0 only if you need to debug raw NCCL. Multi-GPU (nproc>1) is unchanged.
-export ANGELSLIM_DIST_SAFETY="${ANGELSLIM_DIST_SAFETY:-1}"
 
 EVAL_ARGS=()
 if [[ -n "${EVAL_DATA_PATH}" ]]; then

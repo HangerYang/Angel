@@ -57,6 +57,42 @@ fi
 
 export CUDA_VISIBLE_DEVICES
 
+# Fail fast if this server's local vLLM is missing the SmolVLM Eagle3 patch.
+python3 - <<'PY'
+import os
+import sys
+
+import vllm
+
+vllm_path = os.path.realpath(vllm.__file__)
+if "third_party/vllm" not in vllm_path.replace("\\", "/"):
+    print(
+        "ERROR: import vllm is not the local third_party checkout:\n"
+        f"  {vllm_path}\n"
+        "  Run: bash third_party/link_local_vllm.sh && source third_party/env.sh",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+from vllm.model_executor.models.idefics3 import Idefics3ForConditionalGeneration
+from vllm.model_executor.models.interfaces import SupportsEagle3
+
+if SupportsEagle3 not in Idefics3ForConditionalGeneration.__mro__:
+    print(
+        "ERROR: local vLLM missing SmolVLM/Idefics3 Eagle3 support "
+        "(Model does not support EAGLE3 interface).\n"
+        "  This patch is tracked in AngelSlim, not upstream vLLM:\n"
+        "    third_party/patches/vllm-v0.25.0-smolvlm-eagle3.patch\n"
+        "  On this server run:\n"
+        "    bash third_party/apply_vllm_patches.sh\n"
+        "  Or full setup:\n"
+        "    bash third_party/link_local_vllm.sh && source third_party/env.sh",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print(f"vLLM Eagle3/SmolVLM OK: {vllm_path}")
+PY
+
 CMD=(
   python3 tools/vllm_offline_eagle3_vlm_batch.py
   --target_model "${TARGET_MODEL}"

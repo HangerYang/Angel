@@ -27,7 +27,7 @@ from angelslim.compressor.speculative import (
     create_target_model,
     get_supported_chat_template_type_strings,
 )
-from angelslim.utils import apply_single_rank_dist_safety, rank0_print
+from angelslim.utils import rank0_print
 
 
 def parse_args():
@@ -265,9 +265,6 @@ def parse_args():
 
 
 def train():
-    # Avoid SIGSEGV on broken single-rank NCCL all_gather/barrier (torchrun nproc=1
-    # + HF Trainer logging / end-of-train). No-op when world_size>1.
-    apply_single_rank_dist_safety()
     args = parse_args()
 
     # Parse torch dtype

@@ -1,0 +1,64 @@
+diff --git a/vllm/model_executor/models/idefics3.py b/vllm/model_executor/models/idefics3.py
+index cf7d51c..c935224 100644
+--- a/vllm/model_executor/models/idefics3.py
++++ b/vllm/model_executor/models/idefics3.py
+@@ -58,6 +58,7 @@ from .idefics2_vision_model import (
+ )
+ from .interfaces import (
+     MultiModalEmbeddings,
++    SupportsEagle3,
+     SupportsLoRA,
+     SupportsMultiModal,
+ )
+@@ -546,7 +547,9 @@ class Idefics3Model(nn.Module):
+     info=Idefics3ProcessingInfo,
+     dummy_inputs=Idefics3DummyInputsBuilder,
+ )
+-class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA):
++class Idefics3ForConditionalGeneration(
++    nn.Module, SupportsMultiModal, SupportsLoRA, SupportsEagle3
++):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -598,6 +601,15 @@ class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLo
+             self.lm_head.weight = self.model.text_model.embed_tokens.weight
+         self.logits_processor = LogitsProcessor(config.text_config.vocab_size)
+ 
++    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        # text_model is LlamaModel (EagleModelMixin); default SupportsEagle3
++        # expects language_model.model, which Idefics3/SmolVLM does not have.
++        self.model.text_model._set_aux_hidden_state_layers(layers)
++
++    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
++        num_layers = len(self.model.text_model.layers)
++        return (2, num_layers // 2, num_layers - 3)
++
+     def _parse_and_validate_image_input(self, **kwargs: object) -> ImageInputs | None:
+         pixel_values = kwargs.pop("pixel_values", None)
+         image_embeds = kwargs.pop("image_embeds", None)
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+index 11961ce..880932d 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+@@ -41,7 +41,19 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+         if hasattr(target_model, "get_language_model")
+         else target_model
+     )
+-    target_inner = target_language_model.model
++    # Most VLMs expose ForCausalLM-style language_model.model (inner decoder).
++    # Idefics3/SmolVLM's get_language_model() returns LlamaModel directly.
++    if hasattr(target_language_model, "model") and hasattr(
++        target_language_model.model, "layers"
++    ):
++        target_inner = target_language_model.model
++    elif hasattr(target_language_model, "layers"):
++        target_inner = target_language_model
++    else:
++        raise AttributeError(
++            f"Cannot locate target decoder layers on "
++            f"{type(target_language_model).__name__}"
++        )
+     draft_inner = eagle_model.model
+ 
+     # Skip embedding sharing under PP — each rank owns its own embedding.

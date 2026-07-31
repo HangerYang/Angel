@@ -229,7 +229,25 @@ Underlying runner (shared with Qwen3-VL / Hunyuan):
 
 `tools/vllm_offline_eagle3_vlm_batch.py`
 
-Requires local vLLM overlay (`source third_party/env.sh`) with SmolVLM Eagle3 support (see below).
+Requires local vLLM overlay with the **tracked** SmolVLM Eagle3 patch applied
+(see below). Stock vLLM raises `Model does not support EAGLE3 interface`.
+
+### Portability (other servers)
+
+Do **not** hand-edit only `third_party/vllm` on one machine — that tree is not
+what other servers get. Eagle3 for SmolVLM is shipped as:
+
+`third_party/patches/vllm-v0.25.0-smolvlm-eagle3.patch`
+
+On every server after cloning vLLM v0.25.0:
+
+```bash
+uv pip install vllm==0.25.0   # or pip
+bash third_party/link_local_vllm.sh   # overlays .so + applies patches/
+source third_party/env.sh
+```
+
+Or only re-apply patches: `bash third_party/apply_vllm_patches.sh`
 
 ---
 
@@ -242,12 +260,13 @@ When Eagle3 eval breaks or you need to change behavior, these are the touch poin
 | **SmolVLM eval launcher** (defaults, dataset, draft path) | `scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh` | Env vars → CLI for the batch tool |
 | **Draft config sync** (1-/multi-layer, aux ids) | `scripts/speculative/smolvlm/prepare_draft_config_for_vllm_eval.py` | Ensures `config.json` has `num_hidden_layers` + `eagle_aux_hidden_state_layer_ids` |
 | **Shared offline batch / metrics** | `tools/vllm_offline_eagle3_vlm_batch.py` | `LLM(..., speculative_config=...)`, acceptance metrics, datasets |
-| **Target: advertise Eagle3 + set aux layers** | `third_party/vllm/vllm/model_executor/models/idefics3.py` | `SupportsEagle3` on `Idefics3ForConditionalGeneration`; `set_aux_hidden_state_layers` → `model.text_model`; `get_eagle3_default_aux_hidden_state_layers` |
-| **SmolVLM class** (inherits Idefics3) | `third_party/vllm/vllm/model_executor/models/smolvlm.py` | Thin subclass; Eagle3 hooks live on Idefics3 |
-| **Wire target embed/HS into draft** | `third_party/vllm/vllm/v1/worker/gpu/spec_decode/eagle/utils.py` | `load_eagle_model`: Idefics3/SmolVLM returns `LlamaModel` directly (`text_model`), not `language_model.model` |
-| **Apply aux layer ids from draft config** | `third_party/vllm/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py` | `set_eagle3_aux_hidden_state_layers` / `get_eagle3_aux_layers_from_config` reads `eagle_aux_hidden_state_layer_ids` |
-| **Draft forward (1- or multi-layer)** | `third_party/vllm/vllm/model_executor/models/llama_eagle3.py` | Builds `num_hidden_layers` blocks; layer 0 = 2H Eagle, rest = H; remaps legacy `midlayer.` → `layers.0.` |
-| **Propose / multi-step draft loop** | `third_party/vllm/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py` | Model Runner V2 Eagle3 propose path |
-| **Train draft JSON** (what gets saved into the checkpoint) | `angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3.json` | Set `num_hidden_layers`, aux ids, optional `draft_layer_init_from_target` before training |
+| **Portable Eagle3 enablement (edit this, not a dirty vllm tree)** | `third_party/patches/vllm-v0.25.0-smolvlm-eagle3.patch` | Applied by `apply_vllm_patches.sh` / `link_local_vllm.sh` |
+| **Target: advertise Eagle3 + set aux layers** *(after patch)* | `third_party/vllm/.../idefics3.py` | `SupportsEagle3`; `set_aux_hidden_state_layers` → `model.text_model` |
+| **SmolVLM class** (inherits Idefics3) | `third_party/vllm/.../smolvlm.py` | Thin subclass; Eagle3 hooks live on Idefics3 |
+| **Wire target embed/HS into draft** *(after patch)* | `third_party/vllm/.../eagle/utils.py` | `load_eagle_model`: `text_model` is LlamaModel directly |
+| **Apply aux layer ids from draft config** | `third_party/vllm/.../eagle/eagle3_utils.py` | reads `eagle_aux_hidden_state_layer_ids` |
+| **Draft forward (1- or multi-layer)** | `third_party/vllm/.../llama_eagle3.py` | `num_hidden_layers` blocks; layer 0 = 2H Eagle |
+| **Propose / multi-step draft loop** | `third_party/vllm/.../autoregressive/speculator.py` | Model Runner V2 Eagle3 propose path |
+| **Train draft JSON** | `angelslim/.../configs/smolvlm-256m-eagle3.json` | `num_hidden_layers`, aux ids, optional init |
 
-Setup reminder: `bash third_party/link_local_vllm.sh && source third_party/env.sh` (see `third_party/README.md`).
+Setup: `bash third_party/link_local_vllm.sh && source third_party/env.sh` (see `third_party/README.md`).

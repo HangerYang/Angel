@@ -14,7 +14,6 @@
 
 from .config_parser import SlimConfigParser, parse_json_full_config  # noqa: F401
 from .default_compress_config import *  # noqa: F401 F403
-from .dist_safety import apply_single_rank_dist_safety  # noqa: F401
 from .lazy_imports import *  # noqa: F401 F403
 from .utils import common_prefix  # noqa: F401
 from .utils import decide_device_for_distributed  # noqa: F401
