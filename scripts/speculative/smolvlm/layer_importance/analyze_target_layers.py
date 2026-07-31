@@ -318,8 +318,8 @@ def analyze_batch(
 
 def _mean_maps(
     accum: Dict[str, Dict[int, List[float]]], num_layers: int
-) -> Dict[str, LayerScores]:
-    out: Dict[str, LayerScores] = {}
+) -> Dict[int, LayerScores]:
+    out: Dict[int, LayerScores] = {}
     for layer_id in range(num_layers):
         ls = LayerScores(layer_id=layer_id)
         for name in (
@@ -341,40 +341,250 @@ def _mean_maps(
     return out
 
 
-def _banded_pick(
-    scores: Dict[int, LayerScores],
-    num_layers: int,
-    primary: str = "ce_grad",
-    higher_is_better: bool = True,
-    exclude_first: int = 1,
-    exclude_last: int = 1,
-) -> List[int]:
-    """Pick one layer from early / mid / late bands by primary score."""
+METRIC_SPECS = {
+    # metric_key on LayerScores -> (enabled_group, higher_is_better, display_name)
+    "ce_grad": ("ce_grad", True, "ce_grad"),
+    "agreement_kl": ("agreement", False, "agreement_kl"),
+    "agreement_ce": ("agreement", False, "agreement_ce"),
+    "delta_rel": ("delta", True, "delta_rel"),
+    "info_eff_rank": ("info", True, "info_eff_rank"),
+    "info_var": ("info", True, "info_var"),
+    "image_attn": ("image_attn", True, "image_attn"),
+}
+
+
+def _band_ranges(
+    num_layers: int, exclude_first: int = 1, exclude_last: int = 1
+) -> List[range]:
     lo = min(exclude_first, num_layers - 1)
     hi = max(lo + 1, num_layers - exclude_last)
     span = hi - lo
     b0 = lo + max(1, span // 3)
     b1 = lo + max(2, (2 * span) // 3)
-    bands = [
-        range(lo, b0),
-        range(b0, b1),
-        range(b1, hi),
-    ]
-    picks = []
-    for band in bands:
-        cand = [i for i in band if i in scores]
-        if not cand:
+    return [range(lo, b0), range(b0, b1), range(b1, hi)]
+
+
+def _metric_value(scores: Dict[int, LayerScores], layer_id: int, metric: str) -> Optional[float]:
+    v = getattr(scores[layer_id], metric)
+    return None if v is None else float(v)
+
+
+def _rank_layers(
+    scores: Dict[int, LayerScores],
+    metric: str,
+    higher_is_better: bool,
+    num_layers: int,
+) -> List[Dict[str, Any]]:
+    """Global rank list: [{layer_id, score, global_rank}, ...] best→worst."""
+    rows = []
+    for lid in range(num_layers):
+        v = _metric_value(scores, lid, metric)
+        if v is None:
             continue
+        rows.append({"layer_id": lid, "score": v})
+    rows.sort(key=lambda r: r["score"], reverse=higher_is_better)
+    for i, r in enumerate(rows):
+        r["global_rank"] = i + 1
+    return rows
 
-        def key(i, _p=primary):
-            v = getattr(scores[i], _p)
+
+def _band_ranks(
+    scores: Dict[int, LayerScores],
+    metric: str,
+    higher_is_better: bool,
+    num_layers: int,
+) -> Dict[str, Any]:
+    """Per-band ranking + band top-1 pick of 3."""
+    band_names = ["early", "mid", "late"]
+    bands_out = {}
+    picks = []
+    for name, band in zip(band_names, _band_ranges(num_layers)):
+        rows = []
+        for lid in band:
+            v = _metric_value(scores, lid, metric)
             if v is None:
-                return float("-inf") if higher_is_better else float("inf")
-            return v
+                continue
+            rows.append({"layer_id": lid, "score": v})
+        rows.sort(key=lambda r: r["score"], reverse=higher_is_better)
+        for i, r in enumerate(rows):
+            r["band_rank"] = i + 1
+        bands_out[name] = {
+            "layer_range": [band.start, band.stop - 1],
+            "ranking": rows,
+            "top1": rows[0]["layer_id"] if rows else None,
+        }
+        if rows:
+            picks.append(rows[0]["layer_id"])
+    return {"bands": bands_out, "top3_band": picks}
 
-        best = max(cand, key=key) if higher_is_better else min(cand, key=key)
-        picks.append(best)
-    return picks
+
+def _top3_global(global_ranking: List[Dict[str, Any]]) -> List[int]:
+    return [r["layer_id"] for r in global_ranking[:3]]
+
+
+def _random_triple(num_layers: int, seed: int, exclude_last: int = 1) -> List[int]:
+    import random
+
+    rng = random.Random(seed)
+    pool = list(range(0, max(1, num_layers - exclude_last)))
+    if len(pool) < 3:
+        return pool
+    return sorted(rng.sample(pool, 3))
+
+
+def _set_vs_final_metrics(
+    features: List[torch.Tensor], target: torch.Tensor, pos_mask: torch.Tensor
+) -> Dict[str, float]:
+    """How close a layer set is to final HS (no learned map).
+
+    - mean_cos / max_cos: cosine of each selected layer to final, then mean/max
+    - mean_mse_rel: mean relative MSE of each selected layer to final
+    """
+    if not features or not pos_mask.any():
+        return {"mean_cos": 0.0, "max_cos": 0.0, "mean_mse_rel": 1.0}
+    y = target.float()[pos_mask]
+    cos_list, mse_list = [], []
+    denom = y.pow(2).mean().clamp_min(1e-6)
+    for f in features:
+        x = f.float()[pos_mask]
+        cos_list.append(F.cosine_similarity(x, y, dim=-1).mean())
+        mse_list.append((x - y).pow(2).mean() / denom)
+    cos_t = torch.stack(cos_list)
+    mse_t = torch.stack(mse_list)
+    return {
+        "mean_cos": float(cos_t.mean().item()),
+        "max_cos": float(cos_t.max().item()),
+        "mean_mse_rel": float(mse_t.mean().item()),
+    }
+
+
+@torch.no_grad()
+def evaluate_layer_sets(
+    model,
+    loader: DataLoader,
+    device: torch.device,
+    image_token_id: int,
+    candidate_sets: Dict[str, List[int]],
+    num_layers: int,
+    max_eval_batches: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Score sets by closeness to final HS; full = all layers except last."""
+    last_id = num_layers - 1
+    full_ids = list(range(last_id))
+
+    def _sanitize(ids: List[int]) -> List[int]:
+        out = [i for i in ids if 0 <= i < last_id]
+        return out if out else full_ids[:3]
+
+    sanitized = {k: _sanitize(v) for k, v in candidate_sets.items()}
+    all_names = list(sanitized.keys()) + ["full_layers"]
+    sums = {
+        n: {"mean_cos": 0.0, "max_cos": 0.0, "mean_mse_rel": 0.0, "n": 0}
+        for n in all_names
+    }
+
+    for step, batch in enumerate(loader):
+        if max_eval_batches is not None and step >= max_eval_batches:
+            break
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        loss_mask = batch["loss_mask"].to(device)
+        pos_mask = _build_loss_mask_positions(loss_mask, attention_mask)
+        fwd = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+        if "pixel_values" in batch and batch["pixel_values"] is not None:
+            fwd["pixel_values"] = batch["pixel_values"].to(device)
+        if "pixel_attention_mask" in batch and batch["pixel_attention_mask"] is not None:
+            fwd["pixel_attention_mask"] = batch["pixel_attention_mask"].to(device)
+
+        out = model(**fwd)
+        hs = out.hidden_states
+        h_final = hs[-1]
+
+        def feats(ids: List[int]) -> List[torch.Tensor]:
+            return [hs[i + 1] for i in ids]
+
+        for name, ids in sanitized.items():
+            m = _set_vs_final_metrics(feats(ids), h_final, pos_mask)
+            for k in ("mean_cos", "max_cos", "mean_mse_rel"):
+                sums[name][k] += m[k]
+            sums[name]["n"] += 1
+
+        m_full = _set_vs_final_metrics(feats(full_ids), h_final, pos_mask)
+        for k in ("mean_cos", "max_cos", "mean_mse_rel"):
+            sums["full_layers"][k] += m_full[k]
+        sums["full_layers"]["n"] += 1
+
+        if (step + 1) % 5 == 0:
+            print(f"  eval batch {step + 1}")
+
+    results = {}
+    full = sums["full_layers"]
+    n_full = max(full["n"], 1)
+    full_cos = full["mean_cos"] / n_full
+    full_mse = full["mean_mse_rel"] / n_full
+
+    for name, s in sums.items():
+        n = max(s["n"], 1)
+        mean_cos = s["mean_cos"] / n
+        max_cos = s["max_cos"] / n
+        mean_mse = s["mean_mse_rel"] / n
+        results[name] = {
+            "layers_requested": candidate_sets.get(name, full_ids),
+            "layers_eval": sanitized.get(name, full_ids),
+            "mean_cos": mean_cos,
+            "max_cos": max_cos,
+            "mean_mse_rel": mean_mse,
+            "full_mean_cos": full_cos,
+            "full_mean_mse_rel": full_mse,
+            "gap_cos": full_cos - mean_cos,
+            "gap_mse": mean_mse - full_mse,
+            # Higher better: closeness to final, relative to full-set mean cos.
+            "final_score": mean_cos / max(full_cos, 1e-6),
+        }
+    return results
+
+
+def _build_metric_reports(
+    scores: Dict[int, LayerScores],
+    enabled: set,
+    num_layers: int,
+    n_image: int,
+) -> Dict[str, Any]:
+    reports = {}
+    for metric, (group, higher, _) in METRIC_SPECS.items():
+        if group not in enabled:
+            continue
+        if metric == "image_attn" and n_image == 0:
+            reports[metric] = {
+                "status": "skipped",
+                "reason": "no image samples",
+                "higher_is_better": higher,
+            }
+            continue
+        # Skip if all null/zero unused
+        if all(_metric_value(scores, i, metric) is None for i in range(num_layers)):
+            continue
+        glob = _rank_layers(scores, metric, higher, num_layers)
+        band = _band_ranks(scores, metric, higher, num_layers)
+        reports[metric] = {
+            "higher_is_better": higher,
+            "global_ranking": glob,
+            "top3_global": _top3_global(glob),
+            "band_ranking": band["bands"],
+            "top3_band": band["top3_band"],
+            "summary": {
+                "best_global": glob[0] if glob else None,
+                "worst_global": glob[-1] if glob else None,
+                "top3_global": _top3_global(glob),
+                "top3_band": band["top3_band"],
+            },
+        }
+    return reports
 
 
 def _print_table(scores: Dict[int, LayerScores], n_image: int, n_text: int):
@@ -393,6 +603,19 @@ def _print_table(scores: Dict[int, LayerScores], n_image: int, n_text: int):
         print(
             f"{lid:3d}  {s.ce_grad:10.4g}  {s.agreement_kl:10.4g}  {s.agreement_ce:10.4g}  "
             f"{s.delta_rel:10.4g}  {s.info_eff_rank:9.3f}  {s.info_var:10.4g}  {img:>10}"
+        )
+
+
+def _print_metric_summaries(reports: Dict[str, Any]):
+    print("\n=== Per-metric summary (global top3 | band top3) ===")
+    for metric, rep in reports.items():
+        if rep.get("status") == "skipped":
+            print(f"  {metric}: skipped ({rep.get('reason')})")
+            continue
+        s = rep["summary"]
+        print(
+            f"  {metric}: global={s['top3_global']}  band={s['top3_band']}  "
+            f"(higher_is_better={rep['higher_is_better']})"
         )
 
 
@@ -433,6 +656,18 @@ def parse_args():
         help="Deprecated: omit image_attn from --metrics instead",
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--eval-random",
+        action="store_true",
+        default=os.environ.get("EVAL_RANDOM", "").lower() in ("1", "true", "yes"),
+        help="Also evaluate a random 3-layer set",
+    )
+    p.add_argument("--num-random", type=int, default=1, help="How many random triples")
+    p.add_argument(
+        "--skip-eval",
+        action="store_true",
+        help="Skip selected-vs-full reconstruction eval",
+    )
     return p.parse_args()
 
 
@@ -454,7 +689,6 @@ def main():
         "float32": torch.float32,
     }[args.dtype]
 
-    # eager required only when collecting attentions
     attn_impl = "eager" if "image_attn" in enabled else "sdpa"
     print(
         f"Loading processor/model from {args.model_path} → {device}, "
@@ -528,30 +762,73 @@ def main():
     scores = _mean_maps(accum, num_layers)
     _print_table(scores, n_image, n_text)
 
-    banded: Dict[str, Any] = {}
-    if "ce_grad" in enabled:
-        banded["ce_grad"] = _banded_pick(
-            scores, num_layers, primary="ce_grad", higher_is_better=True
-        )
-    if "agreement" in enabled:
-        banded["agreement_kl"] = _banded_pick(
-            scores, num_layers, primary="agreement_kl", higher_is_better=False
-        )
-    if "delta" in enabled:
-        banded["delta_rel"] = _banded_pick(
-            scores, num_layers, primary="delta_rel", higher_is_better=True
-        )
-    if "info" in enabled:
-        banded["info_eff_rank"] = _banded_pick(
-            scores, num_layers, primary="info_eff_rank", higher_is_better=True
-        )
-    if "image_attn" in enabled:
-        banded["image_attn"] = (
-            _banded_pick(scores, num_layers, primary="image_attn", higher_is_better=True)
-            if n_image > 0
-            else None
-        )
+    # --- 1) per-metric global + band ranks ---
+    metric_reports = _build_metric_reports(scores, enabled, num_layers, n_image)
+    _print_metric_summaries(metric_reports)
 
+    # --- 2/3) candidate sets: band top3 + global top3 (+ random) ---
+    candidate_sets: Dict[str, List[int]] = {
+        "depth_baseline": depth_ids,
+    }
+    for metric, rep in metric_reports.items():
+        if rep.get("status") == "skipped":
+            continue
+        candidate_sets[f"{metric}__band"] = list(rep["top3_band"])
+        candidate_sets[f"{metric}__global"] = list(rep["top3_global"])
+
+    if args.eval_random:
+        for r in range(args.num_random):
+            candidate_sets[f"random_{r}"] = _random_triple(
+                num_layers, seed=args.seed + r
+            )
+
+    evaluation = {}
+    comparison_rows = []
+    if not args.skip_eval:
+        print("\n=== Eval: selected vs full (closeness to final HS) ===")
+        evaluation = evaluate_layer_sets(
+            model,
+            loader,
+            device=device,
+            image_token_id=image_token_id,
+            candidate_sets=candidate_sets,
+            num_layers=num_layers,
+        )
+        # Rank methods by final_score (excl. full_layers reference)
+        ranked = sorted(
+            ((k, v) for k, v in evaluation.items() if k != "full_layers"),
+            key=lambda kv: kv[1]["final_score"],
+            reverse=True,
+        )
+        print(
+            f"{'method':<28} {'layers_eval':<16} {'mean_cos':>8} {'mse':>8} "
+            f"{'gap_cos':>8} {'score':>7}"
+        )
+        print("-" * 86)
+        for name, ev in ranked:
+            layers = ev.get("layers_eval", ev.get("layers"))
+            comparison_rows.append(
+                {
+                    "method": name,
+                    "layers": layers,
+                    "layers_requested": ev.get("layers_requested", layers),
+                    "mean_cos": ev["mean_cos"],
+                    "mean_mse_rel": ev["mean_mse_rel"],
+                    "gap_cos": ev["gap_cos"],
+                    "gap_mse": ev["gap_mse"],
+                    "final_score": ev["final_score"],
+                }
+            )
+            print(
+                f"{name:<28} {str(layers):<16} "
+                f"{ev['mean_cos']:8.4f} {ev['mean_mse_rel']:8.4g} "
+                f"{ev['gap_cos']:8.4f} {ev['final_score']:7.4f}"
+            )
+        if ranked:
+            print(
+                f"\nBest method: {ranked[0][0]}  "
+                f"layers={ranked[0][1].get('layers_eval', ranked[0][1].get('layers'))}"
+            )
     tag = "all" if enabled == set(ALL_METRICS) else "+".join(sorted(enabled))
     summary = {
         "model_path": args.model_path,
@@ -562,12 +839,17 @@ def main():
         "n_image": n_image,
         "n_text_only": n_text,
         "depth_only_baseline": depth_ids,
-        "banded_selection": banded,
-        "suggested_aux_hidden_states_layer_ids": banded.get("ce_grad"),
+        "metric_reports": metric_reports,
+        "candidate_sets": candidate_sets,
+        "evaluation": evaluation,
+        "final_comparison": comparison_rows,
         "note": (
-            "Layer ids match AngelSlim aux_hidden_states_layer_ids "
-            "(HF hidden_states index = id + 1). "
-            "image_attn is N/A when n_image=0."
+            "Per metric: global_ranking + band_ranking (early/mid/late). "
+            "Eval: mean cosine / MSE of selected layers vs final-layer HS, "
+            "compared to full_layers (all but last). "
+            "final_score = mean_cos / full_mean_cos. "
+            "Last layer stripped from eval features if present in a pick. "
+            "Layer ids = AngelSlim aux_hidden_states_layer_ids (HF hs[id+1])."
         ),
         "layers": [asdict(scores[i]) for i in range(num_layers)],
     }
@@ -575,10 +857,40 @@ def main():
     json_path = os.path.join(args.output_dir, f"layer_importance_{tag}.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
-    # Also write stable names for the all-metrics run
-    if enabled == set(ALL_METRICS):
-        with open(os.path.join(args.output_dir, "layer_importance.json"), "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
+
+    # Compact metric summaries
+    metrics_path = os.path.join(args.output_dir, f"metric_summaries_{tag}.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {m: r.get("summary", r) for m, r in metric_reports.items()},
+            f,
+            indent=2,
+        )
+
+    # Final comparison CSV
+    if comparison_rows:
+        cmp_path = os.path.join(args.output_dir, f"final_comparison_{tag}.csv")
+        with open(cmp_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "method",
+                    "layers",
+                    "layers_requested",
+                    "mean_cos",
+                    "mean_mse_rel",
+                    "gap_cos",
+                    "gap_mse",
+                    "final_score",
+                ],
+            )
+            w.writeheader()
+            for row in comparison_rows:
+                out = dict(row)
+                out["layers"] = json.dumps(out["layers"])
+                out["layers_requested"] = json.dumps(out.get("layers_requested", []))
+                w.writerow(out)
+        print(f"Wrote {cmp_path}")
 
     csv_path = os.path.join(args.output_dir, f"layer_importance_{tag}.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -598,31 +910,9 @@ def main():
         w.writeheader()
         for i in range(num_layers):
             w.writerow(asdict(scores[i]))
-    if enabled == set(ALL_METRICS):
-        with open(
-            os.path.join(args.output_dir, "layer_importance.csv"), "w", newline="", encoding="utf-8"
-        ) as f:
-            w = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "layer_id",
-                    "ce_grad",
-                    "agreement_kl",
-                    "agreement_ce",
-                    "delta_rel",
-                    "info_eff_rank",
-                    "info_var",
-                    "image_attn",
-                ],
-            )
-            w.writeheader()
-            for i in range(num_layers):
-                w.writerow(asdict(scores[i]))
 
-    print("\nDepth-only baseline:     ", depth_ids)
-    for k, v in banded.items():
-        print(f"Banded pick ({k}): {v}")
     print(f"\nWrote {json_path}")
+    print(f"Wrote {metrics_path}")
     print(f"Wrote {csv_path}")
 
 

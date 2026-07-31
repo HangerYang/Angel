@@ -27,7 +27,7 @@ from angelslim.compressor.speculative import (
     create_target_model,
     get_supported_chat_template_type_strings,
 )
-from angelslim.utils import rank0_print
+from angelslim.utils import apply_single_rank_dist_safety, rank0_print
 
 
 def parse_args():
@@ -265,6 +265,9 @@ def parse_args():
 
 
 def train():
+    # Avoid SIGSEGV on broken single-rank NCCL all_gather/barrier (torchrun nproc=1
+    # + HF Trainer logging / end-of-train). No-op when world_size>1.
+    apply_single_rank_dist_safety()
     args = parse_args()
 
     # Parse torch dtype
@@ -306,14 +309,26 @@ def train():
             target_layer_weight_prefix=getattr(
                 draft_model_config, "target_layer_weight_prefix", None
             ),
+            layer0_embed_init_from_target=int(
+                getattr(draft_model_config, "draft_layer0_embed_init_from_target", 0)
+            ),
         )
-    # vLLM reads eagle_aux_hidden_state_layer_ids from the saved draft config.
-    aux_ids = getattr(draft_model_config, "aux_hidden_states_layer_ids", None) or getattr(
-        draft_model_config, "eagle_aux_hidden_state_layer_ids", None
-    )
+    # Fusion aux layers (train) vs vLLM indices (often train_id + 1).
+    aux_ids = getattr(draft_model_config, "aux_hidden_states_layer_ids", None)
+    eagle_aux_ids = getattr(draft_model_config, "eagle_aux_hidden_state_layer_ids", None)
     if aux_ids is not None:
         draft_model.config.aux_hidden_states_layer_ids = list(aux_ids)
-        draft_model.config.eagle_aux_hidden_state_layer_ids = list(aux_ids)
+        if eagle_aux_ids is None:
+            # AngelSlim train uses hs[id+1]; vLLM records after layer id directly.
+            eagle_aux_ids = [int(i) + 1 for i in aux_ids]
+    if eagle_aux_ids is not None:
+        draft_model.config.eagle_aux_hidden_state_layer_ids = list(eagle_aux_ids)
+    rank0_print(
+        "Draft fusion aux layers (train): "
+        f"{getattr(draft_model.config, 'aux_hidden_states_layer_ids', None)}; "
+        "vLLM eagle_aux: "
+        f"{getattr(draft_model.config, 'eagle_aux_hidden_state_layer_ids', None)}"
+    )
     rank0_print("Draft model loaded successfully")
 
     # Create datasets using DatasetManager

@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+# Copyright 2025 Tencent Inc. All Rights Reserved.
+"""Ensure a trained SmolVLM Eagle3 draft checkpoint is ready for vLLM eval.
+
+Reads ``num_hidden_layers`` (1 or multi-layer) and aux-layer ids from the draft
+checkpoint and/or the AngelSlim train draft JSON, then writes any missing
+vLLM-facing fields into ``<draft_model>/config.json``.
+
+vLLM reads:
+  - ``num_hidden_layers`` — draft depth (layer 0 = Eagle 2H, rest = standard H)
+  - ``eagle_aux_hidden_state_layer_ids`` — target layers that feed fused HS
+
+AngelSlim train uses ``aux_hidden_states_layer_ids`` (HF ``hs[id+1]``). If only
+that list is present, this script sets ``eagle_aux = [id+1 for id in aux]``,
+matching ``tools/train_eagle3_online.py``.
+
+Usage:
+  python scripts/speculative/smolvlm/prepare_draft_config_for_vllm_eval.py \\
+      --draft_model output/smolvlm_256m_eagle3_online \\
+      --draft_model_config_path \\
+          angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected JSON object in {path}")
+    return data
+
+
+def _as_int_list(value: Any, field: str) -> Optional[List[int]]:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        raise ValueError(f"{field} must be a non-empty list of ints, got {value!r}")
+    return [int(x) for x in value]
+
+
+def prepare_draft_config(
+    draft_model: Path,
+    draft_model_config_path: Optional[Path] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    config_path = draft_model / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"Draft checkpoint config not found: {config_path}. "
+            "Train with a save strategy that writes the draft (e.g. "
+            "SAVE_STRATEGY=epoch) or point --draft_model at a saved dir."
+        )
+
+    cfg = _load_json(config_path)
+    train_cfg: Dict[str, Any] = {}
+    if draft_model_config_path is not None:
+        if not draft_model_config_path.is_file():
+            raise FileNotFoundError(
+                f"Train draft config not found: {draft_model_config_path}"
+            )
+        train_cfg = _load_json(draft_model_config_path)
+
+    # Prefer checkpoint values; fill gaps from the train JSON used to build it.
+    num_layers = cfg.get("num_hidden_layers", train_cfg.get("num_hidden_layers"))
+    if num_layers is None:
+        raise ValueError(
+            "num_hidden_layers missing from draft config.json and train config. "
+            "Set it explicitly (1 for single-layer, >1 for multi-layer draft)."
+        )
+    num_layers = int(num_layers)
+
+    aux_ids = _as_int_list(
+        cfg.get("aux_hidden_states_layer_ids", train_cfg.get("aux_hidden_states_layer_ids")),
+        "aux_hidden_states_layer_ids",
+    )
+    eagle_aux_ids = _as_int_list(
+        cfg.get(
+            "eagle_aux_hidden_state_layer_ids",
+            train_cfg.get("eagle_aux_hidden_state_layer_ids"),
+        ),
+        "eagle_aux_hidden_state_layer_ids",
+    )
+    if eagle_aux_ids is None and aux_ids is not None:
+        eagle_aux_ids = [i + 1 for i in aux_ids]
+
+    if eagle_aux_ids is None:
+        raise ValueError(
+            "Need eagle_aux_hidden_state_layer_ids (vLLM) or "
+            "aux_hidden_states_layer_ids (train) in draft/train config."
+        )
+
+    draft_init = cfg.get(
+        "draft_layer_init_from_target",
+        train_cfg.get("draft_layer_init_from_target"),
+    )
+    if draft_init is not None:
+        draft_init = _as_int_list(draft_init, "draft_layer_init_from_target")
+        if len(draft_init) != num_layers:
+            raise ValueError(
+                f"draft_layer_init_from_target length ({len(draft_init)}) must "
+                f"equal num_hidden_layers ({num_layers})"
+            )
+
+    updates: Dict[str, Any] = {
+        "num_hidden_layers": num_layers,
+        "eagle_aux_hidden_state_layer_ids": eagle_aux_ids,
+    }
+    if aux_ids is not None:
+        updates["aux_hidden_states_layer_ids"] = aux_ids
+    if draft_init is not None:
+        updates["draft_layer_init_from_target"] = draft_init
+    for key in (
+        "draft_layer0_embed_init_from_target",
+        "target_model_type",
+        "modal_type",
+        "draft_vocab_size",
+        "image_token_id",
+    ):
+        if key not in cfg and key in train_cfg:
+            updates[key] = train_cfg[key]
+
+    changed = {k: v for k, v in updates.items() if cfg.get(k) != v}
+    cfg.update(updates)
+
+    print("SmolVLM Eagle3 draft config for vLLM eval:")
+    print(f"  draft_model: {draft_model}")
+    print(f"  num_hidden_layers: {num_layers} "
+          f"({'single-layer' if num_layers == 1 else f'{num_layers}-layer'} draft)")
+    print(f"  aux_hidden_states_layer_ids (train): {cfg.get('aux_hidden_states_layer_ids')}")
+    print(f"  eagle_aux_hidden_state_layer_ids (vLLM): "
+          f"{cfg.get('eagle_aux_hidden_state_layer_ids')}")
+    if draft_init is not None:
+        print(f"  draft_layer_init_from_target: {draft_init}")
+    if changed:
+        print(f"  updating config.json fields: {sorted(changed)}")
+        if not dry_run:
+            with config_path.open("w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            print(f"  wrote {config_path}")
+    else:
+        print("  config.json already has required fields; no write needed")
+
+    return cfg
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--draft_model",
+        type=Path,
+        required=True,
+        help="Path to trained draft checkpoint directory (contains config.json)",
+    )
+    p.add_argument(
+        "--draft_model_config_path",
+        type=Path,
+        default=None,
+        help="Optional AngelSlim train draft JSON to fill missing fields",
+    )
+    p.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Validate/print only; do not rewrite config.json",
+    )
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    prepare_draft_config(
+        draft_model=args.draft_model,
+        draft_model_config_path=args.draft_model_config_path,
+        dry_run=args.dry_run,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

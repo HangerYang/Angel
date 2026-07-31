@@ -667,13 +667,17 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         layer_ids: List[int],
         embed_weight_key: Optional[str] = None,
         target_layer_weight_prefix: Optional[str] = None,
+        layer0_embed_init_from_target: int = 0,
     ):
         """
         Initialize draft layers from selected target decoder layers.
 
-        Layer 0 (2H QKV): copy norms/MLP/o_proj; put target QKV on the HS half of
-        the 2H projection and zero the embed half.
-        Later layers: full H→H copy of attn/MLP/norms.
+        Layer 0 (2H QKV, dual norm):
+          - emb path (input_layernorm + QKV emb half) ← target layer
+            ``layer0_embed_init_from_target`` (default 0; input ≈ embeddings)
+          - HS path (hidden_norm + QKV HS half + o_proj/MLP/post-norm) ←
+            ``layer_ids[0]`` (intermediate; input is fused HS)
+        Later layers: full H→H copy from ``layer_ids[i]``.
         """
         if layer_ids is None:
             return
@@ -694,12 +698,9 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 )
             target_layer_weight_prefix = infer_target_layer_weight_prefix(embed_weight_key)
 
-        # Collect keys we need, then load once.
-        needed: List[str] = []
-        plan: List[Tuple[int, int, Dict[str, str]]] = []  # draft_idx, target_idx, name_map
-        for draft_idx, target_idx in enumerate(layer_ids):
+        def _layer_name_map(target_idx: int) -> Dict[str, str]:
             prefix = f"{target_layer_weight_prefix}.{target_idx}"
-            name_map = {
+            return {
                 "self_attn.q_proj.weight": f"{prefix}.self_attn.q_proj.weight",
                 "self_attn.k_proj.weight": f"{prefix}.self_attn.k_proj.weight",
                 "self_attn.v_proj.weight": f"{prefix}.self_attn.v_proj.weight",
@@ -710,8 +711,17 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 "input_layernorm.weight": f"{prefix}.input_layernorm.weight",
                 "post_attention_layernorm.weight": f"{prefix}.post_attention_layernorm.weight",
             }
+
+        # Collect keys we need, then load once.
+        needed: List[str] = []
+        plan: List[Tuple[int, int, Dict[str, str]]] = []  # draft_idx, target_idx, name_map
+        for draft_idx, target_idx in enumerate(layer_ids):
+            name_map = _layer_name_map(target_idx)
             needed.extend(name_map.values())
             plan.append((draft_idx, target_idx, name_map))
+
+        emb_src_map = _layer_name_map(int(layer0_embed_init_from_target))
+        needed.extend(emb_src_map.values())
 
         tensors = self._load_weight_tensors(target_model_name_or_path, needed)
         missing = [k for k in needed if k not in tensors]
@@ -727,37 +737,57 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 layer = self.layers[draft_idx]
                 src = {k: tensors[v] for k, v in name_map.items()}
 
-                def _copy(param: torch.nn.Parameter, tensor: torch.Tensor):
+                def _copy(param: torch.nn.Parameter, tensor: torch.Tensor, what: str = ""):
                     if param.shape != tensor.shape:
                         raise ValueError(
                             f"Shape mismatch when init draft layer {draft_idx} "
-                            f"from target layer {target_idx}: "
+                            f"({what}) from target layer {target_idx}: "
                             f"{tuple(param.shape)} vs {tuple(tensor.shape)}"
                         )
                     param.copy_(tensor.to(dtype=param.dtype, device=param.device))
 
-                # Norms / MLP / o_proj: always full copy.
-                _copy(layer.mlp.gate_proj.weight, src["mlp.gate_proj.weight"])
-                _copy(layer.mlp.up_proj.weight, src["mlp.up_proj.weight"])
-                _copy(layer.mlp.down_proj.weight, src["mlp.down_proj.weight"])
-                _copy(layer.post_attention_layernorm.weight, src["post_attention_layernorm.weight"])
-                _copy(layer.self_attn.o_proj.weight, src["self_attn.o_proj.weight"])
+                # Residual-stream body always from the mapped HS source layer.
+                _copy(layer.mlp.gate_proj.weight, src["mlp.gate_proj.weight"], "mlp.gate")
+                _copy(layer.mlp.up_proj.weight, src["mlp.up_proj.weight"], "mlp.up")
+                _copy(layer.mlp.down_proj.weight, src["mlp.down_proj.weight"], "mlp.down")
+                _copy(
+                    layer.post_attention_layernorm.weight,
+                    src["post_attention_layernorm.weight"],
+                    "post_attn_norm",
+                )
+                _copy(layer.self_attn.o_proj.weight, src["self_attn.o_proj.weight"], "o_proj")
 
                 if draft_idx == 0:
-                    # HS stream norm ← target input_layernorm; embed norm also seeded from it.
-                    _copy(layer.hidden_norm.weight, src["input_layernorm.weight"])
-                    _copy(layer.input_layernorm.weight, src["input_layernorm.weight"])
-                    # QKV: [out, 2H] with cat(emb, hs) → put target weights on HS half.
+                    emb_src = {k: tensors[v] for k, v in emb_src_map.items()}
+                    # Emb path ← target first (or configured) layer.
+                    _copy(
+                        layer.input_layernorm.weight,
+                        emb_src["input_layernorm.weight"],
+                        "emb input_layernorm",
+                    )
+                    # HS path ← mapped intermediate layer.
+                    _copy(
+                        layer.hidden_norm.weight,
+                        src["input_layernorm.weight"],
+                        "hidden_norm",
+                    )
+                    # QKV: [out, 2H] = cat(emb, hs) → fill both halves from two sources.
                     for proj_name in ("q_proj", "k_proj", "v_proj"):
                         draft_w = getattr(layer.self_attn, proj_name).weight
-                        tgt_w = src[f"self_attn.{proj_name}.weight"]
-                        if draft_w.shape[-1] != 2 * h or tgt_w.shape[-1] != h:
+                        emb_w = emb_src[f"self_attn.{proj_name}.weight"]
+                        hs_w = src[f"self_attn.{proj_name}.weight"]
+                        if draft_w.shape[-1] != 2 * h or emb_w.shape[-1] != h or hs_w.shape[-1] != h:
                             raise ValueError(
                                 f"Expected draft layer0 {proj_name} in_features=2H and "
-                                f"target in_features=H; got {draft_w.shape} / {tgt_w.shape}"
+                                f"target in_features=H; got {draft_w.shape} / "
+                                f"{emb_w.shape} / {hs_w.shape}"
                             )
-                        draft_w.zero_()
-                        draft_w[:, h:].copy_(tgt_w.to(dtype=draft_w.dtype, device=draft_w.device))
+                        draft_w[:, :h].copy_(
+                            emb_w.to(dtype=draft_w.dtype, device=draft_w.device)
+                        )
+                        draft_w[:, h:].copy_(
+                            hs_w.to(dtype=draft_w.dtype, device=draft_w.device)
+                        )
                 else:
                     _copy(layer.input_layernorm.weight, src["input_layernorm.weight"])
                     _copy(layer.self_attn.q_proj.weight, src["self_attn.q_proj.weight"])
@@ -766,7 +796,8 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
 
         print(
             f"Initialized draft layers from target layers {layer_ids} "
-            f"(prefix={target_layer_weight_prefix})"
+            f"(layer0 emb path from target layer {layer0_embed_init_from_target}; "
+            f"prefix={target_layer_weight_prefix})"
         )
 
     def forward(

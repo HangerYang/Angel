@@ -35,8 +35,15 @@ SAMPLE_NUM=${SAMPLE_NUM:-}
 DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-}
 # Reuse HF datasets preprocess cache across restarts (true/false).
 LOAD_FROM_CACHE_FILE=${LOAD_FROM_CACHE_FILE:-true}
+# Save draft for vLLM eval. Use "epoch" (or steps) so OUTPUT_DIR has config.json + weights.
+# Set SAVE_STRATEGY=no only for throwaway smoke runs.
+SAVE_STRATEGY=${SAVE_STRATEGY:-epoch}
+SAVE_STEPS=${SAVE_STEPS:-}
 
 export CUDA_VISIBLE_DEVICES
+# Short-circuit broken single-rank NCCL gather/barrier under torchrun nproc=1.
+# Set to 0 only if you need to debug raw NCCL. Multi-GPU (nproc>1) is unchanged.
+export ANGELSLIM_DIST_SAFETY="${ANGELSLIM_DIST_SAFETY:-1}"
 
 EVAL_ARGS=()
 if [[ -n "${EVAL_DATA_PATH}" ]]; then
@@ -53,6 +60,11 @@ if [[ -n "${DEEPSPEED_CONFIG}" ]]; then
   DS_ARGS+=(--deepspeed "${DEEPSPEED_CONFIG}")
 fi
 
+SAVE_ARGS=(--save_strategy "${SAVE_STRATEGY}")
+if [[ -n "${SAVE_STEPS}" ]]; then
+  SAVE_ARGS+=(--save_steps "${SAVE_STEPS}")
+fi
+
 torchrun --nproc_per_node="${NPROC}" tools/train_eagle3_online.py \
     --modal_type VLM \
     --target_model_name_or_path "${TARGET_MODEL_NAME_OR_PATH}" \
@@ -66,7 +78,7 @@ torchrun --nproc_per_node="${NPROC}" tools/train_eagle3_online.py \
     --gradient_accumulation_steps 1 \
     --num_proc 4 \
     --load_from_cache_file "${LOAD_FROM_CACHE_FILE}" \
-    --save_strategy "no" \
+    "${SAVE_ARGS[@]}" \
     --learning_rate 1e-4 \
     --weight_decay 0.0 \
     --warmup_ratio 0.05 \
