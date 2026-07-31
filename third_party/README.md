@@ -14,15 +14,22 @@ git clone --branch v0.25.0 --depth 1 \
 
 # Activate THAT server's Python env, then:
 uv pip install vllm==0.25.0          # or: pip install vllm==0.25.0
-bash third_party/link_local_vllm.sh  # overlays this machine's .so; wires imports
+bash third_party/link_local_vllm.sh  # overlays .so, applies AngelSlim patches, wires imports
 source third_party/env.sh            # PYTHONPATH=<repo>/third_party/vllm
 ```
+
+`link_local_vllm.sh` also runs `third_party/apply_vllm_patches.sh`, which applies
+tracked patches under `third_party/patches/` (e.g. SmolVLM/Idefics3 Eagle3).
+Do **not** rely on hand-edited files inside `third_party/vllm` — those do not
+travel to other servers. Edit the `.patch` files in AngelSlim instead.
 
 Verify:
 
 ```bash
 python -c "import vllm, os; print(vllm.__version__, os.path.realpath(vllm.__file__))"
 # expect: 0.25.0  .../<any-path>/third_party/vllm/vllm/__init__.py
+
+python -c "from vllm.model_executor.models.idefics3 import Idefics3ForConditionalGeneration as C; from vllm.model_executor.models.interfaces import SupportsEagle3 as S; assert S in C.__mro__, 'SmolVLM Eagle3 patch missing — run bash third_party/apply_vllm_patches.sh'; print('SmolVLM Eagle3: OK')"
 ```
 
 Qwen3-VL + Eagle3 uses **Model Runner V2** (`Using V2 Model Runner` in logs).

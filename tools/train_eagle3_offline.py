@@ -30,7 +30,7 @@ from angelslim.compressor.speculative import (
     get_supported_chat_template_type_strings,
     infer_model_params,
 )
-from angelslim.utils import apply_single_rank_dist_safety, rank0_print
+from angelslim.utils import rank0_print
 
 
 def parse_args():
@@ -290,7 +290,6 @@ def parse_args():
 
 
 def train():
-    apply_single_rank_dist_safety()
     args = parse_args()
 
     rank0_print(f"Loading draft model: {args.draft_model_config_path}")

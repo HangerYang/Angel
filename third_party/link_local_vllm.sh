@@ -73,6 +73,11 @@ if [[ -e "${INSTALLED}" || -L "${INSTALLED}" ]]; then
   rm -rf "${INSTALLED}"
 fi
 
+# AngelSlim-tracked patches (portable across servers). Must run AFTER rsync
+# overlay, which restores stock vLLM sources from the wheel.
+echo "Applying AngelSlim vLLM patches..."
+bash "${ROOT}/third_party/apply_vllm_patches.sh"
+
 # .pth path is absolute for *this* machine's checkout; regenerate on each server.
 echo "${SRC}" > "${PTH}"
 echo "Wrote ${PTH}"
