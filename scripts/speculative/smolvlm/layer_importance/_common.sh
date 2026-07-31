@@ -32,6 +32,9 @@ NUM_PROC="${NUM_PROC:-8}"
 # Use the python that has torch+transformers. Examples:
 #   PYTHON=/path/to/env/bin/python
 #   conda activate angel   # then default `python` works
+# Optional:
+#   EVAL_RANDOM=1          # also score random 3-layer sets
+#   MAX_SAMPLES=
 PYTHON="${PYTHON:-python}"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -53,6 +56,9 @@ run_metrics() {
   fi
   if [[ -n "${DEVICE}" ]]; then
     args+=(--device "${DEVICE}")
+  fi
+  if [[ "${EVAL_RANDOM:-}" == "1" || "${EVAL_RANDOM:-}" == "true" ]]; then
+    args+=(--eval-random)
   fi
   echo "[layer_importance] metrics=${metrics}"
   echo "[layer_importance] data=${DATA_PATH}"
