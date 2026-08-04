@@ -257,8 +257,13 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        # Eagle layer 0 attends over cat(embeds, fused_hs) → 2H; later layers are H.
-        qkv_in = self.hidden_size * 2 if layer_idx == 0 else self.hidden_size
+        # Eagle layer 0 (and all layers in progressive_staged) attend over cat(., .) → 2H.
+        progressive = (
+            getattr(config, "eagle_aux_injection_mode", "fused_fc") == "progressive_staged"
+        )
+        qkv_in = (
+            self.hidden_size * 2 if (layer_idx == 0 or progressive) else self.hidden_size
+        )
         self.q_proj = nn.Linear(qkv_in, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(
             qkv_in, self.num_key_value_heads * self.head_dim, bias=False
@@ -487,9 +492,12 @@ class LlamaDecoderLayeremb(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        self.progressive_staged = (
+            getattr(config, "eagle_aux_injection_mode", "fused_fc") == "progressive_staged"
+        )
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
         self.mlp = LlamaMLP(config)
-        # Layer 0: dual-norm Eagle path (embeds + fused HS). Later layers: standard Llama.
+        # Layer 0 (and progressive L1+): dual-norm Eagle path. Stock L1+: standard Llama.
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -504,22 +512,14 @@ class LlamaDecoderLayeremb(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        inject: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape
-                `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated
-                by very large negative values.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention
-                layers. See `attentions` under returned tensors for more detail.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned
-                and can be used to speed up decoding (see `past_key_values`).
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*):
-                cached past key and value projection states
+            hidden_states (`torch.FloatTensor`): residual stream `[B,S,H]`.
+            inject (`torch.FloatTensor`, *optional*): progressive L1+ target aux HS
+                to concat as the attention right half. Layer 0 ignores this and uses
+                `hidden_states` as the right half (with `input_emb` as left).
         """
 
         residual = hidden_states
@@ -529,6 +529,16 @@ class LlamaDecoderLayeremb(nn.Module):
                 raise ValueError("Eagle layer 0 requires input_emb (token embeds).")
             attn_input = torch.cat(
                 (self.input_layernorm(input_emb), self.hidden_norm(hidden_states)),
+                dim=-1,
+            )
+            return_hidden = attn_input
+        elif self.progressive_staged:
+            if inject is None:
+                raise ValueError(
+                    f"progressive_staged layer {self.layer_idx} requires inject HS."
+                )
+            attn_input = torch.cat(
+                (self.input_layernorm(hidden_states), self.hidden_norm(inject)),
                 dim=-1,
             )
             return_hidden = attn_input
@@ -566,6 +576,9 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
     def __init__(self, config):
         super().__init__(config)
         num_layers = getattr(config, "num_hidden_layers", 1)
+        self.progressive_staged = (
+            getattr(config, "eagle_aux_injection_mode", "fused_fc") == "progressive_staged"
+        )
         self.layers = nn.ModuleList(
             [LlamaDecoderLayeremb(config, layer_idx=i) for i in range(num_layers)]
         )
@@ -575,7 +588,13 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         self.padding_idx = config.pad_token_id
         self.hidden_size = config.hidden_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
+        # Stock Eagle3: early fuse 3H→H. Progressive staged: per-layer inject, no fc.
+        if self.progressive_staged:
+            self.fc = None
+            self._aux_inject: Optional[Tuple[torch.Tensor, ...]] = None
+        else:
+            self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
+            self._aux_inject = None
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
 
         # create vocab buffers
@@ -589,13 +608,36 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         # Required by new transformers gradient checkpointing format
         self.gradient_checkpointing = False
 
+    def is_progressive_staged(self) -> bool:
+        return bool(self.progressive_staged)
+
     @property
     def midlayer(self):
         """Legacy alias for the first draft layer (Eagle 2H block)."""
         return self.layers[0]
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.progressive_staged:
+            n = len(self.layers)
+            expected = self.hidden_size * n
+            if hidden_states.shape[-1] != expected:
+                raise ValueError(
+                    "progressive_staged expects concat aux HS of size "
+                    f"{expected} (=num_hidden_layers*H), got {hidden_states.shape[-1]}"
+                )
+            chunks = tuple(hidden_states.split(self.hidden_size, dim=-1))
+            self._aux_inject = chunks
+            # L0 residual seed = first (predecessor) aux stream.
+            return chunks[0]
         return self.fc(hidden_states)
+
+    def shift_aux_inject(self, left: bool = False):
+        """Pad/shift stored progressive aux injects with the training-time test loop."""
+        if not self.progressive_staged or self._aux_inject is None:
+            return
+        from angelslim.compressor.speculative.utils import padding as pad_fn
+
+        self._aux_inject = tuple(pad_fn(t, left=left) for t in self._aux_inject)
 
     def init_cache_hidden(self):
         """Per-draft-layer KV cache containers for the speculative train loop."""
@@ -627,6 +669,14 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             )
 
         for layer_idx, layer in enumerate(self.layers):
+            inject = None
+            if self.progressive_staged and layer_idx > 0:
+                if self._aux_inject is None or layer_idx >= len(self._aux_inject):
+                    raise ValueError(
+                        "progressive_staged encode_layers missing aux inject "
+                        f"for layer {layer_idx}"
+                    )
+                inject = self._aux_inject[layer_idx]
             layer_outputs, cache_hidden[layer_idx] = layer(
                 inputs_embeds if layer_idx == 0 else None,
                 hidden_states,
@@ -636,6 +686,7 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 past_key_value=None,
                 output_attentions=False,
                 use_cache=use_cache,
+                inject=inject,
             )
             hidden_states = layer_outputs[0]
         return hidden_states, cache_hidden
@@ -672,12 +723,16 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         """
         Initialize draft layers from selected target decoder layers.
 
-        Layer 0 (2H QKV, dual norm):
-          - emb path (input_layernorm + QKV emb half) ← target layer
-            ``layer0_embed_init_from_target`` (default 0; input ≈ embeddings)
-          - HS path (hidden_norm + QKV HS half + o_proj/MLP/post-norm) ←
-            ``layer_ids[0]`` (intermediate; input is fused HS)
-        Later layers: full H→H copy from ``layer_ids[i]``.
+        Stock (fused_fc):
+          Layer 0 (2H QKV, dual norm):
+            - emb path ← ``layer0_embed_init_from_target``
+            - HS path ← ``layer_ids[0]``
+          Later layers: full H→H copy from ``layer_ids[i]``.
+
+        Progressive staged (all layers 2H):
+          Layer i right/HS half ← ``layer_ids[i]`` (consumer layer)
+          Layer i left half ← predecessor (``layer_ids[i]-1``, or
+          ``layer0_embed_init_from_target`` for i==0)
         """
         if layer_ids is None:
             return
@@ -715,13 +770,20 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         # Collect keys we need, then load once.
         needed: List[str] = []
         plan: List[Tuple[int, int, Dict[str, str]]] = []  # draft_idx, target_idx, name_map
+        left_src_ids: List[int] = []
         for draft_idx, target_idx in enumerate(layer_ids):
             name_map = _layer_name_map(target_idx)
             needed.extend(name_map.values())
             plan.append((draft_idx, target_idx, name_map))
+            if draft_idx == 0:
+                left_src_ids.append(int(layer0_embed_init_from_target))
+            elif self.progressive_staged:
+                left_src_ids.append(int(target_idx) - 1)
+            else:
+                left_src_ids.append(int(target_idx))
 
-        emb_src_map = _layer_name_map(int(layer0_embed_init_from_target))
-        needed.extend(emb_src_map.values())
+        for left_id in left_src_ids:
+            needed.extend(_layer_name_map(left_id).values())
 
         tensors = self._load_weight_tensors(target_model_name_or_path, needed)
         missing = [k for k in needed if k not in tensors]
@@ -736,6 +798,8 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             for draft_idx, target_idx, name_map in plan:
                 layer = self.layers[draft_idx]
                 src = {k: tensors[v] for k, v in name_map.items()}
+                left_map = _layer_name_map(left_src_ids[draft_idx])
+                left_src = {k: tensors[v] for k, v in left_map.items()}
 
                 def _copy(param: torch.nn.Parameter, tensor: torch.Tensor, what: str = ""):
                     if param.shape != tensor.shape:
@@ -757,30 +821,28 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 )
                 _copy(layer.self_attn.o_proj.weight, src["self_attn.o_proj.weight"], "o_proj")
 
-                if draft_idx == 0:
-                    emb_src = {k: tensors[v] for k, v in emb_src_map.items()}
-                    # Emb path ← target first (or configured) layer.
+                use_2h = draft_idx == 0 or self.progressive_staged
+                if use_2h:
+                    # Left path ← predecessor / embed layer; HS path ← consumer layer.
                     _copy(
                         layer.input_layernorm.weight,
-                        emb_src["input_layernorm.weight"],
-                        "emb input_layernorm",
+                        left_src["input_layernorm.weight"],
+                        "left input_layernorm",
                     )
-                    # HS path ← mapped intermediate layer.
                     _copy(
                         layer.hidden_norm.weight,
                         src["input_layernorm.weight"],
                         "hidden_norm",
                     )
-                    # QKV: [out, 2H] = cat(emb, hs) → fill both halves from two sources.
                     for proj_name in ("q_proj", "k_proj", "v_proj"):
                         draft_w = getattr(layer.self_attn, proj_name).weight
-                        emb_w = emb_src[f"self_attn.{proj_name}.weight"]
+                        emb_w = left_src[f"self_attn.{proj_name}.weight"]
                         hs_w = src[f"self_attn.{proj_name}.weight"]
                         if draft_w.shape[-1] != 2 * h or emb_w.shape[-1] != h or hs_w.shape[-1] != h:
                             raise ValueError(
-                                f"Expected draft layer0 {proj_name} in_features=2H and "
-                                f"target in_features=H; got {draft_w.shape} / "
-                                f"{emb_w.shape} / {hs_w.shape}"
+                                f"Expected draft layer{draft_idx} {proj_name} "
+                                f"in_features=2H and target in_features=H; got "
+                                f"{draft_w.shape} / {emb_w.shape} / {hs_w.shape}"
                             )
                         draft_w[:, :h].copy_(
                             emb_w.to(dtype=draft_w.dtype, device=draft_w.device)
@@ -796,7 +858,8 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
 
         print(
             f"Initialized draft layers from target layers {layer_ids} "
-            f"(layer0 emb path from target layer {layer0_embed_init_from_target}; "
+            f"(progressive_staged={self.progressive_staged}; "
+            f"left sources={left_src_ids}; "
             f"prefix={target_layer_weight_prefix})"
         )
 
@@ -823,7 +886,7 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             hidden_states.requires_grad = True
 
         if hidden_states.shape[-1] != self.hidden_size:
-            hidden_states = self.fc(hidden_states)
+            hidden_states = self.combine_hidden_states(hidden_states)
 
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]

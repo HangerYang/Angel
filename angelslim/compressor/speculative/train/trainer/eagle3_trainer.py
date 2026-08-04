@@ -296,6 +296,8 @@ class Eagle3Trainer(Trainer, ABC):
                 input_ids = padding(input_ids, left=False)
                 target_logits = padding(target_logits, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                if hasattr(self.draft_model, "shift_aux_inject"):
+                    self.draft_model.shift_aux_inject(left=False)
 
         # Step 8: Compute weighted loss
         ploss_weight = [0.8**i for i in range(len(plosses))]

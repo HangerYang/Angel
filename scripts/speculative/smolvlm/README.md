@@ -155,6 +155,38 @@ Example 3-layer draft init from target:
 
 `--training_time_test_length` / trainer `length` = speculative **decode steps**, not draft depth and not aux count.
 
+### Progressive staged injection (experiment)
+
+Config: `angelslim/.../configs/smolvlm-256m-eagle3-progressive.json`
+
+Instead of early `fc(3H→H)` and Eagle-only on draft L0, each draft layer is 2H and injects one predecessor aux stream:
+
+```text
+inject train ids: [0, 13, 25]   # inputs to target layers 1 / 14 / 26
+init weights from: [1, 14, 26]  # consumer layers (left half from predecessor)
+mode: "eagle_aux_injection_mode": "progressive_staged"
+```
+
+```text
+L0: residual=HS₀;  attn=cat(norm(embed), norm(HS₀))
+L1: residual=h0;   attn=cat(norm(h0),    norm(HS₁₃))
+L2: residual=h1;   attn=cat(norm(h1),    norm(HS₂₅)) → lm_head
+```
+
+Train / eval:
+
+```bash
+DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3-progressive.json \
+  OUTPUT_DIR=output/smolvlm_256m_eagle3_progressive \
+  bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+
+DRAFT_MODEL=output/smolvlm_256m_eagle3_progressive/checkpoint-* \
+  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3-progressive.json \
+  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+```
+
+Requires the local vLLM tree edits in `third_party/vllm/.../llama_eagle3.py` + `speculator.py` (progressive path). Stock `fused_fc` remains the default when the mode field is omitted.
+
 ---
 
 ## Recommended: dp=4 (4 GPU replicas) for data gen
