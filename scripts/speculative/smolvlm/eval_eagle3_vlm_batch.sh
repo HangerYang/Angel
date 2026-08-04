@@ -46,6 +46,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 OUTPUT_LEN="${OUTPUT_LEN:-1024}"
 TEMP="${TEMP:-0}"
 TP="${TP:-1}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 DEBUG_ARGS=()
 if [[ "${DEBUG:-0}" == "1" ]]; then
@@ -101,6 +102,7 @@ CMD=(
   --temp "${TEMP}"
   --max_num_seqs "${MAX_NUM_SEQS}"
   --max_model_len "${MAX_MODEL_LEN}"
+  --gpu_memory_utilization "${GPU_MEMORY_UTILIZATION}"
   --output_len "${OUTPUT_LEN}"
   --tp "${TP}"
   --output_file "${OUTPUT_FILE}"

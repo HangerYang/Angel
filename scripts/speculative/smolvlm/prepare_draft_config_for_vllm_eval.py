@@ -117,6 +117,25 @@ def prepare_draft_config(
         updates["aux_hidden_states_layer_ids"] = aux_ids
     if draft_init is not None:
         updates["draft_layer_init_from_target"] = draft_init
+
+    injection_mode = cfg.get(
+        "eagle_aux_injection_mode",
+        train_cfg.get("eagle_aux_injection_mode", "fused_fc"),
+    )
+    updates["eagle_aux_injection_mode"] = injection_mode
+    if injection_mode == "progressive_staged":
+        if aux_ids is not None and len(aux_ids) != num_layers:
+            raise ValueError(
+                "progressive_staged requires len(aux_hidden_states_layer_ids) "
+                f"== num_hidden_layers ({num_layers}), got {len(aux_ids)}"
+            )
+        if eagle_aux_ids is not None and len(eagle_aux_ids) != num_layers:
+            raise ValueError(
+                "progressive_staged requires len(eagle_aux_hidden_state_layer_ids) "
+                f"== num_hidden_layers ({num_layers}), got {len(eagle_aux_ids)}"
+            )
+        updates["num_aux_hidden_states"] = num_layers
+
     for key in (
         "draft_layer0_embed_init_from_target",
         "target_model_type",
@@ -132,6 +151,7 @@ def prepare_draft_config(
 
     print("SmolVLM Eagle3 draft config for vLLM eval:")
     print(f"  draft_model: {draft_model}")
+    print(f"  eagle_aux_injection_mode: {injection_mode}")
     print(f"  num_hidden_layers: {num_layers} "
           f"({'single-layer' if num_layers == 1 else f'{num_layers}-layer'} draft)")
     print(f"  aux_hidden_states_layer_ids (train): {cfg.get('aux_hidden_states_layer_ids')}")

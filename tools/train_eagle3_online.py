@@ -313,15 +313,27 @@ def train():
     # Fusion aux layers (train) vs vLLM indices (often train_id + 1).
     aux_ids = getattr(draft_model_config, "aux_hidden_states_layer_ids", None)
     eagle_aux_ids = getattr(draft_model_config, "eagle_aux_hidden_state_layer_ids", None)
+    injection_mode = getattr(
+        draft_model_config, "eagle_aux_injection_mode", "fused_fc"
+    )
+    draft_model.config.eagle_aux_injection_mode = injection_mode
     if aux_ids is not None:
         draft_model.config.aux_hidden_states_layer_ids = list(aux_ids)
         if eagle_aux_ids is None:
             # AngelSlim train uses hs[id+1]; vLLM records after layer id directly.
             eagle_aux_ids = [int(i) + 1 for i in aux_ids]
+        if injection_mode == "progressive_staged":
+            n_layers = int(getattr(draft_model_config, "num_hidden_layers", 1))
+            if len(aux_ids) != n_layers:
+                raise ValueError(
+                    "progressive_staged requires len(aux_hidden_states_layer_ids) "
+                    f"== num_hidden_layers ({n_layers}), got {len(aux_ids)}"
+                )
     if eagle_aux_ids is not None:
         draft_model.config.eagle_aux_hidden_state_layer_ids = list(eagle_aux_ids)
     rank0_print(
-        "Draft fusion aux layers (train): "
+        f"Draft aux injection mode: {injection_mode}; "
+        "train aux layers: "
         f"{getattr(draft_model.config, 'aux_hidden_states_layer_ids', None)}; "
         "vLLM eagle_aux: "
         f"{getattr(draft_model.config, 'eagle_aux_hidden_state_layer_ids', None)}"

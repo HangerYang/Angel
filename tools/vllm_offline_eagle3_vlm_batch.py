@@ -94,6 +94,12 @@ def parse_args():
     )
     parser.add_argument("--max_num_seqs", type=int, default=1)
     parser.add_argument("--max_model_len", type=int, default=32768, help="Maximum model length")
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.9,
+        help="Fraction of GPU memory for vLLM",
+    )
     parser.add_argument("--temp", type=float, default=0, help="Number of speculative tokens")
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--output_len", type=int, default=1024)
@@ -371,7 +377,7 @@ def main():
         model=args.target_model,
         trust_remote_code=True,
         tensor_parallel_size=args.tp,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         speculative_config=speculative_config,
         max_num_seqs=args.max_num_seqs,
         enforce_eager=True,
