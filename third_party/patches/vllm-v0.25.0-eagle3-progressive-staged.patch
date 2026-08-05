@@ -1,33 +1,46 @@
 diff --git a/vllm/model_executor/models/llama_eagle3.py b/vllm/model_executor/models/llama_eagle3.py
-index 2d859bd..4bc5e59 100644
+index 2d859bd..a58478a 100644
 --- a/vllm/model_executor/models/llama_eagle3.py
 +++ b/vllm/model_executor/models/llama_eagle3.py
-@@ -45,9 +45,15 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+@@ -45,9 +45,19 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
          config = config or vllm_config.model_config.hf_config
          quant_config = self.get_quant_config(vllm_config)
  
 -        # First layer uses 2*hidden_size (embeds + hidden_states concatenated)
 -        # Subsequent layers use hidden_size (only hidden_states, no embeds)
 -        qkv_input_size = 2 * self.hidden_size if layer_idx == 0 else self.hidden_size
-+        self.progressive_staged = (
-+            getattr(config, "eagle_aux_injection_mode", "fused_fc") == "progressive_staged"
-+        )
-+        # First layer (and all progressive_staged layers) use 2*hidden_size.
++        mode = getattr(config, "eagle_aux_injection_mode", "fused_fc")
++        self.progressive_staged = mode == "progressive_staged"
++        self.hawk = mode == "hawk"
++        # Hawk: always H. Progressive: 2H on every layer. Stock: 2H only on L0.
 +        qkv_input_size = (
-+            2 * self.hidden_size
-+            if (layer_idx == 0 or self.progressive_staged)
-+            else self.hidden_size
++            self.hidden_size
++            if self.hawk
++            else (
++                2 * self.hidden_size
++                if (layer_idx == 0 or self.progressive_staged)
++                else self.hidden_size
++            )
 +        )
  
          # Parallel drafting checkpoints may have attention bias enabled
          qkv_bias = getattr(config, "attention_bias", False)
-@@ -95,12 +101,28 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+@@ -95,12 +105,36 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
          embeds: torch.Tensor,
          hidden_states: torch.Tensor,
          residual: torch.Tensor | None,
 +        inject: torch.Tensor | None = None,
      ) -> tuple[torch.Tensor, torch.Tensor]:
-         if self.layer_idx == 0:
+-        if self.layer_idx == 0:
++        if self.hawk:
++            # Hawk: LlamaModel already fused to H; standard Pre-LN H block.
++            # Each hawk layer is entered with residual=None (fusion resets stream).
++            if residual is None:
++                residual = hidden_states
++                hidden_states = self.input_layernorm(hidden_states)
++            else:
++                hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        elif self.layer_idx == 0:
              # First layer: concatenate embeds with hidden_states
              embeds = self.input_layernorm(embeds)
              hidden_states, residual = self._residual_norm(hidden_states=hidden_states)
@@ -50,27 +63,36 @@ index 2d859bd..4bc5e59 100644
          else:
              # Subsequent layers: process hidden_states and residuals only
              hidden_states, residual = self.input_layernorm(hidden_states, residual)
-@@ -152,6 +174,19 @@ class LlamaModel(nn.Module):
+@@ -152,6 +186,28 @@ class LlamaModel(nn.Module):
                  "norm_before_fc", getattr(self.config, "norm_before_fc", False)
              )
          )
-+        self.progressive_staged = (
-+            getattr(self.config, "eagle_aux_injection_mode", "fused_fc")
-+            == "progressive_staged"
-+        )
++        mode = getattr(self.config, "eagle_aux_injection_mode", "fused_fc")
++        self.progressive_staged = mode == "progressive_staged"
++        self.hawk = mode == "hawk"
++        # Per-layer aux (progressive concat or hawk H-fusion); no early fc.
++        self.per_layer_aux = self.progressive_staged or self.hawk
 +        if self.progressive_staged:
 +            logger.info(
 +                "Eagle3 progressive_staged enabled: per-layer aux inject, no fc "
 +                "(num_hidden_layers=%s)",
 +                self.config.num_hidden_layers,
 +            )
++        if self.hawk:
++            logger.info(
++                "Eagle3 hawk enabled: per-layer H fuse_w1/w2 inject, no fc "
++                "(num_hidden_layers=%s)",
++                self.config.num_hidden_layers,
++            )
 +        # Per-layer inject buffers set by combine_hidden_states / set_aux_inject.
 +        self._aux_inject: list[torch.Tensor] | None = None
 +        self._last_layer_outs: list[torch.Tensor] | None = None
++        self.fuse_w1: ReplicatedLinear | None = None
++        self.fuse_w2: ReplicatedLinear | None = None
  
          current_vllm_config = get_current_vllm_config()
  
-@@ -179,41 +214,55 @@ class LlamaModel(nn.Module):
+@@ -179,41 +235,74 @@ class LlamaModel(nn.Module):
              if self.num_aux_hidden_states is None:
                  eagle_config = getattr(self.config, "eagle_config", None) or {}
                  layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
@@ -82,7 +104,7 @@ index 2d859bd..4bc5e59 100644
 +                self.num_aux_hidden_states = (
 +                    len(layer_ids)
 +                    if layer_ids
-+                    else (len(self.layers) if self.progressive_staged else 3)
++                    else (len(self.layers) if self.per_layer_aux else 3)
 +                )
  
              target_hidden_size = getattr(
@@ -96,7 +118,7 @@ index 2d859bd..4bc5e59 100644
 -                    eps=self.config.rms_norm_eps,
 -                )
 -            else:
-+            if self.progressive_staged:
++            if self.per_layer_aux:
 +                # No early 3H→H fusion; aux streams are injected per draft layer.
                  self.input_norm = None
 -
@@ -121,6 +143,25 @@ index 2d859bd..4bc5e59 100644
 -                return_bias=False,
 -            )
 +                self.fc = None
++                if self.hawk:
++                    self.fuse_w1 = ReplicatedLinear(
++                        input_size=self.config.hidden_size,
++                        output_size=self.config.hidden_size,
++                        bias=False,
++                        params_dtype=vllm_config.model_config.dtype,
++                        quant_config=self.quant_config,
++                        prefix=maybe_prefix(prefix, "fuse_w1"),
++                        return_bias=False,
++                    )
++                    self.fuse_w2 = ReplicatedLinear(
++                        input_size=self.config.hidden_size,
++                        output_size=self.config.hidden_size,
++                        bias=False,
++                        params_dtype=vllm_config.model_config.dtype,
++                        quant_config=self.quant_config,
++                        prefix=maybe_prefix(prefix, "fuse_w2"),
++                        return_bias=False,
++                    )
 +            else:
 +                if self.norm_before_fc:
 +                    self.input_norm = RMSNorm(
@@ -153,64 +194,94 @@ index 2d859bd..4bc5e59 100644
  
          self.norm_output = getattr(self.config, "norm_output", False)
          self.norm = RMSNorm(
-@@ -224,6 +273,10 @@ class LlamaModel(nn.Module):
+@@ -224,6 +313,10 @@ class LlamaModel(nn.Module):
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
  
 +    def set_aux_inject(self, aux_inject: list[torch.Tensor] | None) -> None:
-+        """Store per-layer inject HS for progressive_staged (target or draft)."""
++        """Store per-layer inject HS for progressive_staged / hawk (target or draft)."""
 +        self._aux_inject = aux_inject
 +
      def forward(
          self,
          input_ids: torch.Tensor,
-@@ -239,13 +292,31 @@ class LlamaModel(nn.Module):
+@@ -239,13 +332,53 @@ class LlamaModel(nn.Module):
          )
  
          residual = None
 -        for layer in self.layers:
+-            hidden_states, residual = layer(
+-                positions=positions,
+-                embeds=input_embeds,
+-                hidden_states=hidden_states,
+-                residual=residual,
+-            )
 +        layer_outs: list[torch.Tensor] = []
 +        for layer_idx, layer in enumerate(self.layers):
-+            inject = None
-+            if self.progressive_staged and layer_idx > 0:
++            if self.hawk:
++                if self.fuse_w1 is None or self.fuse_w2 is None:
++                    raise RuntimeError("hawk mode missing fuse_w1 / fuse_w2")
 +                if self._aux_inject is None or layer_idx >= len(self._aux_inject):
 +                    raise ValueError(
-+                        "progressive_staged forward missing aux inject "
-+                        f"for layer {layer_idx}"
++                        f"hawk forward missing aux inject for layer {layer_idx}"
 +                    )
++                # Materialize prior deferred residual before H-fusion (match train).
++                if residual is not None:
++                    hidden_states = hidden_states + residual
++                    residual = None
++                left = input_embeds if layer_idx == 0 else hidden_states
 +                inject = self._aux_inject[layer_idx]
-             hidden_states, residual = layer(
-                 positions=positions,
-                 embeds=input_embeds,
-                 hidden_states=hidden_states,
-                 residual=residual,
-+                inject=inject,
-             )
-+            if self.progressive_staged:
++                fused = self.fuse_w1(inject) + self.fuse_w2(left)
++                hidden_states, residual = layer(
++                    positions=positions,
++                    embeds=input_embeds,
++                    hidden_states=fused,
++                    residual=None,
++                    inject=None,
++                )
++            else:
++                inject = None
++                if self.progressive_staged and layer_idx > 0:
++                    if self._aux_inject is None or layer_idx >= len(self._aux_inject):
++                        raise ValueError(
++                            "progressive_staged forward missing aux inject "
++                            f"for layer {layer_idx}"
++                        )
++                    inject = self._aux_inject[layer_idx]
++                hidden_states, residual = layer(
++                    positions=positions,
++                    embeds=input_embeds,
++                    hidden_states=hidden_states,
++                    residual=residual,
++                    inject=inject,
++                )
++            if self.per_layer_aux:
 +                # Materialize full layer output (vLLM defers residual add).
 +                h_complete = (
 +                    hidden_states + residual if residual is not None else hidden_states
 +                )
 +                layer_outs.append(h_complete)
-+        self._last_layer_outs = layer_outs if self.progressive_staged else None
++        self._last_layer_outs = layer_outs if self.per_layer_aux else None
 +
          hidden_states, hidden_prenorm = self.norm(hidden_states, residual)
  
          # norm_output variant uses the post-norm hidden states.
-@@ -362,8 +433,22 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -362,8 +495,24 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
      ) -> torch.Tensor:
          if not self.model.use_aux_hidden_state:
              return hidden_states
 -        # combine multiple auxiliary hidden states returned by eagle3
  
-+        if self.model.progressive_staged:
++        if self.model.per_layer_aux:
 +            # hidden_states is concat of N aux streams [T, N*H]; stash per-layer
-+            # injects and return the first stream as L0 residual seed.
++            # injects. Progressive uses chunk0 as L0 seed; hawk L0 fuses
++            # inject0+embed and only needs shape-H placeholder.
 +            n = self.model.num_aux_hidden_states
 +            h = self.config.hidden_size
++            mode = "hawk" if self.model.hawk else "progressive_staged"
 +            if hidden_states.shape[-1] != n * h:
 +                raise ValueError(
-+                    "progressive_staged combine_hidden_states expected "
++                    f"{mode} combine_hidden_states expected "
 +                    f"last dim {n * h}, got {hidden_states.shape[-1]}"
 +                )
 +            chunks = list(hidden_states.split(h, dim=-1))
@@ -221,7 +292,7 @@ index 2d859bd..4bc5e59 100644
          if self.model.norm_before_fc:
              hidden_states = self.model.input_norm(hidden_states)
  
-@@ -378,6 +463,35 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -378,6 +527,35 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
  
          return self.model.fc(hidden_states)
  
@@ -257,18 +328,22 @@ index 2d859bd..4bc5e59 100644
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
          model_weights = {}
          includes_draft_id_mapping = False
-@@ -420,7 +534,8 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -420,8 +598,12 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
              skip_substrs.append("draft_id_to_target_id")
          if not includes_embed_tokens:
              skip_substrs.append("embed_tokens")
 -        if not self.model.use_aux_hidden_state:
-+        if not self.model.use_aux_hidden_state or self.model.progressive_staged:
-+            # Progressive staged has no early fc; skip if present in older ckpts.
++        if not self.model.use_aux_hidden_state or self.model.per_layer_aux:
++            # Progressive / hawk have no early fc; skip if present in older ckpts.
              skip_substrs.append("fc.")
++        if not self.model.hawk:
++            skip_substrs.append("fuse_w1.")
++            skip_substrs.append("fuse_w2.")
          if not self.model.norm_before_fc:
              skip_substrs.append("input_norm.")
+         loader = AutoWeightsLoader(
 diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-index 747fb3a..9153d62 100644
+index 747fb3a..98b91a1 100644
 --- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 @@ -174,6 +174,21 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
@@ -293,30 +368,24 @@ index 747fb3a..9153d62 100644
          self._copy_request_inputs(
              num_reqs,
              input_batch.idx_mapping,
-@@ -368,6 +383,22 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -368,6 +383,16 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
          self.input_buffers.positions[:num_reqs] = positions
  
-+        # Progressive staged decode feedback (current):
++        # Progressive / hawk decode feedback:
 +        #   next L0 seed ← h0, L1 inject ← h1, L2 inject ← h2 (same-depth draft).
-+        # Optional alternative (commented): stock L0←h2 + stale last-token target aux.
-+        if getattr(getattr(self.model, "model", None), "progressive_staged", False):
++        draft_inner = getattr(self.model, "model", None)
++        if draft_inner is not None and getattr(draft_inner, "per_layer_aux", False):
 +            seed = self.model.take_progressive_draft_feedback(
 +                token_indices=last_token_indices
 +            )
 +            if seed is not None:
 +                self.hidden_states[:num_reqs] = seed
-+            # draft_inner = getattr(self.model, "model", None)
-+            # aux = getattr(draft_inner, "_aux_inject", None)
-+            # if aux is not None:
-+            #     self.model.set_aux_inject_from_list(
-+            #         [a[last_token_indices] for a in aux]
-+            #     )
 +
      def _multi_step_decode(
          self,
          num_reqs: int,
-@@ -382,6 +413,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -382,6 +407,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
          attn_metadata = None
          slot_mappings_by_layer = None
          for step in range(1, self.num_speculative_steps):
@@ -336,12 +405,12 @@ index 747fb3a..9153d62 100644
              # Rebuild every step when positions advance, or just once
              # on the first step when positions are constant (Gemma4 MTP).
              if not skip_attn and (self.advance_draft_positions or step == 1):
-@@ -465,6 +509,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -465,6 +503,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              advance_draft_positions=self.advance_draft_positions,
          )
  
-+        # Progressive: refresh L0/L1/L2 from per-layer draft outs (h0/h1/h2).
-+        if getattr(getattr(self.model, "model", None), "progressive_staged", False):
++        # Progressive / hawk: refresh L0/L1/L2 from per-layer draft outs (h0/h1/h2).
++        if getattr(getattr(self.model, "model", None), "per_layer_aux", False):
 +            seed = self.model.take_progressive_draft_feedback(num_tokens=num_reqs)
 +            if seed is not None:
 +                self.hidden_states[:num_reqs] = seed
