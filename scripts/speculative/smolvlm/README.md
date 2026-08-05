@@ -343,15 +343,20 @@ what other servers get. Eagle3 for SmolVLM is shipped as:
 
 `third_party/patches/vllm-v0.25.0-smolvlm-eagle3.patch`
 
-On every server after cloning vLLM v0.25.0:
+On every server (clones vLLM v0.25.0 if needed):
 
 ```bash
-uv pip install vllm==0.25.0   # or pip
-bash third_party/link_local_vllm.sh   # overlays .so + applies patches/
+# CUDA 13.0 (default)
+bash third_party/install_local_vllm.sh
+
+# CUDA 12.6 server (source build; needs toolkit / nvcc)
+VLLM_CUDA=12.6 bash third_party/install_local_vllm.sh
+
 source third_party/env.sh
 ```
 
-Or only re-apply patches: `bash third_party/apply_vllm_patches.sh`
+Or only re-apply patches: `bash third_party/apply_vllm_patches.sh`  
+Details: `third_party/README.md`.
 
 ---
 

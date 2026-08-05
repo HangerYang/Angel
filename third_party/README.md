@@ -5,23 +5,35 @@ Works on any server path and any env (conda, uv, venv).
 
 ## 1. Setup (every machine / every env)
 
-Paths and compiled `.so` files are **not** portable. On each server:
+Paths and compiled `.so` files are **not** portable. On each server, activate
+that env and run:
 
 ```bash
-# From the AngelSlim repo root on THAT machine
-git clone --branch v0.25.0 --depth 1 \
-  https://github.com/vllm-project/vllm.git third_party/vllm   # if missing
+# CUDA 13.0 (default — same as stock vLLM 0.25.0 PyPI wheel)
+bash third_party/install_local_vllm.sh
 
-# Activate THAT server's Python env, then:
-uv pip install vllm==0.25.0          # or: pip install vllm==0.25.0
-bash third_party/link_local_vllm.sh  # overlays .so, applies AngelSlim patches, wires imports
-source third_party/env.sh            # PYTHONPATH=<repo>/third_party/vllm
+# CUDA 12.6 server (no official +cu126 wheel for 0.25.0 → source build)
+# Needs CUDA toolkit 12.6 / nvcc on that machine:
+#   export CUDA_HOME=/usr/local/cuda-12.6
+#   export PATH="$CUDA_HOME/bin:$PATH"
+VLLM_CUDA=12.6 bash third_party/install_local_vllm.sh
+
+# Optional: official CUDA 12.x *prebuilt* (+cu129; driver must report ≥ 12.9)
+VLLM_CUDA=12.9 bash third_party/install_local_vllm.sh
 ```
 
-`link_local_vllm.sh` also runs `third_party/apply_vllm_patches.sh`, which applies
-tracked patches under `third_party/patches/` (e.g. SmolVLM/Idefics3 Eagle3).
+`install_local_vllm.sh` clones `third_party/vllm` @ v0.25.0 if needed, installs
+the matching torch/vLLM bits, then runs `link_local_vllm.sh` (`.so` overlay +
+`apply_vllm_patches.sh` + import wiring).
+
+| `VLLM_CUDA` | What gets installed |
+|---|---|
+| `13.0` (default) | PyPI `vllm==0.25.0` + torch cu130 |
+| `12.6` | torch cu126 + **build** vLLM from `third_party/vllm` |
+| `12.9` | GitHub `vllm-0.25.0+cu129` wheel + torch cu129 |
+
 Do **not** rely on hand-edited files inside `third_party/vllm` — those do not
-travel to other servers. Edit the `.patch` files in AngelSlim instead.
+travel to other servers. Edit the `.patch` files under `third_party/patches/` instead.
 
 Verify:
 
