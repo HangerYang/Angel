@@ -216,7 +216,21 @@ DRAFT_MODEL=output/smolvlm_256m_eagle3_progressive/checkpoint-* \
   bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
 ```
 
-Requires the local vLLM tree edits in `third_party/vllm/.../llama_eagle3.py` + `speculator.py` (progressive path). Stock `fused_fc` remains the default when the mode field is omitted.
+Requires the local vLLM progressive patch
+(`third_party/patches/vllm-v0.25.0-eagle3-progressive-staged.patch`).
+Re-apply after pull: `bash third_party/apply_vllm_patches.sh` (or
+`bash third_party/link_local_vllm.sh`). Look for log line
+`Eagle3 progressive_staged enabled` at draft load.
+
+Stock `fused_fc` remains the default when the mode field is omitted.
+
+**Eval gotchas (progressive patch):**
+1. vLLM defers residual adds — L1+ must materialize `h_prev = mlp_out + residual`
+   before concat-inject.
+2. After the first draft token, eval reuses **per-layer draft outs**
+   (`next L0←h0`, `L1←h1`, `L2←h2`), not stale last-token target aux.
+   (Old behavior: had target HS for N tokens; token N+1 reused the N-th target
+   vector. Training still shifts full-seq target HS — train/eval gap on step 2+.)
 
 ---
 
@@ -247,11 +261,24 @@ bash scripts/speculative/smolvlm/run_vllm_server.sh
 
 ## 2. Generate target-model samples
 
+Default input: `dataset/preprocessed/mixed_sharegpt_llava665k_70k70k.jsonl`
+(70k ShareGPT text + 70k LLaVA VL; images under `dataset/preprocessed/llava_images/`).
+
+vLLM servers must already be up (4 replicas on 6000–6003 by default):
+
 ```bash
 bash scripts/speculative/smolvlm/generate_data_for_target_model.sh
 ```
 
-Output: `dataset/smolvlm_256m_target_gen/data_*.jsonl`
+Output: `dataset/smolvlm_256m_target_gen_mixed_70k70k/data_*.jsonl`
+
+Then train with:
+
+```bash
+TRAIN_DATA_PATH=dataset/smolvlm_256m_target_gen_mixed_70k70k \
+  bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+```
+
 
 ## 3. Online Eagle3 training
 
