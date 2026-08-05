@@ -242,10 +242,10 @@ Stock `fused_fc` remains the default when the mode field is omitted.
 **Eval gotchas (progressive patch):**
 1. vLLM defers residual adds — L1+ must materialize `h_prev = mlp_out + residual`
    before concat-inject.
-2. After the first draft token, eval reuses **per-layer draft outs**
-   (`next L0←h0`, `L1←h1`, `L2←h2`), not stale last-token target aux.
-   (Old behavior: had target HS for N tokens; token N+1 reused the N-th target
-   vector. Training still shifts full-seq target HS — train/eval gap on step 2+.)
+2. After the first draft token (current default): **L0←last draft `h2`** (stock
+   Eagle), **L1/L2←stale last-token target aux**. An alternate per-layer draft
+   reuse (`L0←h0`, `L1←h1`, `L2←h2`) is left commented in
+   `speculator.py` (`_prefill` / `_generate_draft`).
 
 ---
 
