@@ -296,9 +296,12 @@ class Eagle3Trainer(Trainer, ABC):
                 input_ids = padding(input_ids, left=False)
                 target_logits = padding(target_logits, left=False)
                 loss_mask = padding(loss_mask, left=False)
-                # Progressive: next step uses same-depth draft outs (h0/h1/h2),
-                # not shifted target aux (that was teacher-forcing / train cheat).
-                if getattr(self.draft_model, "progressive_staged", False) and hasattr(
+                # Progressive / hawk: next step uses same-depth draft outs
+                # (h0/h1/h2), not shifted target aux (teacher-forcing cheat).
+                use_draft_feedback = getattr(
+                    self.draft_model, "progressive_staged", False
+                ) or getattr(self.draft_model, "hawk", False)
+                if use_draft_feedback and hasattr(
                     self.draft_model, "take_progressive_draft_feedback"
                 ):
                     seed = self.draft_model.take_progressive_draft_feedback()
