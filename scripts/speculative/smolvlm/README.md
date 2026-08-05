@@ -153,7 +153,38 @@ Example 3-layer draft init from target:
 "eagle_aux_hidden_state_layer_ids": [2, 15, 27]
 ```
 
-`--training_time_test_length` / trainer `length` = speculative **decode steps**, not draft depth and not aux count.
+`--training_time_test_length` / trainer `length` = speculative **decode steps** unrolled in the train loop (default **7** → logs `acc_0…acc_6`), not draft depth and not aux count. Same unroll is used for HF `--eval_data_path`; real acceptance length is measured only via vLLM offline eval.
+
+Draft config index: `angelslim/compressor/speculative/train/configs/README_smolvlm.md`.
+
+### Hawk fusion (progressive-only experiment)
+
+Config: `angelslim/.../configs/smolvlm-256m-hawk.json`
+
+Hawk is **progressive like** `progressive_staged`, but each inject is **H add-fusion** (not 2H concat):
+
+```text
+# requires len(aux)==num_hidden_layers (default 3)
+L0: ê0 = HS₀  @ w1 + embed @ w2  → H-block
+L1: ê1 = HS₁₃ @ w1 + h0    @ w2  → H-block
+L2: ê2 = HS₂₅ @ w1 + h1    @ w2  → H-block
+```
+
+| | Progressive Eagle | Hawk |
+|---|---|---|
+| Aux layout | 1 stream / draft layer | same |
+| Per-layer combine | **concat → 2H** QKV | **`w1`/`w2` add → H** |
+| Draft blocks | 2H Eagle | standard **H** Llama |
+| Train loop | Eagle online | same |
+| vLLM eval | patched | **not yet** |
+
+Do **not** set `progressive_staged` for hawk — use `"eagle_aux_injection_mode": "hawk"`.
+
+```bash
+DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+  OUTPUT_DIR=output/smolvlm_256m_hawk \
+  bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+```
 
 ### Progressive staged injection (experiment)
 
@@ -197,6 +228,15 @@ GPU_NUM=4 BASE_PORT=6000 bash scripts/speculative/smolvlm/run_vllm_server.sh
 MAX_CLIENTS=4 NUM_THREADS=32 bash scripts/speculative/smolvlm/generate_data_for_target_model.sh
 ```
 
+### Single-GPU vLLM (data gen only)
+
+```bash
+GPU_NUM=1 CUDA_VISIBLE_DEVICES=0 bash scripts/speculative/smolvlm/run_vllm_server.sh
+MAX_CLIENTS=1 NUM_THREADS=8 bash scripts/speculative/smolvlm/generate_data_for_target_model.sh
+```
+
+Same target samples / same jsonl schema — only wall-clock slower (~4× for the same dataset vs 4 replicas). **Not** a training-step multiplier; training equivalence is controlled by `EQUIV_NPROC` / `grad_accum` above.
+
 ---
 
 ## 1. Start vLLM server
@@ -223,6 +263,38 @@ Draft config: `angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle
 
 Default `SAVE_STRATEGY=epoch` writes the draft under `OUTPUT_DIR` (needed for eval).  
 For a throwaway smoke run: `SAVE_STRATEGY=no bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh`.
+
+### Launch modes (NCCL issues / single GPU)
+
+| Mode | Command | Same math as NCCL 4-GPU? |
+|---|---|---|
+| torchrun + NCCL | `NPROC=4 CUDA_VISIBLE_DEVICES=0,1,2,3 DIST_BACKEND=nccl bash ...` | reference |
+| torchrun + Gloo | `NPROC=4 ... DIST_BACKEND=gloo bash ...` | **Yes** — same DDP, different collective backend (slower) |
+| plain python 1 GPU | `LAUNCH=python EQUIV_NPROC=4 CUDA_VISIBLE_DEVICES=0 bash ...` | **Yes if** `grad_accum=EQUIV_NPROC` (auto) so effective batch matches |
+
+```bash
+# Gloo 4-GPU (drop-in when NCCL is broken; same steps / same effective batch)
+DIST_BACKEND=gloo NPROC=4 CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+
+# Plain python, 1 GPU, matched to a 4-GPU DDP run
+LAUNCH=python EQUIV_NPROC=4 CUDA_VISIBLE_DEVICES=0 NUM_PROC=1 \
+  bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+```
+
+**Equivalence (do you need 4× steps?)**
+
+Effective batch ≈ `per_device_bs × NPROC × grad_accum` (for `LAUNCH=python`, `NPROC=1`).
+
+| Setup | effective batch | optimizer steps / epoch (dataset size N, bs=1) |
+|---|---|---|
+| NCCL or Gloo, `NPROC=4`, `grad_accum=1` | 4 | ≈ N/4 |
+| `LAUNCH=python`, `grad_accum=4` (`EQUIV_NPROC=4`) | 4 | ≈ N/4 — **same** |
+| `LAUNCH=python`, `grad_accum=1` (no EQUIV) | 1 | ≈ N — **not** the same (4× more updates, smaller batch) |
+
+So: Gloo 4-GPU ≡ NCCL 4-GPU (same step count). Plain python does **not** need 4× epochs if you set `EQUIV_NPROC=4` (uses grad accum). Without that, you get a different optimization trajectory.
+
+Also lower HF datasets workers if mp is flaky: `NUM_PROC=1`.
 
 ---
 

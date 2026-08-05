@@ -232,6 +232,17 @@ def parse_args():
     training_group.add_argument(
         "--deepspeed", type=str, default=None, help="DeepSpeed config file"
     )
+    training_group.add_argument(
+        "--ddp_backend",
+        type=str,
+        default=None,
+        choices=["nccl", "gloo", "mpi", "ccl", "hccl"],
+        help=(
+            "torch.distributed backend for DDP (HF TrainingArguments.ddp_backend). "
+            "Use 'gloo' when NCCL/multiprocessing is broken. Ignored for plain "
+            "single-process python (no process group)."
+        ),
+    )
     training_group.add_argument("--fp16", action="store_true", help="Whether to use fp16 training")
     training_group.add_argument("--bf16", action="store_true", help="Whether to use bf16 training")
     training_group.add_argument(
@@ -414,6 +425,9 @@ def train():
     distributed_args = {
         "deepspeed": args.deepspeed,
     }
+    if args.ddp_backend is not None:
+        distributed_args["ddp_backend"] = args.ddp_backend
+        rank0_print(f"Using ddp_backend={args.ddp_backend}")
 
     training_args = transformers.TrainingArguments(
         **basic_args,

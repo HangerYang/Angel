@@ -135,6 +135,23 @@ def prepare_draft_config(
                 f"== num_hidden_layers ({num_layers}), got {len(eagle_aux_ids)}"
             )
         updates["num_aux_hidden_states"] = num_layers
+    elif injection_mode == "hawk":
+        # Progressive hawk: one aux stream per draft layer (same length checks).
+        if aux_ids is not None and len(aux_ids) != num_layers:
+            raise ValueError(
+                "hawk requires len(aux_hidden_states_layer_ids) "
+                f"== num_hidden_layers ({num_layers}), got {len(aux_ids)}"
+            )
+        if eagle_aux_ids is not None and len(eagle_aux_ids) != num_layers:
+            raise ValueError(
+                "hawk requires len(eagle_aux_hidden_state_layer_ids) "
+                f"== num_hidden_layers ({num_layers}), got {len(eagle_aux_ids)}"
+            )
+        updates["num_aux_hidden_states"] = num_layers
+        print(
+            "  NOTE: hawk is train-side progressive H-fusion; offline vLLM "
+            "Eagle3 eval is not wired for fuse_w1/fuse_w2 yet."
+        )
 
     for key in (
         "draft_layer0_embed_init_from_target",

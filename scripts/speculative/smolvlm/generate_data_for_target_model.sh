@@ -3,6 +3,10 @@
 # Uses the mixed text/VL JSONL (openai_vl format) by default.
 # Default: talk to 4 server replicas (ports BASE_PORT .. BASE_PORT+3):
 #   MAX_CLIENTS=4 NUM_THREADS=32 bash scripts/speculative/smolvlm/generate_data_for_target_model.sh
+#
+# Single-GPU server:
+#   MAX_CLIENTS=1 NUM_THREADS=8 bash scripts/speculative/smolvlm/generate_data_for_target_model.sh
+# (Same outputs; slower wall-clock — not a training-step multiplier.)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -22,6 +26,7 @@ export DATA_FORMAT="${DATA_FORMAT:-openai_vl}"
 export DATA_SHARD_SIZE="${DATA_SHARD_SIZE:-50000}"
 export BASE_PORT="${BASE_PORT:-6000}"
 export NUM_THREADS="${NUM_THREADS:-32}"
+# Match GPU_NUM used in run_vllm_server.sh (1 server → MAX_CLIENTS=1).
 export MAX_CLIENTS="${MAX_CLIENTS:-4}"
 export MAX_TOKENS="${MAX_TOKENS:-512}"
 
