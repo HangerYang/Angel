@@ -598,6 +598,8 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         # Progressive: per-layer 2H concat inject, no fc.
         # Hawk (progressive-only): per-layer ê=inject@w1+left@w2 (H), then H blocks.
         self._aux_inject: Optional[Tuple[torch.Tensor, ...]] = None
+        # Per-layer draft outs from the last encode (progressive decode feedback).
+        self._last_layer_outs: Optional[List[torch.Tensor]] = None
         if self.hawk:
             self.fc = None
             self.fuse_w1 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
@@ -652,7 +654,11 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         return self.fc(hidden_states)
 
     def shift_aux_inject(self, left: bool = False):
-        """Pad/shift stored per-layer aux injects with the training-time test loop."""
+        """Pad/shift stored per-layer aux injects with the training-time test loop.
+
+        Used by hawk. Progressive staged no longer shifts target aux after step 0;
+        it reuses per-layer draft outs via ``take_progressive_draft_feedback``.
+        """
         if self._aux_inject is None:
             return
         if not (self.progressive_staged or self.hawk):
@@ -660,6 +666,18 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         from angelslim.compressor.speculative.utils import padding as pad_fn
 
         self._aux_inject = tuple(pad_fn(t, left=left) for t in self._aux_inject)
+
+    def take_progressive_draft_feedback(self) -> Optional[torch.Tensor]:
+        """After a draft encode, set next-step injects from per-layer draft outs.
+
+        Returns L0 seed (``h0``). Sets ``_aux_inject = (h0, h1, h2, ...)`` so the
+        next speculative step uses same-depth draft HS instead of shifted target aux.
+        """
+        outs = self._last_layer_outs
+        if not outs:
+            return None
+        self._aux_inject = tuple(outs)
+        return outs[0]
 
     def init_cache_hidden(self):
         """Per-draft-layer KV cache containers for the speculative train loop."""
@@ -717,8 +735,10 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                     inject=None,
                 )
                 hidden_states = layer_outputs[0]
+            self._last_layer_outs = None
             return hidden_states, cache_hidden
 
+        layer_outs: List[torch.Tensor] = []
         for layer_idx, layer in enumerate(self.layers):
             inject = None
             if self.progressive_staged and layer_idx > 0:
@@ -740,6 +760,9 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 inject=inject,
             )
             hidden_states = layer_outputs[0]
+            if self.progressive_staged:
+                layer_outs.append(hidden_states)
+        self._last_layer_outs = layer_outs if self.progressive_staged else None
         return hidden_states, cache_hidden
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
