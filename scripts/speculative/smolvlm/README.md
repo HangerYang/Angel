@@ -165,9 +165,13 @@ Hawk is **progressive like** `progressive_staged`, but each inject is **H add-fu
 
 ```text
 # requires len(aux)==num_hidden_layers (default 3)
-L0: ê0 = HS₀  @ w1 + embed @ w2  → H-block
-L1: ê1 = HS₁₃ @ w1 + h0    @ w2  → H-block
-L2: ê2 = HS₂₅ @ w1 + h1    @ w2  → H-block
+step 0 (target aux):
+  L0: ê0 = HS₀  @ w1 + embed @ w2  → H-block
+  L1: ê1 = HS₁₃ @ w1 + h0    @ w2  → H-block
+  L2: ê2 = HS₂₅ @ w1 + h1    @ w2  → H-block
+
+steps 1+ (same-depth draft outs; same as progressive):
+  injects ← (h0_prev, h1_prev, h2_prev)
 ```
 
 | | Progressive Eagle | Hawk |
@@ -176,6 +180,7 @@ L2: ê2 = HS₂₅ @ w1 + h1    @ w2  → H-block
 | Per-layer combine | **concat → 2H** QKV | **`w1`/`w2` add → H** |
 | Draft blocks | 2H Eagle | standard **H** Llama |
 | Train loop | Eagle online | same |
+| Steps 1+ feedback | draft `h0/h1/h2` | same |
 | vLLM eval | patched | **not yet** |
 
 Do **not** set `progressive_staged` for hawk — use `"eagle_aux_injection_mode": "hawk"`.

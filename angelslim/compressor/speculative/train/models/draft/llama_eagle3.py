@@ -654,10 +654,10 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         return self.fc(hidden_states)
 
     def shift_aux_inject(self, left: bool = False):
-        """Pad/shift stored per-layer aux injects with the training-time test loop.
+        """Pad/shift stored per-layer aux injects (legacy teacher-forcing path).
 
-        Used by hawk. Progressive staged no longer shifts target aux after step 0;
-        it reuses per-layer draft outs via ``take_progressive_draft_feedback``.
+        Progressive staged and hawk no longer use this after step 0; they reuse
+        per-layer draft outs via ``take_progressive_draft_feedback``.
         """
         if self._aux_inject is None:
             return
@@ -670,8 +670,9 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
     def take_progressive_draft_feedback(self) -> Optional[torch.Tensor]:
         """After a draft encode, set next-step injects from per-layer draft outs.
 
-        Returns L0 seed (``h0``). Sets ``_aux_inject = (h0, h1, h2, ...)`` so the
-        next speculative step uses same-depth draft HS instead of shifted target aux.
+        Used by ``progressive_staged`` and ``hawk``. Returns L0 seed (``h0``).
+        Sets ``_aux_inject = (h0, h1, h2, ...)`` so the next speculative step
+        uses same-depth draft HS instead of shifted target aux.
         """
         outs = self._last_layer_outs
         if not outs:
@@ -719,6 +720,7 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                     f"(got {None if self._aux_inject is None else len(self._aux_inject)} "
                     f"for {len(self.layers)} layers)"
                 )
+            layer_outs: List[torch.Tensor] = []
             for layer_idx, layer in enumerate(self.layers):
                 left = inputs_embeds if layer_idx == 0 else hidden_states
                 inject = self._aux_inject[layer_idx]
@@ -735,10 +737,11 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                     inject=None,
                 )
                 hidden_states = layer_outputs[0]
-            self._last_layer_outs = None
+                layer_outs.append(hidden_states)
+            self._last_layer_outs = layer_outs
             return hidden_states, cache_hidden
 
-        layer_outs: List[torch.Tensor] = []
+        layer_outs = []
         for layer_idx, layer in enumerate(self.layers):
             inject = None
             if self.progressive_staged and layer_idx > 0:
