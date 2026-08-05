@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import time
 from abc import ABC, abstractmethod
@@ -25,6 +26,8 @@ from transformers import Trainer
 from angelslim.utils.lazy_imports import deepspeed
 
 from ...utils import padding
+
+logger = logging.getLogger(__name__)
 
 
 class Eagle3Trainer(Trainer, ABC):
@@ -51,6 +54,7 @@ class Eagle3Trainer(Trainer, ABC):
         self._train_pending_log_count: int = 0
         self._eval_pending_log: dict = {}
         self._eval_pending_log_count: int = 0
+        self._logged_draft_hs_feedback = False
 
     def train(self, *args, **kwargs):
         """Override train method to record training start time for estimating remaining time."""
@@ -116,8 +120,15 @@ class Eagle3Trainer(Trainer, ABC):
 
     @property
     def draft_model(self) -> nn.Module:
-        """Get the draft model."""
-        return self.model
+        """Underlying draft module (unwrap DDP / Accelerate / DeepSpeed)."""
+        model = self.model
+        accelerator = getattr(self, "accelerator", None)
+        if accelerator is not None:
+            try:
+                return accelerator.unwrap_model(model)
+            except Exception:
+                pass
+        return model.module if hasattr(model, "module") else model
 
     def compute_loss(
         self,
@@ -229,25 +240,28 @@ class Eagle3Trainer(Trainer, ABC):
 
         # Step 6: Initialize containers for losses, accuracies and cache
         plosses, acces = [], []
-        if hasattr(self.draft_model, "init_cache_hidden"):
-            cache_hidden = self.draft_model.init_cache_hidden()
+        draft = self.draft_model  # unwrapped — mode flags / _aux_inject live here
+        use_draft_feedback = bool(
+            getattr(draft, "progressive_staged", False) or getattr(draft, "hawk", False)
+        )
+        feedback_applied = 0
+        aux_vs_draft_cos_sum = 0.0
+        if hasattr(draft, "init_cache_hidden"):
+            cache_hidden = draft.init_cache_hidden()
         else:
             cache_hidden = [[], []]
 
         # Step 7: Iterative speculative decoding training loop
         for idx in range(self.length):
             # Step 7.1: Get input embeddings with gradient tracking
-            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+            inputs_embeds = draft.embed_input_ids(input_ids)
             if not inputs_embeds.requires_grad:
                 inputs_embeds.requires_grad = True
 
             # Step 7.2: Encode through draft model layers
-            if (
-                getattr(self.draft_model, "gradient_checkpointing", False)
-                and self.draft_model.training
-            ):
+            if getattr(draft, "gradient_checkpointing", False) and draft.training:
                 hidden_states, cache_hidden = torch.utils.checkpoint.checkpoint(
-                    self.draft_model.encode_layers,
+                    draft.encode_layers,
                     inputs_embeds,
                     hidden_states,
                     cache_hidden,
@@ -257,7 +271,7 @@ class Eagle3Trainer(Trainer, ABC):
                     use_reentrant=False,
                 )
             else:
-                hidden_states, cache_hidden = self.draft_model.encode_layers(
+                hidden_states, cache_hidden = draft.encode_layers(
                     inputs_embeds=inputs_embeds,
                     hidden_states=hidden_states,
                     cache_hidden=cache_hidden,
@@ -267,15 +281,15 @@ class Eagle3Trainer(Trainer, ABC):
                 )
 
             # Step 7.3: Compute logits from hidden states
-            logits = self.draft_model.compute_logits(hidden_states)
+            logits = draft.compute_logits(hidden_states)
 
             # Step 7.4: Compute target distribution and position mask
             with torch.no_grad():
                 target_max_token = target_logits.argmax(-1)
-                target_mask = self.draft_model.t2d[target_max_token][..., None].int()
+                target_mask = draft.t2d[target_max_token][..., None].int()
                 position_mask = target_mask * loss_mask
 
-                target_head = target_logits[..., self.draft_model.t2d].float()
+                target_head = target_logits[..., draft.t2d].float()
                 target_p = nn.Softmax(dim=2)(target_head).detach()
 
             # Step 7.5: Compute loss
@@ -298,17 +312,69 @@ class Eagle3Trainer(Trainer, ABC):
                 loss_mask = padding(loss_mask, left=False)
                 # Progressive / hawk: next step uses same-depth draft outs
                 # (h0/h1/h2), not shifted target aux (teacher-forcing cheat).
-                use_draft_feedback = getattr(
-                    self.draft_model, "progressive_staged", False
-                ) or getattr(self.draft_model, "hawk", False)
-                if use_draft_feedback and hasattr(
-                    self.draft_model, "take_progressive_draft_feedback"
-                ):
-                    seed = self.draft_model.take_progressive_draft_feedback()
-                    if seed is not None:
-                        hidden_states = seed
-                elif hasattr(self.draft_model, "shift_aux_inject"):
-                    self.draft_model.shift_aux_inject(left=False)
+                if use_draft_feedback:
+                    if not hasattr(draft, "take_progressive_draft_feedback"):
+                        raise RuntimeError(
+                            "progressive/hawk draft missing take_progressive_draft_feedback"
+                        )
+                    # Prove encode stored per-layer outs before we consume them.
+                    n_outs = len(getattr(draft, "_last_layer_outs", None) or [])
+                    if n_outs != len(draft.layers):
+                        raise RuntimeError(
+                            "progressive/hawk encode_layers did not store per-layer outs "
+                            f"(got {n_outs}, expected {len(draft.layers)}). "
+                            "Draft-HS feedback cannot run — check model unwrap / mode flags."
+                        )
+                    prev_inject0 = (
+                        draft._aux_inject[0] if draft._aux_inject is not None else None
+                    )
+                    seed = draft.take_progressive_draft_feedback()
+                    if seed is None:
+                        raise RuntimeError(
+                            "take_progressive_draft_feedback returned None after encode"
+                        )
+                    # Evidence: inject tape must now be the draft layer outs, not
+                    # the target aux from combine_hidden_states.
+                    if draft._aux_inject is None or draft._aux_inject[0] is prev_inject0:
+                        raise RuntimeError(
+                            "draft-HS feedback did not replace _aux_inject with layer outs"
+                        )
+                    if draft._aux_inject[0] is not draft._last_layer_outs[0]:
+                        raise RuntimeError(
+                            "draft-HS feedback inject[0] is not encode layer-out h0"
+                        )
+                    with torch.no_grad():
+                        # <1 means inject left target tape; ≈1 would mean still target-like.
+                        aux_vs_draft_cos_sum += torch.nn.functional.cosine_similarity(
+                            prev_inject0.detach().float().flatten(),
+                            draft._aux_inject[0].detach().float().flatten(),
+                            dim=0,
+                        ).item()
+                    hidden_states = seed
+                    feedback_applied += 1
+                    if not getattr(self, "_logged_draft_hs_feedback", False):
+                        mode = (
+                            "hawk"
+                            if getattr(draft, "hawk", False)
+                            else "progressive_staged"
+                        )
+                        logger.info(
+                            "Eagle3 %s draft-HS feedback ON: after step0, "
+                            "L0←h0 and injects←(h0..h%d) from draft outs "
+                            "(not shifted target aux). Look for train/draft_hs_feedback=1 "
+                            "and train/aux_vs_draft_cos<1 in logs.",
+                            mode,
+                            len(draft.layers) - 1,
+                        )
+                        self._logged_draft_hs_feedback = True
+                elif hasattr(draft, "shift_aux_inject"):
+                    draft.shift_aux_inject(left=False)
+
+        if use_draft_feedback and feedback_applied != max(self.length - 1, 0):
+            raise RuntimeError(
+                f"draft-HS feedback expected {max(self.length - 1, 0)} applies, "
+                f"got {feedback_applied}"
+            )
 
         # Step 8: Compute weighted loss
         ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -316,6 +382,16 @@ class Eagle3Trainer(Trainer, ABC):
 
         log = {f"{log_prefix}/acc_{i}": acces[i] for i in range(len(acces))}
         log.update({f"{log_prefix}/ploss_{i}": plosses[i].item() for i in range(len(plosses))})
+        # 1.0 => draft-HS feedback ran every speculative step after 0; 0 => off/stock.
+        log[f"{log_prefix}/draft_hs_feedback"] = (
+            float(feedback_applied) / float(max(self.length - 1, 1))
+            if use_draft_feedback
+            else 0.0
+        )
+        if use_draft_feedback and feedback_applied > 0:
+            log[f"{log_prefix}/aux_vs_draft_cos"] = (
+                aux_vs_draft_cos_sum / float(feedback_applied)
+            )
         # Route into the appropriate accumulator.
         if log_prefix == "eval":
             for k, v in log.items():
