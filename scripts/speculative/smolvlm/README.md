@@ -199,9 +199,15 @@ mode: "eagle_aux_injection_mode": "progressive_staged"
 ```
 
 ```text
-L0: residual=HS₀;  attn=cat(norm(embed), norm(HS₀))
-L1: residual=h0;   attn=cat(norm(h0),    norm(HS₁₃))
-L2: residual=h1;   attn=cat(norm(h1),    norm(HS₂₅)) → lm_head
+step 0 (target aux):
+  L0: residual=HS₀;  attn=cat(norm(embed), norm(HS₀))
+  L1: residual=h0;   attn=cat(norm(h0),    norm(HS₁₃))
+  L2: residual=h1;   attn=cat(norm(h1),    norm(HS₂₅)) → lm_head
+
+steps 1+ (same-depth draft outs; no shifted target aux):
+  L0: residual=h0_prev;  attn=cat(norm(embed), norm(h0_prev))
+  L1: residual=h0';       attn=cat(norm(h0'),    norm(h1_prev))
+  L2: residual=h1';       attn=cat(norm(h1'),    norm(h2_prev))
 ```
 
 Train / eval:
@@ -239,13 +245,10 @@ If those files were never patched on this machine, you can skip the
 
 Stock `fused_fc` remains the default when the mode field is omitted.
 
-**Eval gotchas (progressive patch):**
-1. vLLM defers residual adds — L1+ must materialize `h_prev = mlp_out + residual`
-   before concat-inject.
-2. After the first draft token (current default): **L0←last draft `h2`** (stock
-   Eagle), **L1/L2←stale last-token target aux**. An alternate per-layer draft
-   reuse (`L0←h0`, `L1←h1`, `L2←h2`) is left commented in
-   `speculator.py` (`_prefill` / `_generate_draft`).
+**Train/eval feedback (progressive):** after the first draft token, both train and
+vLLM reuse per-layer draft outs (`L0←h0`, `L1←h1`, `L2←h2`) — not shifted /
+stale target aux. Residual materialize before L1+ inject is still required in
+vLLM (`h_prev = mlp_out + residual`).
 
 ---
 
