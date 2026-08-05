@@ -218,7 +218,22 @@ DRAFT_MODEL=output/smolvlm_256m_eagle3_progressive/checkpoint-* \
 
 Requires the local vLLM progressive patch
 (`third_party/patches/vllm-v0.25.0-eagle3-progressive-staged.patch`).
-Re-apply after pull: `bash third_party/apply_vllm_patches.sh` (or
+
+After `git pull`, if an older progressive patch was already applied under
+`third_party/vllm`, reset those files then re-apply (otherwise `git apply`
+can fail on a dirty tree):
+
+```bash
+cd third_party/vllm
+git checkout -- vllm/model_executor/models/llama_eagle3.py \
+  vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+cd ../..
+bash third_party/apply_vllm_patches.sh
+source third_party/env.sh
+```
+
+If those files were never patched on this machine, you can skip the
+`git checkout` and only run `apply_vllm_patches.sh` (or
 `bash third_party/link_local_vllm.sh`). Look for log line
 `Eagle3 progressive_staged enabled` at draft load.
 
