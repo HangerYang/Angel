@@ -5,8 +5,8 @@
 #   source third_party/env.sh
 #
 # Does NOT install packages. Pair with:
-#   uv pip install vllm==0.25.0   # or pip, on THAT machine
-#   bash third_party/link_local_vllm.sh
+#   bash third_party/install_local_vllm.sh                 # CUDA 13.0
+#   VLLM_CUDA=12.6 bash third_party/install_local_vllm.sh  # CUDA 12.6
 _ANGELSLIM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 _VLLM_SRC="${_ANGELSLIM_ROOT}/third_party/vllm"
 

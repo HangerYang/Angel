@@ -14,7 +14,10 @@ Stock vLLM rejects Eagle3 for SmolVLM/Idefics3 (`Model does not support EAGLE3 i
 ## Apply
 
 ```bash
-# Preferred (also run by link_local_vllm.sh after .so overlay):
+# Preferred one-shot (CUDA 13.0 default; use VLLM_CUDA=12.6 on older drivers):
+bash third_party/install_local_vllm.sh
+
+# Or only re-apply patches (also run by link_local_vllm.sh after .so overlay):
 bash third_party/apply_vllm_patches.sh
 
 # Manual:
@@ -23,3 +26,7 @@ git apply ../patches/vllm-v0.25.0-smolvlm-eagle3.patch
 ```
 
 Idempotent: already-applied patches are skipped.
+
+CUDA notes: patches are **CUDA-agnostic** (Python sources). Native `.so` must
+still match the machine — choose `VLLM_CUDA=13.0` / `12.6` / `12.9` via
+`third_party/install_local_vllm.sh` (see `third_party/README.md`).

@@ -4,9 +4,13 @@
 # Portable: no hardcoded machine paths. Derives repo root from this script's
 # location, and site-packages from whatever `python` is on PATH (conda / uv / venv).
 #
-# On every new server / env:
+# Preferred one-shot (picks CUDA wheels / source build):
+#   bash third_party/install_local_vllm.sh                  # CUDA 13.0 (default)
+#   VLLM_CUDA=12.6 bash third_party/install_local_vllm.sh   # CUDA 12.6
+#
+# Manual:
 #   1) Activate that env
-#   2) uv pip install vllm==0.25.0    # builds/fetches native .so for THIS machine
+#   2) Install a CUDA-matching vllm==0.25.0 wheel (or source build) on THIS machine
 #   3) bash third_party/link_local_vllm.sh
 #   4) source third_party/env.sh      # optional but recommended; also done via .pth
 set -euo pipefail
@@ -46,7 +50,14 @@ echo "site-pkg:  ${SITE}"
 
 # Overlay native extensions from a real wheel install into the source tree.
 # Required on each machine: .so files are ABI/CUDA-specific and not portable.
-if [[ -d "${INSTALLED}" && ! -L "${INSTALLED}" ]]; then
+# SKIP_OVERLAY=1: keep .so already built in-tree (CUDA 12.6 source install).
+if [[ "${SKIP_OVERLAY:-0}" == "1" ]]; then
+  echo "SKIP_OVERLAY=1 — keeping in-tree .so under ${PKG}/"
+  if [[ ! -e "${PKG}/_C_stable_libtorch.abi3.so" && ! -e "${PKG}/_C.abi3.so" ]]; then
+    echo "ERROR: SKIP_OVERLAY=1 but no compiled .so in ${PKG}" >&2
+    exit 1
+  fi
+elif [[ -d "${INSTALLED}" && ! -L "${INSTALLED}" ]]; then
   VER="$(python -c 'import importlib.metadata as m; print(m.version("vllm"))' 2>/dev/null || true)"
   if [[ -n "${VER}" && "${VER}" != "0.25.0" ]]; then
     echo "WARNING: env has vllm==${VER}, expected 0.25.0" >&2
@@ -59,19 +70,30 @@ if [[ -d "${INSTALLED}" && ! -L "${INSTALLED}" ]]; then
   fi
 elif [[ ! -e "${PKG}/_C_stable_libtorch.abi3.so" && ! -e "${PKG}/_C.abi3.so" ]]; then
   echo "ERROR: no site-packages/vllm to overlay, and source tree has no compiled .so." >&2
-  echo "  Install the wheel in THIS env first, then re-run:" >&2
-  echo "    uv pip install vllm==0.25.0   # or: pip install vllm==0.25.0" >&2
-  echo "    bash third_party/link_local_vllm.sh" >&2
+  echo "  Install a CUDA-matching vLLM in THIS env first, then re-run:" >&2
+  echo "    bash third_party/install_local_vllm.sh                 # CUDA 13.0" >&2
+  echo "    VLLM_CUDA=12.6 bash third_party/install_local_vllm.sh  # CUDA 12.6" >&2
   exit 1
 else
   echo "No site-packages/vllm dir; keeping existing .so already in ${PKG}"
 fi
 
-# Remove env-owned package tree so imports cannot silently use a stale install.
+# Remove env-owned package tree / editable stubs so imports use third_party only.
 if [[ -e "${INSTALLED}" || -L "${INSTALLED}" ]]; then
   echo "Removing ${INSTALLED}"
   rm -rf "${INSTALLED}"
 fi
+shopt -s nullglob
+for stale in \
+  "${SITE}"/vllm-*.dist-info \
+  "${SITE}"/__editable__.vllm*.pth \
+  "${SITE}"/__editable___*vllm* \
+  "${SITE}"/*vllm*.egg-link
+do
+  echo "Removing ${stale}"
+  rm -rf "${stale}"
+done
+shopt -u nullglob
 
 # AngelSlim-tracked patches (portable across servers). Must run AFTER rsync
 # overlay, which restores stock vLLM sources from the wheel.
