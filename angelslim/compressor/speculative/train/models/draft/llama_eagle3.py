@@ -656,12 +656,15 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
     def shift_aux_inject(self, left: bool = False):
         """Pad/shift stored per-layer aux injects (legacy teacher-forcing path).
 
-        Progressive staged and hawk no longer use this after step 0; they reuse
-        per-layer draft outs via ``take_progressive_draft_feedback``.
+        Forbidden for ``progressive_staged`` / ``hawk``: after the first draft
+        token those modes must reuse draft layer outs, never shifted target HS.
         """
+        if self.progressive_staged or self.hawk:
+            raise RuntimeError(
+                "shift_aux_inject is forbidden for progressive_staged/hawk; "
+                "use take_progressive_draft_feedback (draft outs only after step 0)"
+            )
         if self._aux_inject is None:
-            return
-        if not (self.progressive_staged or self.hawk):
             return
         from angelslim.compressor.speculative.utils import padding as pad_fn
 

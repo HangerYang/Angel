@@ -310,8 +310,8 @@ class Eagle3Trainer(Trainer, ABC):
                 input_ids = padding(input_ids, left=False)
                 target_logits = padding(target_logits, left=False)
                 loss_mask = padding(loss_mask, left=False)
-                # Progressive / hawk: next step uses same-depth draft outs
-                # (h0/h1/h2), not shifted target aux (teacher-forcing cheat).
+                # Progressive / hawk: after first token, NEVER target HS — only
+                # same-depth draft outs (h0/h1/h2). No shift_aux_inject fallback.
                 if use_draft_feedback:
                     if not hasattr(draft, "take_progressive_draft_feedback"):
                         raise RuntimeError(
@@ -359,14 +359,14 @@ class Eagle3Trainer(Trainer, ABC):
                             else "progressive_staged"
                         )
                         logger.info(
-                            "Eagle3 %s draft-HS feedback ON: after step0, "
-                            "L0←h0 and injects←(h0..h%d) from draft outs "
-                            "(not shifted target aux). Look for train/draft_hs_feedback=1 "
-                            "and train/aux_vs_draft_cos<1 in logs.",
+                            "Eagle3 %s: target HS only on first draft token; "
+                            "steps 1+ use draft outs only (L0←h0, injects←h0..h%d). "
+                            "train/draft_hs_feedback=1 required.",
                             mode,
                             len(draft.layers) - 1,
                         )
                         self._logged_draft_hs_feedback = True
+                # Stock fused_fc only: keep legacy shift if present (no-op for most).
                 elif hasattr(draft, "shift_aux_inject"):
                     draft.shift_aux_inject(left=False)
 
