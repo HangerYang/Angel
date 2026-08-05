@@ -149,8 +149,8 @@ def prepare_draft_config(
             )
         updates["num_aux_hidden_states"] = num_layers
         print(
-            "  NOTE: hawk is train-side progressive H-fusion; offline vLLM "
-            "Eagle3 eval is not wired for fuse_w1/fuse_w2 yet."
+            "  hawk: vLLM loads fuse_w1/fuse_w2; needs progressive patch "
+            "(third_party/patches/vllm-v0.25.0-eagle3-progressive-staged.patch)."
         )
 
     for key in (

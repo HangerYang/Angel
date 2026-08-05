@@ -181,7 +181,7 @@ steps 1+ (same-depth draft outs; same as progressive):
 | Draft blocks | 2H Eagle | standard **H** Llama |
 | Train loop | Eagle online | same |
 | Steps 1+ feedback | draft `h0/h1/h2` | same |
-| vLLM eval | patched | **not yet** |
+| vLLM eval | same progressive patch | same (`fuse_w1`/`fuse_w2`) |
 
 Do **not** set `progressive_staged` for hawk — use `"eagle_aux_injection_mode": "hawk"`.
 
@@ -189,7 +189,13 @@ Do **not** set `progressive_staged` for hawk — use `"eagle_aux_injection_mode"
 DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
   OUTPUT_DIR=output/smolvlm_256m_hawk \
   bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+
+DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-* \
+  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
 ```
+
+Look for log line `Eagle3 hawk enabled` at draft load (same patch re-apply as progressive).
 
 ### Progressive staged injection (experiment)
 
