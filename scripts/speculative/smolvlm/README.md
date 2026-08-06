@@ -85,13 +85,12 @@ If only `aux_hidden_states_layer_ids` is set, train scripts auto-set `eagle_aux`
 Optional init:
 
 ```json
-"draft_layer_init_from_target": [14, 16, 26],
-"draft_layer0_embed_init_from_target": 0
+"draft_layer_init_from_target": [14, 16, 26]
 ```
 
 | Draft piece | Source |
 |---|---|
-| Layer 0 emb path (`input_layernorm` + QKV emb half) | target layer `draft_layer0_embed_init_from_target` (default **0**) |
+| Layer 0 emb path (`input_layernorm` + QKV emb half) | random (not copied) |
 | Layer 0 HS path (`hidden_norm` + QKV HS half + o_proj/MLP/post-norm) | `draft_layer_init_from_target[0]` |
 | Layers 1…N−1 | full copy from `draft_layer_init_from_target[i]` |
 
@@ -148,7 +147,6 @@ Example 3-layer draft init from target:
 ```json
 "num_hidden_layers": 3,
 "draft_layer_init_from_target": [14, 16, 26],
-"draft_layer0_embed_init_from_target": 0,
 "aux_hidden_states_layer_ids": [1, 14, 26],
 "eagle_aux_hidden_state_layer_ids": [2, 15, 27]
 ```

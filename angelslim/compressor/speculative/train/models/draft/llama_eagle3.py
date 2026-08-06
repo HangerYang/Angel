@@ -798,21 +798,20 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         layer_ids: List[int],
         embed_weight_key: Optional[str] = None,
         target_layer_weight_prefix: Optional[str] = None,
-        layer0_embed_init_from_target: int = 0,
     ):
         """
         Initialize draft layers from selected target decoder layers.
 
         Stock (fused_fc):
           Layer 0 (2H QKV, dual norm):
-            - emb path ← ``layer0_embed_init_from_target``
-            - HS path ← ``layer_ids[0]``
+            - emb / left path ← random (not copied)
+            - HS / right path ← ``layer_ids[0]``
           Later layers: full H→H copy from ``layer_ids[i]``.
 
         Progressive staged (all layers 2H):
           Layer i right/HS half ← ``layer_ids[i]`` (consumer layer)
-          Layer i left half ← predecessor (``layer_ids[i]-1``, or
-          ``layer0_embed_init_from_target`` for i==0)
+          Layer 0 left half ← random
+          Layer i>0 left half ← predecessor (``layer_ids[i]-1``)
 
         Hawk (progressive H fusion; fuse_w1/w2 stay random):
           full H→H copy from ``layer_ids[i]`` for each draft layer.
@@ -853,20 +852,22 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         # Collect keys we need, then load once.
         needed: List[str] = []
         plan: List[Tuple[int, int, Dict[str, str]]] = []  # draft_idx, target_idx, name_map
-        left_src_ids: List[int] = []
+        # L0 left stays random; progressive L1+ left ← predecessor target layer.
+        left_src_ids: List[Optional[int]] = []
         for draft_idx, target_idx in enumerate(layer_ids):
             name_map = _layer_name_map(target_idx)
             needed.extend(name_map.values())
             plan.append((draft_idx, target_idx, name_map))
             if draft_idx == 0:
-                left_src_ids.append(int(layer0_embed_init_from_target))
+                left_src_ids.append(None)
             elif self.progressive_staged:
                 left_src_ids.append(int(target_idx) - 1)
             else:
                 left_src_ids.append(int(target_idx))
 
         for left_id in left_src_ids:
-            needed.extend(_layer_name_map(left_id).values())
+            if left_id is not None:
+                needed.extend(_layer_name_map(left_id).values())
 
         tensors = self._load_weight_tensors(target_model_name_or_path, needed)
         missing = [k for k in needed if k not in tensors]
@@ -881,8 +882,12 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             for draft_idx, target_idx, name_map in plan:
                 layer = self.layers[draft_idx]
                 src = {k: tensors[v] for k, v in name_map.items()}
-                left_map = _layer_name_map(left_src_ids[draft_idx])
-                left_src = {k: tensors[v] for k, v in left_map.items()}
+                left_id = left_src_ids[draft_idx]
+                left_src = (
+                    {k: tensors[v] for k, v in _layer_name_map(left_id).items()}
+                    if left_id is not None
+                    else None
+                )
 
                 def _copy(param: torch.nn.Parameter, tensor: torch.Tensor, what: str = ""):
                     if param.shape != tensor.shape:
@@ -906,33 +911,41 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
 
                 use_2h = (not self.hawk) and (draft_idx == 0 or self.progressive_staged)
                 if use_2h:
-                    # Left path ← predecessor / embed layer; HS path ← consumer layer.
-                    _copy(
-                        layer.input_layernorm.weight,
-                        left_src["input_layernorm.weight"],
-                        "left input_layernorm",
-                    )
+                    # HS / right path ← consumer layer. L0 left stays random;
+                    # progressive L1+ left ← predecessor when available.
                     _copy(
                         layer.hidden_norm.weight,
                         src["input_layernorm.weight"],
                         "hidden_norm",
                     )
+                    if left_src is not None:
+                        _copy(
+                            layer.input_layernorm.weight,
+                            left_src["input_layernorm.weight"],
+                            "left input_layernorm",
+                        )
                     for proj_name in ("q_proj", "k_proj", "v_proj"):
                         draft_w = getattr(layer.self_attn, proj_name).weight
-                        emb_w = left_src[f"self_attn.{proj_name}.weight"]
                         hs_w = src[f"self_attn.{proj_name}.weight"]
-                        if draft_w.shape[-1] != 2 * h or emb_w.shape[-1] != h or hs_w.shape[-1] != h:
+                        if draft_w.shape[-1] != 2 * h or hs_w.shape[-1] != h:
                             raise ValueError(
                                 f"Expected draft layer{draft_idx} {proj_name} "
                                 f"in_features=2H and target in_features=H; got "
-                                f"{draft_w.shape} / {emb_w.shape} / {hs_w.shape}"
+                                f"{draft_w.shape} / {hs_w.shape}"
                             )
-                        draft_w[:, :h].copy_(
-                            emb_w.to(dtype=draft_w.dtype, device=draft_w.device)
-                        )
                         draft_w[:, h:].copy_(
                             hs_w.to(dtype=draft_w.dtype, device=draft_w.device)
                         )
+                        if left_src is not None:
+                            emb_w = left_src[f"self_attn.{proj_name}.weight"]
+                            if emb_w.shape[-1] != h:
+                                raise ValueError(
+                                    f"Expected left-source {proj_name} in_features=H; "
+                                    f"got {emb_w.shape}"
+                                )
+                            draft_w[:, :h].copy_(
+                                emb_w.to(dtype=draft_w.dtype, device=draft_w.device)
+                            )
                 else:
                     _copy(layer.input_layernorm.weight, src["input_layernorm.weight"])
                     _copy(layer.self_attn.q_proj.weight, src["self_attn.q_proj.weight"])
