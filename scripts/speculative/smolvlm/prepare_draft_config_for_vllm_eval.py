@@ -154,7 +154,6 @@ def prepare_draft_config(
         )
 
     for key in (
-        "draft_layer0_embed_init_from_target",
         "target_model_type",
         "modal_type",
         "draft_vocab_size",

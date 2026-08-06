@@ -339,9 +339,6 @@ def train():
             target_layer_weight_prefix=getattr(
                 draft_model_config, "target_layer_weight_prefix", None
             ),
-            layer0_embed_init_from_target=int(
-                getattr(draft_model_config, "draft_layer0_embed_init_from_target", 0)
-            ),
         )
     aux_ids = getattr(draft_model_config, "aux_hidden_states_layer_ids", None)
     eagle_aux_ids = getattr(draft_model_config, "eagle_aux_hidden_state_layer_ids", None)
