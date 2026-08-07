@@ -9,7 +9,7 @@ Stock vLLM rejects Eagle3 for SmolVLM/Idefics3 (`Model does not support EAGLE3 i
 | Patch | Purpose |
 |---|---|
 | `vllm-v0.25.0-smolvlm-eagle3.patch` | `SupportsEagle3` on Idefics3/SmolVLM + `load_eagle_model` `text_model` wiring |
-| `vllm-v0.25.0-eagle3-progressive-staged.patch` | Progressive staged + hawk aux injection + **assistance mode** (frozen target aux for draft steps) |
+| `vllm-v0.25.0-eagle3-progressive-staged.patch` | Progressive staged + hawk + **miracle** (oracle GT-HS tape for fused/progressive/hawk) |
 
 ## Apply
 
@@ -26,6 +26,30 @@ git apply ../patches/vllm-v0.25.0-smolvlm-eagle3.patch
 ```
 
 Idempotent: already-applied patches are skipped.
+
+### Re-apply progressive / miracle after pull
+
+If an older progressive patch is already on the tree, reset then re-apply:
+
+```bash
+cd third_party/vllm
+git checkout -- vllm/envs.py \
+  vllm/model_executor/models/llama_eagle3.py \
+  vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+rm -f vllm/model_executor/models/eagle_miracle.py
+cd ../..
+bash third_party/apply_vllm_patches.sh
+source third_party/env.sh
+```
+
+Miracle eval (see `scripts/speculative/smolvlm/README.md` § Miracle mode):
+
+```bash
+MIRACLE_MODE=1 TEMP=0 \
+  DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
+  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+```
 
 CUDA notes: patches are **CUDA-agnostic** (Python sources). Native `.so` must
 still match the machine — choose `VLLM_CUDA=13.0` / `12.6` / `12.9` via

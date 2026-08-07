@@ -81,13 +81,20 @@ def parse_args():
         help="Enable speculative decoding with Eagle",
     )
     parser.add_argument(
-        "--eagle_assistance_mode",
+        "--eagle_miracle_mode",
         action="store_true",
         help=(
-            "Progressive/hawk only: after target verify, keep using frozen "
-            "target aux HS for draft steps 1+ (no draft-HS feedback). "
-            "Sets VLLM_EAGLE_ASSISTANCE_MODE=1."
+            "Oracle GT-HS miracle mode (fused / progressive / hawk): "
+            "1) target-only generate for GT tokens, 2) capture full target "
+            "aux tape along that trajectory, 3) eagle decode injecting "
+            "tape[pos] each draft step. Timed metrics are from step 3 only."
         ),
+    )
+    parser.add_argument(
+        "--miracle_hs_dir",
+        type=str,
+        default=None,
+        help="Directory for GT tokens + aux tapes (default: <output>_miracle_hs).",
     )
     parser.add_argument(
         "--output_file", type=str, default="results/qwen3-vl-4b-eagle3-results.jsonl"
@@ -356,35 +363,36 @@ def main():
                 "Running without speculative decoding."
             )
 
-    if args.eagle_assistance_mode:
-        if not args.use_eagle:
-            print(
-                "Warning: --eagle_assistance_mode ignored without --use_eagle"
-            )
-        else:
-            os.environ["VLLM_EAGLE_ASSISTANCE_MODE"] = "1"
-            # Also stamp draft config so model __init__ sees the flag even if
-            # env is cleared in workers.
-            if args.draft_model:
-                cfg_path = os.path.join(args.draft_model, "config.json")
-                if os.path.isfile(cfg_path):
-                    with open(cfg_path, encoding="utf-8") as f:
-                        cfg = json.load(f)
-                    if not cfg.get("eagle_assistance_mode"):
-                        cfg["eagle_assistance_mode"] = True
-                        with open(cfg_path, "w", encoding="utf-8") as f:
-                            json.dump(cfg, f, indent=2)
-                            f.write("\n")
-                        print(f"Wrote eagle_assistance_mode=true -> {cfg_path}")
-            print(
-                "Eagle assistance mode ON: draft steps use frozen target aux "
-                "(not draft-HS feedback)"
-            )
+    miracle = bool(args.eagle_miracle_mode)
+    if miracle and not args.use_eagle:
+        print("Warning: --eagle_miracle_mode ignored without --use_eagle")
+        miracle = False
+    if miracle and args.max_num_seqs != 1:
+        raise ValueError("eagle_miracle_mode requires --max_num_seqs 1")
 
-    print(
-        f"Initializing LLM with target_model={args.target_model}, "
-        f"speculative_config={speculative_config}"
-    )
+    miracle_hs_dir = args.miracle_hs_dir
+    if miracle:
+        if not miracle_hs_dir:
+            base, _ = os.path.splitext(args.output_file)
+            miracle_hs_dir = base + "_miracle_hs"
+        os.makedirs(miracle_hs_dir, exist_ok=True)
+        if args.draft_model:
+            cfg_path = os.path.join(args.draft_model, "config.json")
+            if os.path.isfile(cfg_path):
+                with open(cfg_path, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if not cfg.get("eagle_miracle_mode"):
+                    cfg["eagle_miracle_mode"] = True
+                    # Clear stale frozen-assistance flag if present.
+                    cfg.pop("eagle_assistance_mode", None)
+                    with open(cfg_path, "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, indent=2)
+                        f.write("\n")
+                    print(f"Wrote eagle_miracle_mode=true -> {cfg_path}")
+        print(
+            "Eagle MIRACLE mode ON: GT target-HS tape along target trajectory "
+            f"(dir={miracle_hs_dir})"
+        )
 
     # Build mm_processor_kwargs based on model type (Qwen3-VL vs others)
     mm_processor_kwargs = None
@@ -407,20 +415,26 @@ def main():
             mm_processor_kwargs["min_pixels"] = args.min_pixels
         print(f"mm_processor_kwargs: {mm_processor_kwargs}")
 
-    llm = LLM(
-        model=args.target_model,
-        trust_remote_code=True,
-        tensor_parallel_size=args.tp,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        speculative_config=speculative_config,
-        max_num_seqs=args.max_num_seqs,
-        enforce_eager=True,
-        disable_log_stats=False,
-        max_model_len=args.max_model_len,
-        limit_mm_per_prompt={"image": args.limit_mm_per_prompt_image},
-        mm_processor_kwargs=mm_processor_kwargs,
-        disable_chunked_mm_input=False,
-    )
+    def _make_llm(spec_cfg):
+        print(
+            f"Initializing LLM with target_model={args.target_model}, "
+            f"speculative_config={spec_cfg}"
+        )
+        return LLM(
+            model=args.target_model,
+            trust_remote_code=True,
+            tensor_parallel_size=args.tp,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            speculative_config=spec_cfg,
+            max_num_seqs=args.max_num_seqs,
+            enforce_eager=True,
+            disable_log_stats=False,
+            max_model_len=args.max_model_len,
+            limit_mm_per_prompt={"image": args.limit_mm_per_prompt_image},
+            mm_processor_kwargs=mm_processor_kwargs,
+            disable_chunked_mm_input=False,
+            enable_prefix_caching=False,
+        )
 
     sampling_params = SamplingParams(temperature=args.temp, max_tokens=args.output_len)
 
@@ -428,10 +442,57 @@ def main():
         print("[debug] breakpoint before generate — continue in debugger")
         breakpoint()
 
-    print("Starting generation...")
-    start_time = time.perf_counter()
-    outputs = llm.chat(prompts, sampling_params=sampling_params)
-    end_time = time.perf_counter()
+    if miracle:
+        # --- Phase A: target-only GT trajectory (not timed) ---
+        print("MIRACLE phase A: target-only generate for GT tokens...")
+        llm_base = _make_llm(None)
+        baseline_outputs = llm_base.chat(prompts, sampling_params=sampling_params)
+        gt_meta = []
+        for out in baseline_outputs:
+            prompt_ids = list(out.prompt_token_ids)
+            out_ids = list(out.outputs[0].token_ids)
+            gt_meta.append(
+                {
+                    "prompt_len": len(prompt_ids),
+                    "token_ids": prompt_ids + out_ids,
+                }
+            )
+        gt_path = os.path.join(miracle_hs_dir, "gt_tokens.json")
+        with open(gt_path, "w", encoding="utf-8") as f:
+            json.dump(gt_meta, f)
+        print(f"  wrote {len(gt_meta)} GT trajectories -> {gt_path}")
+        del llm_base
+
+        # --- Phase B: capture GT aux tapes (not timed) ---
+        print("MIRACLE phase B: capture GT-HS tapes (force draft onto GT path)...")
+        os.environ["VLLM_EAGLE_MIRACLE_MODE"] = "1"
+        os.environ["VLLM_EAGLE_MIRACLE_HS_DIR"] = os.path.abspath(miracle_hs_dir)
+        os.environ["VLLM_EAGLE_MIRACLE_PHASE"] = "capture"
+        llm_cap = _make_llm(speculative_config)
+        _ = llm_cap.chat(prompts, sampling_params=sampling_params)
+        n_tapes = sum(
+            1
+            for i in range(len(gt_meta))
+            if os.path.isfile(os.path.join(miracle_hs_dir, f"{i:05d}.pt"))
+        )
+        print(f"  captured {n_tapes}/{len(gt_meta)} tapes in {miracle_hs_dir}")
+        del llm_cap
+
+        # --- Phase C: eagle with miracle inject (TIMED) ---
+        print("MIRACLE phase C: eagle decode with GT-HS inject (timed)...")
+        os.environ["VLLM_EAGLE_MIRACLE_PHASE"] = "use"
+        llm = _make_llm(speculative_config)
+        print("Starting generation...")
+        start_time = time.perf_counter()
+        outputs = llm.chat(prompts, sampling_params=sampling_params)
+        end_time = time.perf_counter()
+    else:
+        llm = _make_llm(speculative_config)
+        print("Starting generation...")
+        start_time = time.perf_counter()
+        outputs = llm.chat(prompts, sampling_params=sampling_params)
+        end_time = time.perf_counter()
+
     total_time = end_time - start_time
     print(f"Generation finished in {total_time:.2f} seconds.")
 
@@ -503,7 +564,8 @@ def main():
         "total_time": total_time,
         "avg_time_per_sample": total_time / num_prompts if num_prompts > 0 else 0,
         "use_eagle": args.use_eagle,
-        "eagle_assistance_mode": bool(args.eagle_assistance_mode),
+        "eagle_miracle_mode": bool(miracle),
+        "miracle_hs_dir": miracle_hs_dir if miracle else None,
         "output_throughput": output_throughput,
         "request_throughput": request_throughput,
         "avg_input_tokens": avg_input_tokens,
