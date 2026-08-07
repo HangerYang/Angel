@@ -81,6 +81,15 @@ def parse_args():
         help="Enable speculative decoding with Eagle",
     )
     parser.add_argument(
+        "--eagle_assistance_mode",
+        action="store_true",
+        help=(
+            "Progressive/hawk only: after target verify, keep using frozen "
+            "target aux HS for draft steps 1+ (no draft-HS feedback). "
+            "Sets VLLM_EAGLE_ASSISTANCE_MODE=1."
+        ),
+    )
+    parser.add_argument(
         "--output_file", type=str, default="results/qwen3-vl-4b-eagle3-results.jsonl"
     )
     parser.add_argument(
@@ -347,6 +356,31 @@ def main():
                 "Running without speculative decoding."
             )
 
+    if args.eagle_assistance_mode:
+        if not args.use_eagle:
+            print(
+                "Warning: --eagle_assistance_mode ignored without --use_eagle"
+            )
+        else:
+            os.environ["VLLM_EAGLE_ASSISTANCE_MODE"] = "1"
+            # Also stamp draft config so model __init__ sees the flag even if
+            # env is cleared in workers.
+            if args.draft_model:
+                cfg_path = os.path.join(args.draft_model, "config.json")
+                if os.path.isfile(cfg_path):
+                    with open(cfg_path, encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    if not cfg.get("eagle_assistance_mode"):
+                        cfg["eagle_assistance_mode"] = True
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            json.dump(cfg, f, indent=2)
+                            f.write("\n")
+                        print(f"Wrote eagle_assistance_mode=true -> {cfg_path}")
+            print(
+                "Eagle assistance mode ON: draft steps use frozen target aux "
+                "(not draft-HS feedback)"
+            )
+
     print(
         f"Initializing LLM with target_model={args.target_model}, "
         f"speculative_config={speculative_config}"
@@ -469,6 +503,7 @@ def main():
         "total_time": total_time,
         "avg_time_per_sample": total_time / num_prompts if num_prompts > 0 else 0,
         "use_eagle": args.use_eagle,
+        "eagle_assistance_mode": bool(args.eagle_assistance_mode),
         "output_throughput": output_throughput,
         "request_throughput": request_throughput,
         "avg_input_tokens": avg_input_tokens,

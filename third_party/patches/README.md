@@ -9,7 +9,7 @@ Stock vLLM rejects Eagle3 for SmolVLM/Idefics3 (`Model does not support EAGLE3 i
 | Patch | Purpose |
 |---|---|
 | `vllm-v0.25.0-smolvlm-eagle3.patch` | `SupportsEagle3` on Idefics3/SmolVLM + `load_eagle_model` `text_model` wiring |
-| `vllm-v0.25.0-eagle3-progressive-staged.patch` | Progressive staged + hawk aux injection for multi-layer Eagle3 draft (`llama_eagle3` + propose) |
+| `vllm-v0.25.0-eagle3-progressive-staged.patch` | Progressive staged + hawk aux injection + **assistance mode** (frozen target aux for draft steps) |
 
 ## Apply
 
