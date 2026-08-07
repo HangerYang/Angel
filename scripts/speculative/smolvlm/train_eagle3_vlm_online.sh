@@ -206,20 +206,40 @@ TRAIN_CMD=(
   --modal_type VLM
   --target_model_name_or_path "${TARGET_MODEL_NAME_OR_PATH}"
   --draft_model_config_path "${DRAFT_MODEL_CONFIG_PATH}"
-  "${DRAFT_MODEL_DTYPE_ARGS[@]}"
-  "${DRAFT_WARM_START_ARGS[@]}"
+)
+if (( ${#DRAFT_MODEL_DTYPE_ARGS[@]} )); then
+  TRAIN_CMD+=("${DRAFT_MODEL_DTYPE_ARGS[@]}")
+fi
+if (( ${#DRAFT_WARM_START_ARGS[@]} )); then
+  TRAIN_CMD+=("${DRAFT_WARM_START_ARGS[@]}")
+fi
+TRAIN_CMD+=(
   --train_data_path "${TRAIN_DATA_PATH}"
-  "${EVAL_ARGS[@]}"
+)
+if (( ${#EVAL_ARGS[@]} )); then
+  TRAIN_CMD+=("${EVAL_ARGS[@]}")
+fi
+TRAIN_CMD+=(
   --output_dir "${OUTPUT_DIR}"
   --num_train_epochs "${NUM_TRAIN_EPOCHS}"
-  "${MAX_STEPS_ARGS[@]}"
-  "${PROGRESSIVE_TARGET_HS_WARMUP_ARGS[@]}"
+)
+if (( ${#MAX_STEPS_ARGS[@]} )); then
+  TRAIN_CMD+=("${MAX_STEPS_ARGS[@]}")
+fi
+if (( ${#PROGRESSIVE_TARGET_HS_WARMUP_ARGS[@]} )); then
+  TRAIN_CMD+=("${PROGRESSIVE_TARGET_HS_WARMUP_ARGS[@]}")
+fi
+TRAIN_CMD+=(
   --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
   --per_device_eval_batch_size 1
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
   --num_proc "${NUM_PROC}"
   --load_from_cache_file "${LOAD_FROM_CACHE_FILE}"
-  "${SAVE_ARGS[@]}"
+)
+if (( ${#SAVE_ARGS[@]} )); then
+  TRAIN_CMD+=("${SAVE_ARGS[@]}")
+fi
+TRAIN_CMD+=(
   --learning_rate 1e-4
   --weight_decay 0.0
   --warmup_ratio 0.05
@@ -231,10 +251,16 @@ TRAIN_CMD=(
   --bf16
   --report_to none
   --run_name smolvlm-256m-eagle3-angelslim
-  "${DDP_ARGS[@]}"
-  "${SAMPLE_ARGS[@]}"
-  "${DS_ARGS[@]}"
 )
+if (( ${#DDP_ARGS[@]} )); then
+  TRAIN_CMD+=("${DDP_ARGS[@]}")
+fi
+if (( ${#SAMPLE_ARGS[@]} )); then
+  TRAIN_CMD+=("${SAMPLE_ARGS[@]}")
+fi
+if (( ${#DS_ARGS[@]} )); then
+  TRAIN_CMD+=("${DS_ARGS[@]}")
+fi
 
 EFFECTIVE_BATCH=$((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
 if [[ "${LAUNCH}" == "torchrun" ]]; then
