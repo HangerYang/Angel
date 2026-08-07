@@ -100,8 +100,13 @@ class DraftModelFactory:
         dtype_mapping = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
+            "float32": torch.float32,
         }
-        model_dtype = dtype_mapping.get(config.torch_dtype, torch.bfloat16)
+        config_dtype = getattr(config, "torch_dtype", getattr(config, "dtype", "bfloat16"))
+        if isinstance(config_dtype, torch.dtype):
+            model_dtype = config_dtype
+        else:
+            model_dtype = dtype_mapping.get(str(config_dtype), torch.bfloat16)
         model = model.to(dtype=model_dtype)
 
         return model
