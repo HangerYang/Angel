@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
-from typing import Any, Dict, List
+import os
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from transformers.image_utils import load_image
@@ -32,7 +34,62 @@ __all__ = [
     "AudioDataCollatorWithPadding",
     "CosyVoice3DataCollatorWithPadding",
     "build_image_processor_kwargs",
+    "stable_hf_map_cache_files",
 ]
+
+
+def stable_hf_map_cache_files(
+    datapath: Union[str, List[str]],
+    *,
+    builder_tag: str,
+    max_length: int,
+    shuffle: bool,
+    shuffle_seed: int,
+    sample_num: Optional[int] = None,
+    min_loss_tokens: Optional[int] = None,
+    cache_version: str = "v1",
+) -> Dict[str, str]:
+    """Stable on-disk paths for HuggingFace ``datasets.map`` / ``filter`` caches.
+
+    Default HF fingerprints bound methods (tokenizer object id, etc.), so
+    ``load_from_cache_file=True`` still remaps every restart. Pinning
+    ``cache_file_name`` under ``<data_dir>/.map_cache/`` makes reuse real.
+
+    Key includes data path + size + mtime, builder, max_length, shuffle, etc.
+    Delete the ``.map_cache`` dir (or set ``load_from_cache_file=false``) after
+    changing preprocessing code.
+    """
+    paths = datapath if isinstance(datapath, list) else [datapath]
+    abs_paths = [os.path.abspath(p) for p in paths]
+    meta_parts: List[str] = []
+    for p in abs_paths:
+        if os.path.isfile(p):
+            st = os.stat(p)
+            meta_parts.append(f"{p}:{st.st_size}:{int(st.st_mtime)}")
+        else:
+            meta_parts.append(f"{p}:missing")
+    raw = "|".join(
+        [
+            *meta_parts,
+            f"builder={builder_tag}",
+            f"ver={cache_version}",
+            f"L={max_length}",
+            f"sh={int(bool(shuffle))}",
+            f"seed={shuffle_seed}",
+            f"n={sample_num}",
+            f"mlt={min_loss_tokens}",
+        ]
+    )
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    root = os.path.join(os.path.dirname(abs_paths[0]), ".map_cache")
+    os.makedirs(root, exist_ok=True)
+    stem = f"{builder_tag}_{digest}"
+    return {
+        "root": root,
+        "map": os.path.join(root, f"{stem}_map.arrow"),
+        "filter_empty": os.path.join(root, f"{stem}_filter_empty.arrow"),
+        "filter_loss": os.path.join(root, f"{stem}_filter_loss.arrow"),
+    }
 
 
 def build_image_processor_kwargs(image_processor, max_pixels=None, min_pixels=None):

@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 from angelslim.utils import rank0_print
 
 from ..chat_templates import ChatTemplateType, template_manager
+from ..data_utils import stable_hf_map_cache_files
 
 
 class DatasetBuilder(metaclass=ABCMeta):
@@ -150,6 +151,19 @@ class OnlineDatasetBuilder(DatasetBuilder):
 
             # Store original columns for removal
             original_columns = ds.column_names
+            cache_files = stable_hf_map_cache_files(
+                datapath,
+                builder_tag=type(self).__name__,
+                max_length=self.max_length,
+                shuffle=shuffle,
+                shuffle_seed=self.shuffle_seed,
+                sample_num=sample_num,
+                min_loss_tokens=min_loss_tokens,
+            )
+            if load_from_cache_file:
+                rank0_print(
+                    f"HF map cache (load_from_cache_file=true): {cache_files['root']}"
+                )
 
             # Apply preprocessing
             processed_ds = ds.map(
@@ -158,6 +172,7 @@ class OnlineDatasetBuilder(DatasetBuilder):
                 num_proc=num_proc,
                 remove_columns=original_columns,
                 load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["map"],
                 desc="Processing conversations",
             )
 
@@ -166,6 +181,8 @@ class OnlineDatasetBuilder(DatasetBuilder):
                 lambda batch: [ids is not None for ids in batch["input_ids"]],
                 batched=True,
                 num_proc=num_proc,
+                load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["filter_empty"],
                 desc="Filtering empty input_ids",
             )
 
@@ -177,6 +194,8 @@ class OnlineDatasetBuilder(DatasetBuilder):
                     ],
                     batched=True,
                     num_proc=num_proc,
+                    load_from_cache_file=load_from_cache_file,
+                    cache_file_name=cache_files["filter_loss"],
                     desc=f"Filtering sequences with loss tokens < {min_loss_tokens}",
                 )
 

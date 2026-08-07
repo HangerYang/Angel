@@ -6,24 +6,23 @@
 #   eagle_aux_hidden_state_layer_ids   (vLLM)
 #   aux_hidden_states_layer_ids        (train; used to derive eagle_aux if needed)
 #
-# Examples:
-#   # Eagle3 (requires a saved draft dir)
-#   DRAFT_MODEL=output/smolvlm_256m_eagle3_online \
-#     bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+# Output (default):
+#   {DRAFT_MODEL}/eval/{data}/results.jsonl
+#   {DRAFT_MODEL}/eval/{data}_miracle/results.jsonl   # MIRACLE_MODE=1
+#   results/baseline/eval/{data}/results.jsonl        # USE_EAGLE=0
 #
-#   # Baseline (no speculative decoding)
+# Examples:
+#   DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
+#     DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+#     bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+#   # → .../checkpoint-30000/eval/textvqa/results.jsonl
+#
 #   USE_EAGLE=0 bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
 #
-#   # Miracle mode (oracle GT-HS): works for fused_fc / progressive / hawk.
-#   # Internally: target-only GT → capture aux tape → timed eagle with tape[pos].
 #   MIRACLE_MODE=1 DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
 #     DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
 #     bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
-#
-#   # Local jsonl + small smoke
-#   DATASET=dataset/smolvlm_256m_target_gen/data_0-36.jsonl NUM_PROMPTS=4 \
-#     DRAFT_MODEL=output/smolvlm_256m_eagle3_online \
-#     bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+#   # → .../checkpoint-30000/eval/textvqa_miracle/results.jsonl
 #
 # See scripts/speculative/smolvlm/README.md § Eval + "Where to update vLLM".
 
@@ -43,7 +42,12 @@ TARGET_MODEL="${TARGET_MODEL:-HuggingFaceTB/SmolVLM-256M-Instruct}"
 DRAFT_MODEL="${DRAFT_MODEL:-output/smolvlm_256m_eagle3_online}"
 DRAFT_MODEL_CONFIG_PATH="${DRAFT_MODEL_CONFIG_PATH:-${CONFIG_DIR}/smolvlm-256m-eagle3.json}"
 DATASET="${DATASET:-lmms-lab/textvqa}"
-OUTPUT_FILE="${OUTPUT_FILE:-results/smolvlm-256m-eagle3-eval.jsonl}"
+# OUTPUT_FILE default (set below after draft resolve):
+#   {DRAFT_MODEL}/eval/{data_name}/results.jsonl
+#   {DRAFT_MODEL}/eval/{data_name}_miracle/results.jsonl   # MIRACLE_MODE=1
+#   results/baseline/eval/{data_name}/results.jsonl        # USE_EAGLE=0
+# Override anytime with OUTPUT_FILE=...
+OUTPUT_FILE="${OUTPUT_FILE:-}"
 USE_EAGLE="${USE_EAGLE:-1}"
 MIRACLE_MODE="${MIRACLE_MODE:-0}"
 # Back-compat: old ASSISTANCE_MODE name now means miracle.
@@ -102,57 +106,15 @@ resolve_draft_model() {
   printf '%s' "${d}"
 }
 
-# Fail fast if this server's local vLLM is missing the SmolVLM Eagle3 patch.
-python3 - <<'PY'
-import os
-import sys
-
-import vllm
-
-vllm_path = os.path.realpath(vllm.__file__)
-if "third_party/vllm" not in vllm_path.replace("\\", "/"):
-    print(
-        "ERROR: import vllm is not the local third_party checkout:\n"
-        f"  {vllm_path}\n"
-        "  Run: bash third_party/link_local_vllm.sh && source third_party/env.sh",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-from vllm.model_executor.models.idefics3 import Idefics3ForConditionalGeneration
-from vllm.model_executor.models.interfaces import SupportsEagle3
-
-if SupportsEagle3 not in Idefics3ForConditionalGeneration.__mro__:
-    print(
-        "ERROR: local vLLM missing SmolVLM/Idefics3 Eagle3 support "
-        "(Model does not support EAGLE3 interface).\n"
-        "  This patch is tracked in AngelSlim, not upstream vLLM:\n"
-        "    third_party/patches/vllm-v0.25.0-smolvlm-eagle3.patch\n"
-        "  On this server run:\n"
-        "    bash third_party/apply_vllm_patches.sh\n"
-        "  Or full setup:\n"
-        "    bash third_party/link_local_vllm.sh && source third_party/env.sh",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-# Miracle helpers must exist (progressive patch).
-try:
-    from vllm.model_executor.models import eagle_miracle  # noqa: F401
-except ImportError:
-    print(
-        "ERROR: local vLLM missing eagle_miracle (miracle / GT-HS mode).\n"
-        "  Reset progressive files and re-apply:\n"
-        "    cd third_party/vllm && git checkout -- \\\n"
-        "      vllm/envs.py \\\n"
-        "      vllm/model_executor/models/llama_eagle3.py \\\n"
-        "      vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py\n"
-        "    cd ../.. && bash third_party/apply_vllm_patches.sh",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-print(f"vLLM Eagle3/SmolVLM OK: {vllm_path}")
-PY
+# lmms-lab/textvqa → textvqa ; path/to/foo.jsonl → foo
+dataset_folder_name() {
+  local ds="$1"
+  local base
+  base="$(basename "${ds}")"
+  base="${base%.jsonl}"
+  base="${base%.json}"
+  printf '%s' "${base}"
+}
 
 EXTRA=()
 if [[ "${USE_EAGLE}" == "1" ]]; then
@@ -199,6 +161,22 @@ if [[ "${USE_EAGLE}" == "1" ]]; then
 else
   echo "USE_EAGLE=0 — baseline eval (no draft / speculative decoding)"
 fi
+
+# Default output layout (only if OUTPUT_FILE unset):
+#   draft/eval/<data>/results.jsonl
+#   draft/eval/<data>_miracle/results.jsonl
+DATA_NAME="$(dataset_folder_name "${DATASET}")"
+if [[ "${MIRACLE_MODE}" == "1" ]]; then
+  DATA_NAME="${DATA_NAME}_miracle"
+fi
+if [[ -z "${OUTPUT_FILE}" ]]; then
+  if [[ "${USE_EAGLE}" == "1" ]]; then
+    OUTPUT_FILE="${DRAFT_MODEL}/eval/${DATA_NAME}/results.jsonl"
+  else
+    OUTPUT_FILE="results/baseline/eval/${DATA_NAME}/results.jsonl"
+  fi
+fi
+mkdir -p "$(dirname "${OUTPUT_FILE}")"
 
 CMD=(
   python3 tools/vllm_offline_eagle3_vlm_batch.py

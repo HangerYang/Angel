@@ -9,8 +9,11 @@
 #   TRAIN_MODE=gloo      bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
 #   TRAIN_MODE=python    bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
 #
-# Overrides: TRAIN_DATA_PATH, EVAL_DATA_PATH, OUTPUT_DIR, DRAFT_MODEL_CONFIG_PATH,
-#   DRAFT_MODEL_NAME_OR_PATH, MAX_STEPS, PROGRESSIVE_TARGET_HS_WARMUP_STEPS, ...
+# Draft knobs (see comments near assignments below):
+#   DRAFT_MODEL_CONFIG_PATH   — architecture JSON (eagle3 | progressive | hawk | ...)
+#   DRAFT_MODEL_NAME_OR_PATH  — optional draft checkpoint to warm-start from
+#   DRAFT_MODEL_DTYPE         — config | float16 | bfloat16 | float32
+# Other overrides: TRAIN_DATA_PATH, EVAL_DATA_PATH, OUTPUT_DIR, MAX_STEPS, ...
 
 set -euo pipefail
 
@@ -58,9 +61,29 @@ if [[ -f "${ROOT}/third_party/env.sh" ]]; then
 fi
 
 CONFIG_DIR=angelslim/compressor/speculative/train/configs
+
+# Target (frozen) VLM that produces hidden states / teacher logits.
+# Option: HF id or local path (default HuggingFaceTB/SmolVLM-256M-Instruct).
 TARGET_MODEL_NAME_OR_PATH=${TARGET_MODEL_NAME_OR_PATH:-HuggingFaceTB/SmolVLM-256M-Instruct}
+
+# Draft architecture blueprint (JSON). Required. Builds the draft from scratch.
+# Options under $CONFIG_DIR:
+#   smolvlm-256m-eagle3.json              — stock Eagle3 (fused_fc, 1 draft layer)
+#   smolvlm-256m-eagle3-progressive.json  — progressive_staged, 3 layers, init from target
+#   smolvlm-256m-eagle3-progressive-uninit.json — same progressive, no layer init
+#   smolvlm-256m-hawk.json                — hawk (w1/w2 H-fusion, 3 layers)
+# Example: DRAFT_MODEL_CONFIG_PATH=$CONFIG_DIR/smolvlm-256m-hawk.json
 DRAFT_MODEL_CONFIG_PATH=${DRAFT_MODEL_CONFIG_PATH:-$CONFIG_DIR/smolvlm-256m-eagle3.json}
+
+# Optional warm-start weights for the draft (not the target).
+# Options:
+#   "" (default)              — random / config init only (no pretrained draft)
+#   path/to/checkpoint-NNNN   — load draft weights from a prior train run
+#   path/to/draft_dir         — load from a saved draft model directory / HF id
+# Skipped automatically if OUTPUT_DIR already has checkpoint-* (HF resume wins).
+# Example: DRAFT_MODEL_NAME_OR_PATH=output/smolvlm_256m_hawk/checkpoint-30000
 DRAFT_MODEL_NAME_OR_PATH=${DRAFT_MODEL_NAME_OR_PATH:-}
+
 TRAIN_DATA_PATH=${TRAIN_DATA_PATH:-dataset/smolvlm_256m_target_gen_mixed_70k70k/train.jsonl}
 EVAL_DATA_PATH=${EVAL_DATA_PATH:-dataset/smolvlm_256m_target_gen_mixed_70k70k/eval.jsonl}
 OUTPUT_DIR=${OUTPUT_DIR:-output/smolvlm_256m_eagle3_online}
@@ -73,11 +96,18 @@ PROGRESSIVE_TARGET_HS_WARMUP_STEPS=${PROGRESSIVE_TARGET_HS_WARMUP_STEPS:-0}
 SAMPLE_NUM=${SAMPLE_NUM:-}
 DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-}
 
-# Draft dtype identical across launchers (config JSON, usually bf16).
-# Non-DeepSpeed paths use FP32MasterWeightOptimizer in Eagle3Trainer so Adam
-# moments match ZeRO's FP32 optimizer state (plain bf16 Adam plateaus).
+# Draft parameter dtype before Trainer/optimizer creation.
+# Options: config | float16 | bfloat16 | float32
+#   config (default) — use "dtype" from the draft JSON (usually bfloat16)
+#   float32          — useful for plain DDP/NCCL so Adam gets FP32 moments
+# Non-DeepSpeed paths also use FP32MasterWeightOptimizer so Adam moments match
+# ZeRO's FP32 optimizer state (plain bf16 Adam plateaus).
+# Example: DRAFT_MODEL_DTYPE=float32
 DRAFT_MODEL_DTYPE=${DRAFT_MODEL_DTYPE:-config}
 
+# Tokenization map/filter cache under <train_jsonl_dir>/.map_cache/ (not OUTPUT_DIR).
+# true = reuse those files across restarts; false = remap. Delete .map_cache after
+# changing preprocess code. Default true.
 LOAD_FROM_CACHE_FILE=${LOAD_FROM_CACHE_FILE:-true}
 SAVE_STRATEGY=${SAVE_STRATEGY:-steps}
 SAVE_STEPS=${SAVE_STEPS:-5000}
@@ -139,7 +169,9 @@ ARGS=(
 
 echo "=== SmolVLM Eagle3 train ==="
 echo "  TRAIN_MODE=${TRAIN_MODE}  LAUNCH=${LAUNCH}  NPROC=${NPROC}  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-echo "  deepspeed=${DEEPSPEED_CONFIG:-none}  dtype=${DRAFT_MODEL_DTYPE}"
+echo "  draft_config=${DRAFT_MODEL_CONFIG_PATH}"
+echo "  draft_warmstart=${DRAFT_MODEL_NAME_OR_PATH:-none}  dtype=${DRAFT_MODEL_DTYPE}"
+echo "  deepspeed=${DEEPSPEED_CONFIG:-none}  output=${OUTPUT_DIR}"
 
 case "${LAUNCH}" in
   torchrun)
