@@ -249,7 +249,17 @@ class Eagle3Trainer(Trainer, ABC):
         )
         feedback_applied = 0
         target_shift_applied = 0
-        aux_vs_draft_cos_sum = 0.0
+        # Snapshot target aux tape (h_target per draft layer) before feedback
+        # replaces inject with draft outs. Compare draft h_i vs this tape with
+        # Smooth-L1 on speculative tokens 1..3 (idx 0..2).
+        n_draft_layers = len(getattr(draft, "layers", []) or [])
+        target_aux_tape = None
+        if use_draft_feedback and getattr(draft, "_aux_inject", None) is not None:
+            target_aux_tape = tuple(t.detach() for t in draft._aux_inject)
+        sl1_layer_sum = [0.0] * max(n_draft_layers, 0)
+        sl1_layer_count = [0] * max(n_draft_layers, 0)
+        # How many speculative tokens (1-indexed) to include in the metric.
+        sl1_token_budget = min(3, self.length)
         progressive_target_shift_warmup = (
             log_prefix == "train"
             and getattr(draft, "progressive_staged", False)
@@ -291,6 +301,25 @@ class Eagle3Trainer(Trainer, ABC):
                     use_cache=True,
                 )
 
+            # Step 7.2b: Smooth-L1(draft h_i, target aux_i) on tokens 1..3.
+            if (
+                target_aux_tape is not None
+                and idx < sl1_token_budget
+                and getattr(draft, "_last_layer_outs", None)
+            ):
+                with torch.no_grad():
+                    outs = draft._last_layer_outs
+                    for li, (h_draft, h_tgt) in enumerate(
+                        zip(outs, target_aux_tape)
+                    ):
+                        if h_draft.shape != h_tgt.shape:
+                            continue
+                        sl1_layer_sum[li] += torch.nn.functional.smooth_l1_loss(
+                            h_draft.detach().float(),
+                            h_tgt.float(),
+                        ).item()
+                        sl1_layer_count[li] += 1
+
             # Step 7.3: Compute logits from hidden states
             logits = draft.compute_logits(hidden_states)
 
@@ -321,6 +350,12 @@ class Eagle3Trainer(Trainer, ABC):
                 input_ids = padding(input_ids, left=False)
                 target_logits = padding(target_logits, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                # Keep target aux tape aligned with the shifted sequence so
+                # tokens 2/3 still compare h_i vs the matching target HS.
+                if target_aux_tape is not None and idx + 1 < sl1_token_budget:
+                    target_aux_tape = tuple(
+                        padding(t, left=False) for t in target_aux_tape
+                    )
                 # Progressive warmup can teacher-force with shifted target HS for
                 # all speculative substeps. Outside warmup, progressive/hawk use
                 # same-depth draft outs (h0/h1/h2).
@@ -364,13 +399,6 @@ class Eagle3Trainer(Trainer, ABC):
                         raise RuntimeError(
                             "draft-HS feedback inject[0] is not encode layer-out h0"
                         )
-                    with torch.no_grad():
-                        # <1 means inject left target tape; ≈1 would mean still target-like.
-                        aux_vs_draft_cos_sum += torch.nn.functional.cosine_similarity(
-                            prev_inject0.detach().float().flatten(),
-                            draft._aux_inject[0].detach().float().flatten(),
-                            dim=0,
-                        ).item()
                     hidden_states = seed
                     feedback_applied += 1
                     if not getattr(self, "_logged_draft_hs_feedback", False):
@@ -382,9 +410,11 @@ class Eagle3Trainer(Trainer, ABC):
                         logger.info(
                             "Eagle3 %s: target HS only on first draft token; "
                             "steps 1+ use draft outs only (L0←h0, injects←h0..h%d). "
-                            "train/draft_hs_feedback=1 required.",
+                            "train/draft_hs_feedback=1 required. "
+                            "Logging Smooth-L1(h_i, h_target_i) on tokens 1..%d.",
                             mode,
                             len(draft.layers) - 1,
+                            sl1_token_budget,
                         )
                         self._logged_draft_hs_feedback = True
                 # Stock fused_fc only: keep legacy shift if present (no-op for most).
@@ -425,10 +455,10 @@ class Eagle3Trainer(Trainer, ABC):
             if progressive_target_shift_warmup
             else 0.0
         )
-        if use_draft_feedback and feedback_applied > 0:
-            log[f"{log_prefix}/aux_vs_draft_cos"] = (
-                aux_vs_draft_cos_sum / float(feedback_applied)
-            )
+        # Per-layer Smooth-L1(draft h_i, target aux_i), averaged over tokens 1..3.
+        for li, (s, c) in enumerate(zip(sl1_layer_sum, sl1_layer_count)):
+            if c > 0:
+                log[f"{log_prefix}/aux_vs_draft_sl1_h{li}"] = s / float(c)
         # Route into the appropriate accumulator.
         if log_prefix == "eval":
             for k, v in log.items():

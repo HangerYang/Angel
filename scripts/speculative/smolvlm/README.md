@@ -191,9 +191,20 @@ DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-2
 DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-* \
   DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
   bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+
+# Assistance mode: target verify still runs first and freezes aux HS;
+# draft steps 1+ reuse that tape (no draft-HS feedback).
+ASSISTANCE_MODE=1 DRAFT_MODEL=output/smolvlm_256m_hawk \
+  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+
+# Optional: target-only baseline first, then assisted eagle (two result files)
+RUN_BASELINE_FIRST=1 ASSISTANCE_MODE=1 DRAFT_MODEL=output/smolvlm_256m_hawk \
+  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
 ```
 
-Look for log line `Eagle3 hawk enabled` at draft load (same patch re-apply as progressive).
+Look for log lines `Eagle3 hawk enabled` and `Eagle3 assistance mode` at draft load.
 
 ### Progressive staged injection (experiment)
 

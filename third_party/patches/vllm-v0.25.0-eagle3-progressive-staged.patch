@@ -1,8 +1,16 @@
 diff --git a/vllm/model_executor/models/llama_eagle3.py b/vllm/model_executor/models/llama_eagle3.py
-index 2d859bd..a58478a 100644
+index 2d859bd..d1b6e1b 100644
 --- a/vllm/model_executor/models/llama_eagle3.py
 +++ b/vllm/model_executor/models/llama_eagle3.py
-@@ -45,9 +45,19 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from collections.abc import Iterable
+ 
+ import torch
+@@ -45,9 +46,19 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
          config = config or vllm_config.model_config.hf_config
          quant_config = self.get_quant_config(vllm_config)
  
@@ -25,7 +33,7 @@ index 2d859bd..a58478a 100644
  
          # Parallel drafting checkpoints may have attention bias enabled
          qkv_bias = getattr(config, "attention_bias", False)
-@@ -95,12 +105,36 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+@@ -95,12 +106,36 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
          embeds: torch.Tensor,
          hidden_states: torch.Tensor,
          residual: torch.Tensor | None,
@@ -63,7 +71,7 @@ index 2d859bd..a58478a 100644
          else:
              # Subsequent layers: process hidden_states and residuals only
              hidden_states, residual = self.input_layernorm(hidden_states, residual)
-@@ -152,6 +186,28 @@ class LlamaModel(nn.Module):
+@@ -152,6 +187,43 @@ class LlamaModel(nn.Module):
                  "norm_before_fc", getattr(self.config, "norm_before_fc", False)
              )
          )
@@ -86,13 +94,28 @@ index 2d859bd..a58478a 100644
 +            )
 +        # Per-layer inject buffers set by combine_hidden_states / set_aux_inject.
 +        self._aux_inject: list[torch.Tensor] | None = None
++        # Frozen target aux from the latest target verify (assistance mode).
++        self._target_aux_inject: list[torch.Tensor] | None = None
 +        self._last_layer_outs: list[torch.Tensor] | None = None
 +        self.fuse_w1: ReplicatedLinear | None = None
 +        self.fuse_w2: ReplicatedLinear | None = None
++        # Use target aux for draft steps 1+ instead of draft-HS feedback.
++        # Env: VLLM_EAGLE_ASSISTANCE_MODE=1  or draft config eagle_assistance_mode.
++        self.assistance_mode = bool(
++            getattr(self.config, "eagle_assistance_mode", False)
++        ) or (
++            os.environ.get("VLLM_EAGLE_ASSISTANCE_MODE", "0").strip().lower()
++            in ("1", "true", "yes", "on")
++        )
++        if self.per_layer_aux and self.assistance_mode:
++            logger.info(
++                "Eagle3 assistance mode: draft steps use frozen target aux "
++                "(not draft-HS feedback)"
++            )
  
          current_vllm_config = get_current_vllm_config()
  
-@@ -179,41 +235,74 @@ class LlamaModel(nn.Module):
+@@ -179,41 +251,74 @@ class LlamaModel(nn.Module):
              if self.num_aux_hidden_states is None:
                  eagle_config = getattr(self.config, "eagle_config", None) or {}
                  layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
@@ -194,7 +217,7 @@ index 2d859bd..a58478a 100644
  
          self.norm_output = getattr(self.config, "norm_output", False)
          self.norm = RMSNorm(
-@@ -224,6 +313,10 @@ class LlamaModel(nn.Module):
+@@ -224,6 +329,10 @@ class LlamaModel(nn.Module):
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
  
@@ -205,7 +228,7 @@ index 2d859bd..a58478a 100644
      def forward(
          self,
          input_ids: torch.Tensor,
-@@ -239,13 +332,53 @@ class LlamaModel(nn.Module):
+@@ -239,13 +348,53 @@ class LlamaModel(nn.Module):
          )
  
          residual = None
@@ -266,7 +289,7 @@ index 2d859bd..a58478a 100644
          hidden_states, hidden_prenorm = self.norm(hidden_states, residual)
  
          # norm_output variant uses the post-norm hidden states.
-@@ -362,8 +495,24 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -362,8 +511,27 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
      ) -> torch.Tensor:
          if not self.model.use_aux_hidden_state:
              return hidden_states
@@ -286,13 +309,16 @@ index 2d859bd..a58478a 100644
 +                )
 +            chunks = list(hidden_states.split(h, dim=-1))
 +            self.model.set_aux_inject(chunks)
++            # Freeze target tape for assistance mode (draft steps reuse these
++            # instead of overwriting inject with draft layer outs).
++            self.model._target_aux_inject = [c.detach() for c in chunks]
 +            return chunks[0]
 +
 +        # combine multiple auxiliary hidden states returned by eagle3
          if self.model.norm_before_fc:
              hidden_states = self.model.input_norm(hidden_states)
  
-@@ -378,6 +527,35 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -378,6 +546,65 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
  
          return self.model.fc(hidden_states)
  
@@ -325,10 +351,40 @@ index 2d859bd..a58478a 100644
 +        self.model.set_aux_inject(gathered)
 +        return gathered[0]
 +
++    def take_progressive_target_assistance(
++        self,
++        token_indices: torch.Tensor | None = None,
++        num_tokens: int | None = None,
++    ) -> torch.Tensor | None:
++        """Assistance mode: next-step injects from frozen *target* aux, not draft.
++
++        Target verify already saved ``_target_aux_inject`` in
++        ``combine_hidden_states``. Gather last-token rows for decode and keep
++        that tape for subsequent draft steps.
++        """
++        src = getattr(self.model, "_target_aux_inject", None)
++        if not src:
++            return None
++        gathered: list[torch.Tensor] = []
++        for h in src:
++            if token_indices is not None:
++                gathered.append(h[token_indices])
++            elif num_tokens is not None and h.shape[0] > num_tokens:
++                gathered.append(h[:num_tokens])
++            else:
++                gathered.append(h)
++        self.model.set_aux_inject(gathered)
++        # Decode steps keep the gathered target rows (no draft overwrite).
++        self.model._target_aux_inject = gathered
++        return gathered[0]
++
++    def is_assistance_mode(self) -> bool:
++        return bool(getattr(self.model, "assistance_mode", False))
++
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
          model_weights = {}
          includes_draft_id_mapping = False
-@@ -420,8 +598,12 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -420,8 +647,12 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
              skip_substrs.append("draft_id_to_target_id")
          if not includes_embed_tokens:
              skip_substrs.append("embed_tokens")
@@ -343,7 +399,7 @@ index 2d859bd..a58478a 100644
              skip_substrs.append("input_norm.")
          loader = AutoWeightsLoader(
 diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-index 747fb3a..98b91a1 100644
+index 747fb3a..ff360ed 100644
 --- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 @@ -174,6 +174,21 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
@@ -368,24 +424,30 @@ index 747fb3a..98b91a1 100644
          self._copy_request_inputs(
              num_reqs,
              input_batch.idx_mapping,
-@@ -368,6 +383,16 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -368,6 +383,22 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
          self.input_buffers.positions[:num_reqs] = positions
  
-+        # Progressive / hawk decode feedback:
-+        #   next L0 seed ← h0, L1 inject ← h1, L2 inject ← h2 (same-depth draft).
++        # Progressive / hawk decode feedback (or assistance = keep target aux).
++        #   default: next L0 seed ← h0, injects ← h0/h1/h2 (draft outs)
++        #   assistance: next seed/injects ← frozen target aux (from verify)
 +        draft_inner = getattr(self.model, "model", None)
 +        if draft_inner is not None and getattr(draft_inner, "per_layer_aux", False):
-+            seed = self.model.take_progressive_draft_feedback(
-+                token_indices=last_token_indices
-+            )
++            if getattr(self.model, "is_assistance_mode", lambda: False)():
++                seed = self.model.take_progressive_target_assistance(
++                    token_indices=last_token_indices
++                )
++            else:
++                seed = self.model.take_progressive_draft_feedback(
++                    token_indices=last_token_indices
++                )
 +            if seed is not None:
 +                self.hidden_states[:num_reqs] = seed
 +
      def _multi_step_decode(
          self,
          num_reqs: int,
-@@ -382,6 +407,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -382,6 +413,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
          attn_metadata = None
          slot_mappings_by_layer = None
          for step in range(1, self.num_speculative_steps):
@@ -405,13 +467,18 @@ index 747fb3a..98b91a1 100644
              # Rebuild every step when positions advance, or just once
              # on the first step when positions are constant (Gemma4 MTP).
              if not skip_attn and (self.advance_draft_positions or step == 1):
-@@ -465,6 +503,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -465,6 +509,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              advance_draft_positions=self.advance_draft_positions,
          )
  
-+        # Progressive / hawk: refresh L0/L1/L2 from per-layer draft outs (h0/h1/h2).
++        # Progressive / hawk: refresh injects for next draft step.
 +        if getattr(getattr(self.model, "model", None), "per_layer_aux", False):
-+            seed = self.model.take_progressive_draft_feedback(num_tokens=num_reqs)
++            if getattr(self.model, "is_assistance_mode", lambda: False)():
++                seed = self.model.take_progressive_target_assistance(
++                    num_tokens=num_reqs
++                )
++            else:
++                seed = self.model.take_progressive_draft_feedback(num_tokens=num_reqs)
 +            if seed is not None:
 +                self.hidden_states[:num_reqs] = seed
 +
