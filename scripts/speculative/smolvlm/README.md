@@ -393,7 +393,13 @@ Works for `fused_fc`, `progressive_staged`, and `hawk`. Requires `TEMP=0` and
 **Phases (automatic):** A) target-only GT tokens → B) capture aux tape →
 C) timed eagle with `tape[pos]` inject. Metrics are from **C only**.
 
-After `git pull`, re-apply the progressive patch (includes `eagle_miracle.py`):
+| Phase | What | Timed? |
+|---|---|---|
+| A | Target-only generate → `gt_tokens.json` | no |
+| B | Eagle **capture**: force draft onto GT path; record verify aux at absolute positions → `{i:05d}.pt` | no |
+| C | Eagle **use**: inject `tape[pos]` each draft step | **yes** |
+
+**After `git pull`**, reset then re-apply the progressive patch (ships `eagle_miracle.py`):
 
 ```bash
 cd third_party/vllm
@@ -405,6 +411,22 @@ cd ../..
 bash third_party/apply_vllm_patches.sh
 source third_party/env.sh
 ```
+
+**Smoke test** (local jsonl, 2 prompts, short decode):
+
+```bash
+MIRACLE_MODE=1 TEMP=0 CUDA_VISIBLE_DEVICES=0 NUM_PROMPTS=2 OUTPUT_LEN=32 \
+  DATASET=dataset/smolvlm_256m_target_gen/data_0-36.jsonl \
+  DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
+  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+  OUTPUT_FILE=results/miracle_smoke_test.jsonl \
+  MIRACLE_HS_DIR=results/miracle_smoke_hs \
+  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+```
+
+Expect: `captured 2/2 tapes`, phase C finishes (no rotary crash), and
+`results/miracle_smoke_hs/{00000,00001}.pt` are dense along the GT length.
+Optional debug: `VLLM_EAGLE_MIRACLE_DEBUG=1` logs each capture write.
 
 **Hawk example:**
 
@@ -429,6 +451,18 @@ MIRACLE_MODE=1 TEMP=0 \
 Expect logs: `MIRACLE_MODE=1`, `eagle_miracle_mode: True`,
 `Eagle3 miracle mode (capture|use)`. Optional: `MIRACLE_HS_DIR=...` to keep
 tapes. (`ASSISTANCE_MODE` is a deprecated alias for `MIRACLE_MODE`.)
+
+**Notes / expectations**
+
+- Capture records against **target** positions (`input_batch.positions`), not
+  draft buffers. Offline req ids are `{prompt_index}-{hex}`; warmup ids are
+  ignored so USE init does not skip hawk draft-HS refresh.
+- Output defaults to `{DRAFT_MODEL}/eval/{data}_miracle/results.jsonl`.
+- **Hawk / progressive:** train uses target aux on draft step 0 and **draft
+  feedback** on steps 1+. Miracle still injects GT target tape on 1+ as an
+  oracle upper bound; that is OOD vs hawk training, so mean acceptance may be
+  close to (or slightly below) non-miracle hawk. Prefer **fused Eagle3** when
+  you want a clear target-shift upper bound.
 
 Before calling vLLM, the eval script runs:
 
