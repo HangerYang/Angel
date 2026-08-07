@@ -58,6 +58,84 @@ class Eagle3Trainer(Trainer, ABC):
         self._eval_pending_log: dict = {}
         self._eval_pending_log_count: int = 0
         self._logged_draft_hs_feedback = False
+        # Set by create_optimizer() for non-DeepSpeed bf16 DDP (ZeRO-equivalent).
+        self._fp32_optimizer = None
+
+    def create_optimizer(self, model=None):
+        """Use FP32 master Adam under plain DDP to match DeepSpeed ZeRO moments.
+
+        DeepSpeed ZeRO keeps Adam state in FP32 even when params are bf16.
+        HF AdamW + bf16 DDP keeps moments in bf16 and plateaus. Mirror ZeRO
+        with FP32MasterWeightOptimizer when DeepSpeed is off.
+        """
+        if self.is_deepspeed_enabled:
+            return super().create_optimizer()
+
+        from torch.optim import AdamW
+
+        from .fp32_master_optimizer import FP32MasterWeightOptimizer, FP32StateAdamW
+
+        if self.is_fsdp_enabled:
+            args = self.args
+            param_groups = [{"params": [p for p in self.model.parameters() if p.requires_grad]}]
+            optimizer = FP32StateAdamW(
+                param_groups,
+                lr=args.learning_rate,
+                betas=(
+                    getattr(args, "adam_beta1", 0.9),
+                    getattr(args, "adam_beta2", 0.999),
+                ),
+                eps=getattr(args, "adam_epsilon", 1e-8),
+                weight_decay=args.weight_decay,
+                max_grad_norm=args.max_grad_norm,
+            )
+            self.optimizer = optimizer
+            logger.info(
+                "Eagle3: using FP32StateAdamW (FSDP) so Adam moments match ZeRO FP32."
+            )
+            return self.optimizer
+
+        bf16_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not bf16_params:
+            return super().create_optimizer()
+
+        args = self.args
+        inner_optimizer = AdamW(
+            bf16_params,
+            lr=args.learning_rate,
+            betas=(
+                getattr(args, "adam_beta1", 0.9),
+                getattr(args, "adam_beta2", 0.999),
+            ),
+            eps=getattr(args, "adam_epsilon", 1e-8),
+            weight_decay=args.weight_decay,
+        )
+        fp32_opt = FP32MasterWeightOptimizer(
+            bf16_params=bf16_params,
+            inner_optimizer=inner_optimizer,
+            max_grad_norm=args.max_grad_norm,
+        )
+        self._fp32_optimizer = fp32_opt
+        self.optimizer = fp32_opt
+        logger.info(
+            "Eagle3: using FP32MasterWeightOptimizer (DDP) so Adam moments match "
+            "DeepSpeed ZeRO FP32 optimizer state."
+        )
+        return self.optimizer
+
+    def _clip_grad_norm(self, *args, **kwargs):
+        """Skip HF bf16 grad clip when FP32-master optimizers clip internally."""
+        if self._fp32_optimizer is not None:
+            return torch.tensor(0.0)
+
+        from .fp32_master_optimizer import FP32StateAdamW
+
+        optimizer = self.optimizer
+        if hasattr(optimizer, "optimizer"):
+            optimizer = optimizer.optimizer
+        if isinstance(optimizer, FP32StateAdamW):
+            return torch.tensor(0.0)
+        return super()._clip_grad_norm(*args, **kwargs)
 
     def train(self, *args, **kwargs):
         """Override train method to record training start time for estimating remaining time."""

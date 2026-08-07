@@ -1,53 +1,21 @@
 #!/bin/bash
 # Online Eagle3 training for SmolVLM / Idefics3.
 #
-# Default recipe (this machine): DeepSpeed ZeRO-3, 4 GPU, 2 epochs, save every 5k steps
-#   per_device_bs=1, grad_accum=1, NPROC=4 → effective batch = 4
-#   MAX_STEPS=-1 so epochs are not overridden.
-#
+# Default: DeepSpeed ZeRO-3, 4 GPU, 2 epochs, save every 5k steps
 #   bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
 #
-# ---------------------------------------------------------------------------
-# A) torchrun + NCCL, 4 GPU  (no DeepSpeed)
-# ---------------------------------------------------------------------------
-#   TRAIN_MODE=nccl bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+# TRAIN_MODE=nccl|deepspeed|gloo|python  (default: deepspeed)
+#   TRAIN_MODE=nccl      bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+#   TRAIN_MODE=gloo      bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+#   TRAIN_MODE=python    bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
 #
-# ---------------------------------------------------------------------------
-# A2) torchrun + NCCL + DeepSpeed ZeRO-3, 4 GPU  (default)
-# ---------------------------------------------------------------------------
-#   TRAIN_MODE=deepspeed bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
-#
-# ---------------------------------------------------------------------------
-# B) torchrun + Gloo, 4 GPU  (use when NCCL is broken; same DDP math)
-# ---------------------------------------------------------------------------
-#   TRAIN_MODE=gloo bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
-#
-# ---------------------------------------------------------------------------
-# C) plain python, 1 GPU  (no process group; grad_accum=4 via EQUIV_NPROC)
-# ---------------------------------------------------------------------------
-#   TRAIN_MODE=python bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
-#
-# Related — vLLM data gen on 1 GPU (not this script; throughput only):
-#   GPU_NUM=1 CUDA_VISIBLE_DEVICES=0 bash scripts/speculative/smolvlm/run_vllm_server.sh
-#   MAX_CLIENTS=1 NUM_THREADS=8 bash scripts/speculative/smolvlm/generate_data_for_target_model.sh
-#
-# Other overrides:
-#   TRAIN_DATA_PATH=... EVAL_DATA_PATH=... OUTPUT_DIR=... DRAFT_MODEL_CONFIG_PATH=...
-#   DRAFT_MODEL_NAME_OR_PATH=...   # warm-start from a trained draft into a new run
-#   PROGRESSIVE_TARGET_HS_WARMUP_STEPS=100  # teacher-force progressive aux first
-#   MAX_STEPS=10000  # if set (>0 / not -1), overrides epochs
-#
-# Hawk (progressive H-fusion):
-#   DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
-#     OUTPUT_DIR=output/smolvlm_256m_hawk \
-#     bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+# Overrides: TRAIN_DATA_PATH, EVAL_DATA_PATH, OUTPUT_DIR, DRAFT_MODEL_CONFIG_PATH,
+#   DRAFT_MODEL_NAME_OR_PATH, MAX_STEPS, PROGRESSIVE_TARGET_HS_WARMUP_STEPS, ...
 
 set -euo pipefail
 
-# Optional preset: TRAIN_MODE=nccl|deepspeed|gloo|python (default: deepspeed ZeRO-3 / 4 GPU)
 TRAIN_MODE=${TRAIN_MODE:-deepspeed}
 case "${TRAIN_MODE}" in
-  "" ) ;;
   nccl)
     LAUNCH=${LAUNCH:-torchrun}
     DIST_BACKEND=${DIST_BACKEND:-nccl}
@@ -83,10 +51,6 @@ esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT"
 
-ANGEL_ENV_BIN=${ANGEL_ENV_BIN:-/home/hyang/miniconda3/envs/angel/bin}
-PYTHON_BIN=${PYTHON_BIN:-${ANGEL_ENV_BIN}/python}
-TORCHRUN_BIN=${TORCHRUN_BIN:-${ANGEL_ENV_BIN}/torchrun}
-
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 if [[ -f "${ROOT}/third_party/env.sh" ]]; then
   # shellcheck disable=SC1091
@@ -104,142 +68,51 @@ EMBED_WEIGHT_KEY=${EMBED_WEIGHT_KEY:-model.text_model.embed_tokens.weight}
 MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-4096}
 CHAT_TEMPLATE_TYPE=${CHAT_TEMPLATE_TYPE:-smolvlm}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-2}
-# If > 0 and not -1, overrides epochs (HF optimizer steps). Default -1 → use epochs.
 MAX_STEPS=${MAX_STEPS:--1}
 PROGRESSIVE_TARGET_HS_WARMUP_STEPS=${PROGRESSIVE_TARGET_HS_WARMUP_STEPS:-0}
 SAMPLE_NUM=${SAMPLE_NUM:-}
 DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-}
-# For plain NCCL/DDP, float32 draft params give torch AdamW fp32 moments,
-# matching the important ZeRO-3 optimizer-state behavior more closely.
-if [[ -z "${DRAFT_MODEL_DTYPE:-}" ]]; then
-  if [[ "${TRAIN_MODE}" == "deepspeed" ]]; then
-    DRAFT_MODEL_DTYPE=config
-  else
-    DRAFT_MODEL_DTYPE=float32
-  fi
-fi
-# Reuse HF datasets preprocess cache across restarts (true/false).
+
+# Draft dtype identical across launchers (config JSON, usually bf16).
+# Non-DeepSpeed paths use FP32MasterWeightOptimizer in Eagle3Trainer so Adam
+# moments match ZeRO's FP32 optimizer state (plain bf16 Adam plateaus).
+DRAFT_MODEL_DTYPE=${DRAFT_MODEL_DTYPE:-config}
+
 LOAD_FROM_CACHE_FILE=${LOAD_FROM_CACHE_FILE:-true}
-# Save draft for vLLM eval. Default: every 5k optimizer steps.
-# Set SAVE_STRATEGY=no only for throwaway smoke runs.
 SAVE_STRATEGY=${SAVE_STRATEGY:-steps}
 SAVE_STEPS=${SAVE_STEPS:-5000}
 
-# --- Launch / distributed knobs ---
-# LAUNCH=torchrun|python  (python = single process, no process group / no NCCL)
 LAUNCH=${LAUNCH:-torchrun}
-# DIST_BACKEND=nccl|gloo  (only used with LAUNCH=torchrun)
 DIST_BACKEND=${DIST_BACKEND:-nccl}
 NPROC=${NPROC:-4}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
-# If EQUIV_NPROC is set and GRADIENT_ACCUMULATION_STEPS is unset, match a W-way
-# DDP effective batch: effective_batch = per_device_bs * NPROC * grad_accum
-# For LAUNCH=python (1 process): grad_accum defaults to EQUIV_NPROC.
 EQUIV_NPROC=${EQUIV_NPROC:-}
 if [[ -z "${GRADIENT_ACCUMULATION_STEPS+x}" ]]; then
-  if [[ -n "${EQUIV_NPROC}" ]]; then
-    if [[ "${LAUNCH}" == "python" || "${NPROC}" == "1" ]]; then
-      GRADIENT_ACCUMULATION_STEPS="${EQUIV_NPROC}"
-    else
-      # Multi-GPU DDP already multiplies by NPROC; keep accum=1 unless overridden.
-      GRADIENT_ACCUMULATION_STEPS=1
-    fi
+  if [[ -n "${EQUIV_NPROC}" ]] && [[ "${LAUNCH}" == "python" || "${NPROC}" == "1" ]]; then
+    GRADIENT_ACCUMULATION_STEPS="${EQUIV_NPROC}"
   else
     GRADIENT_ACCUMULATION_STEPS=1
   fi
 fi
-# HF datasets map workers. Broken mp servers: NUM_PROC=1 (or 0).
 NUM_PROC=${NUM_PROC:-4}
 
 export CUDA_VISIBLE_DEVICES
 
-EVAL_ARGS=()
-if [[ -n "${EVAL_DATA_PATH}" ]]; then
-  EVAL_ARGS+=(--eval_data_path "${EVAL_DATA_PATH}")
-fi
-
-DRAFT_WARM_START_ARGS=()
-if [[ -n "${DRAFT_MODEL_NAME_OR_PATH}" ]]; then
-  DRAFT_WARM_START_ARGS+=(--draft_model_name_or_path "${DRAFT_MODEL_NAME_OR_PATH}")
-fi
-
-SAMPLE_ARGS=()
-if [[ -n "${SAMPLE_NUM}" ]]; then
-  SAMPLE_ARGS+=(--sample_num "${SAMPLE_NUM}")
-fi
-
-DS_ARGS=()
-if [[ -n "${DEEPSPEED_CONFIG}" ]]; then
-  DS_ARGS+=(--deepspeed "${DEEPSPEED_CONFIG}")
-fi
-
-SAVE_ARGS=(--save_strategy "${SAVE_STRATEGY}")
-if [[ -n "${SAVE_STEPS}" ]]; then
-  SAVE_ARGS+=(--save_steps "${SAVE_STEPS}")
-fi
-
-MAX_STEPS_ARGS=()
-if [[ -n "${MAX_STEPS}" && "${MAX_STEPS}" != "-1" ]]; then
-  MAX_STEPS_ARGS+=(--max_steps "${MAX_STEPS}")
-fi
-
-PROGRESSIVE_TARGET_HS_WARMUP_ARGS=()
-if [[ "${PROGRESSIVE_TARGET_HS_WARMUP_STEPS}" != "0" ]]; then
-  PROGRESSIVE_TARGET_HS_WARMUP_ARGS+=(
-    --progressive_target_hs_warmup_steps "${PROGRESSIVE_TARGET_HS_WARMUP_STEPS}"
-  )
-fi
-
-DRAFT_MODEL_DTYPE_ARGS=()
-if [[ "${DRAFT_MODEL_DTYPE}" != "config" ]]; then
-  DRAFT_MODEL_DTYPE_ARGS+=(--draft_model_dtype "${DRAFT_MODEL_DTYPE}")
-fi
-
-DDP_ARGS=()
-if [[ "${LAUNCH}" == "torchrun" ]]; then
-  DDP_ARGS+=(--ddp_backend "${DIST_BACKEND}")
-fi
-
-TRAIN_CMD=(
+ARGS=(
   tools/train_eagle3_online.py
   --modal_type VLM
   --target_model_name_or_path "${TARGET_MODEL_NAME_OR_PATH}"
   --draft_model_config_path "${DRAFT_MODEL_CONFIG_PATH}"
-)
-if (( ${#DRAFT_MODEL_DTYPE_ARGS[@]} )); then
-  TRAIN_CMD+=("${DRAFT_MODEL_DTYPE_ARGS[@]}")
-fi
-if (( ${#DRAFT_WARM_START_ARGS[@]} )); then
-  TRAIN_CMD+=("${DRAFT_WARM_START_ARGS[@]}")
-fi
-TRAIN_CMD+=(
   --train_data_path "${TRAIN_DATA_PATH}"
-)
-if (( ${#EVAL_ARGS[@]} )); then
-  TRAIN_CMD+=("${EVAL_ARGS[@]}")
-fi
-TRAIN_CMD+=(
   --output_dir "${OUTPUT_DIR}"
   --num_train_epochs "${NUM_TRAIN_EPOCHS}"
-)
-if (( ${#MAX_STEPS_ARGS[@]} )); then
-  TRAIN_CMD+=("${MAX_STEPS_ARGS[@]}")
-fi
-if (( ${#PROGRESSIVE_TARGET_HS_WARMUP_ARGS[@]} )); then
-  TRAIN_CMD+=("${PROGRESSIVE_TARGET_HS_WARMUP_ARGS[@]}")
-fi
-TRAIN_CMD+=(
   --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
   --per_device_eval_batch_size 1
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
   --num_proc "${NUM_PROC}"
   --load_from_cache_file "${LOAD_FROM_CACHE_FILE}"
-)
-if (( ${#SAVE_ARGS[@]} )); then
-  TRAIN_CMD+=("${SAVE_ARGS[@]}")
-fi
-TRAIN_CMD+=(
+  --save_strategy "${SAVE_STRATEGY}"
   --learning_rate 1e-4
   --weight_decay 0.0
   --warmup_ratio 0.05
@@ -252,48 +125,31 @@ TRAIN_CMD+=(
   --report_to none
   --run_name smolvlm-256m-eagle3-angelslim
 )
-if (( ${#DDP_ARGS[@]} )); then
-  TRAIN_CMD+=("${DDP_ARGS[@]}")
-fi
-if (( ${#SAMPLE_ARGS[@]} )); then
-  TRAIN_CMD+=("${SAMPLE_ARGS[@]}")
-fi
-if (( ${#DS_ARGS[@]} )); then
-  TRAIN_CMD+=("${DS_ARGS[@]}")
-fi
 
-EFFECTIVE_BATCH=$((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
-if [[ "${LAUNCH}" == "torchrun" ]]; then
-  EFFECTIVE_BATCH=$((EFFECTIVE_BATCH * NPROC))
-fi
+[[ -n "${EVAL_DATA_PATH}" ]] && ARGS+=(--eval_data_path "${EVAL_DATA_PATH}")
+[[ -n "${DRAFT_MODEL_NAME_OR_PATH}" ]] && ARGS+=(--draft_model_name_or_path "${DRAFT_MODEL_NAME_OR_PATH}")
+[[ -n "${SAMPLE_NUM}" ]] && ARGS+=(--sample_num "${SAMPLE_NUM}")
+[[ -n "${DEEPSPEED_CONFIG}" ]] && ARGS+=(--deepspeed "${DEEPSPEED_CONFIG}")
+[[ -n "${SAVE_STEPS}" ]] && ARGS+=(--save_steps "${SAVE_STEPS}")
+[[ -n "${MAX_STEPS}" && "${MAX_STEPS}" != "-1" ]] && ARGS+=(--max_steps "${MAX_STEPS}")
+[[ "${PROGRESSIVE_TARGET_HS_WARMUP_STEPS}" != "0" ]] && \
+  ARGS+=(--progressive_target_hs_warmup_steps "${PROGRESSIVE_TARGET_HS_WARMUP_STEPS}")
+[[ "${DRAFT_MODEL_DTYPE}" != "config" ]] && ARGS+=(--draft_model_dtype "${DRAFT_MODEL_DTYPE}")
+[[ "${LAUNCH}" == "torchrun" ]] && ARGS+=(--ddp_backend "${DIST_BACKEND}")
 
-echo "=== SmolVLM Eagle3 train launch ==="
-echo "  LAUNCH=${LAUNCH}  DIST_BACKEND=${DIST_BACKEND}  NPROC=${NPROC}"
-echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-echo "  angel_env_bin=${ANGEL_ENV_BIN}"
-echo "  per_device_bs=${PER_DEVICE_TRAIN_BATCH_SIZE}  grad_accum=${GRADIENT_ACCUMULATION_STEPS}"
-echo "  effective_batch≈${EFFECTIVE_BATCH}  (EQUIV_NPROC=${EQUIV_NPROC:-unset})"
-echo "  epochs=${NUM_TRAIN_EPOCHS}  max_steps=${MAX_STEPS:-unset}"
-echo "  DRAFT_MODEL_DTYPE=${DRAFT_MODEL_DTYPE}"
-echo "  progressive_target_hs_warmup_steps=${PROGRESSIVE_TARGET_HS_WARMUP_STEPS}"
-echo "  deepspeed_config=${DEEPSPEED_CONFIG:-none}"
-echo "  NUM_PROC(datasets map)=${NUM_PROC}"
+echo "=== SmolVLM Eagle3 train ==="
+echo "  TRAIN_MODE=${TRAIN_MODE}  LAUNCH=${LAUNCH}  NPROC=${NPROC}  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "  deepspeed=${DEEPSPEED_CONFIG:-none}  dtype=${DRAFT_MODEL_DTYPE}"
 
 case "${LAUNCH}" in
   torchrun)
-    echo "Running: ${TORCHRUN_BIN} --nproc_per_node=${NPROC} ${TRAIN_CMD[*]}"
-    "${TORCHRUN_BIN}" --nproc_per_node="${NPROC}" "${TRAIN_CMD[@]}"
+    torchrun --nproc_per_node="${NPROC}" "${ARGS[@]}"
     ;;
   python)
-    if [[ "${NPROC}" != "1" ]]; then
-      echo "WARNING: LAUNCH=python ignores NPROC=${NPROC} (single process)." >&2
-    fi
-    # Clear leftover torchrun env so HF does not think we are distributed.
     unset RANK LOCAL_RANK WORLD_SIZE GROUP_RANK LOCAL_WORLD_SIZE MASTER_ADDR MASTER_PORT \
       TORCHELASTIC_RUN_ID TORCHELASTIC_RESTART_COUNT TORCHELASTIC_MAX_RESTARTS \
       TORCHELASTIC_USE_AGENT_STORE 2>/dev/null || true
-    echo "Running: ${PYTHON_BIN} ${TRAIN_CMD[*]}"
-    "${PYTHON_BIN}" "${TRAIN_CMD[@]}"
+    python "${ARGS[@]}"
     ;;
   *)
     echo "ERROR: LAUNCH must be torchrun or python, got: ${LAUNCH}" >&2
