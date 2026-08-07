@@ -63,6 +63,16 @@ def parse_args():
         help="Path to draft model config",
     )
     model_group.add_argument(
+        "--draft_model_name_or_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional trained draft checkpoint/model directory to warm-start from. "
+            "This initializes draft weights for a new run; existing checkpoint-* "
+            "under output_dir still uses HF resume_from_checkpoint."
+        ),
+    )
+    model_group.add_argument(
         "--target_backend",
         type=str,
         default="hf",
@@ -74,7 +84,18 @@ def parse_args():
         type=str,
         default="bfloat16",
         choices=["float16", "bfloat16", "float32"],
-        help="Data type for model weights: float16, bfloat16, float32",
+        help="Data type for target/warm-start model loading: float16, bfloat16, float32",
+    )
+    model_group.add_argument(
+        "--draft_model_dtype",
+        type=str,
+        default="config",
+        choices=["config", "float16", "bfloat16", "float32"],
+        help=(
+            "Override draft parameter dtype before Trainer/optimizer creation. "
+            "Use float32 for plain DDP/NCCL if you want FP32 Adam moments; "
+            "config keeps the dtype from the draft config JSON."
+        ),
     )
     model_group.add_argument(
         "--trust_remote_code",
@@ -194,6 +215,25 @@ def parse_args():
         help="Total number of training epochs to perform",
     )
     training_group.add_argument(
+        "--max_steps",
+        type=int,
+        default=-1,
+        help=(
+            "If > 0, override num_train_epochs and train for this many "
+            "optimizer steps (HF TrainingArguments.max_steps)"
+        ),
+    )
+    training_group.add_argument(
+        "--progressive_target_hs_warmup_steps",
+        type=int,
+        default=0,
+        help=(
+            "For progressive_staged training only, use shifted target auxiliary "
+            "hidden states for this many optimizer steps before switching to "
+            "draft hidden-state feedback. Default: 0."
+        ),
+    )
+    training_group.add_argument(
         "--learning_rate", type=float, default=5e-5, help="Initial learning rate"
     )
     training_group.add_argument(
@@ -277,6 +317,7 @@ def parse_args():
 
 def train():
     args = parse_args()
+    resume_checkpoints = list(Path(args.output_dir).glob("checkpoint-*"))
 
     # Parse torch dtype
     dtype_mapping = {
@@ -288,6 +329,10 @@ def train():
 
     rank0_print("Loading draft model config...")
     draft_model_config = DraftModelConfig.from_file(args.draft_model_config_path)
+    if args.draft_model_dtype != "config":
+        draft_model_config.torch_dtype = args.draft_model_dtype
+        draft_model_config.dtype = args.draft_model_dtype
+        rank0_print(f"Using draft_model_dtype override: {args.draft_model_dtype}")
     target_model_type = getattr(draft_model_config, "target_model_type", None)
 
     # Create target model with specified backend using factory function
@@ -318,6 +363,43 @@ def train():
                 draft_model_config, "target_layer_weight_prefix", None
             ),
         )
+    if args.draft_model_name_or_path:
+        if resume_checkpoints:
+            rank0_print(
+                "Skipping draft warm-start because output_dir already has "
+                "checkpoint-*; HF resume_from_checkpoint will restore model/optimizer."
+            )
+        else:
+            rank0_print(
+                f"Warm-starting draft model from {args.draft_model_name_or_path}..."
+            )
+            warm_model = draft_model.__class__.from_pretrained(
+                args.draft_model_name_or_path,
+                config=draft_model_config,
+                torch_dtype=torch_dtype,
+                trust_remote_code=args.trust_remote_code,
+            )
+            missing, unexpected = draft_model.load_state_dict(
+                warm_model.state_dict(), strict=False
+            )
+            del warm_model
+            rank0_print(
+                "Draft warm-start loaded "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})"
+            )
+            if missing:
+                rank0_print(f"  missing keys: {missing[:20]}")
+            if unexpected:
+                rank0_print(f"  unexpected keys: {unexpected[:20]}")
+            draft_model.freeze_embed_weights()
+    trainable_dtype_counts = {}
+    for p in draft_model.parameters():
+        if p.requires_grad:
+            dtype_key = str(p.dtype)
+            trainable_dtype_counts[dtype_key] = (
+                trainable_dtype_counts.get(dtype_key, 0) + p.numel()
+            )
+    rank0_print(f"Draft trainable parameter dtype counts: {trainable_dtype_counts}")
     # Fusion aux layers (train) vs vLLM indices (often train_id + 1).
     aux_ids = getattr(draft_model_config, "aux_hidden_states_layer_ids", None)
     eagle_aux_ids = getattr(draft_model_config, "eagle_aux_hidden_state_layer_ids", None)
@@ -381,6 +463,7 @@ def train():
     basic_args = {
         "output_dir": args.output_dir,
         "num_train_epochs": args.num_train_epochs,
+        "max_steps": args.max_steps,
     }
 
     batch_args = {
@@ -449,10 +532,11 @@ def train():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        progressive_target_hs_warmup_steps=args.progressive_target_hs_warmup_steps,
     )
 
     # Start training
-    if list(Path(training_args.output_dir).glob("checkpoint-*")):
+    if resume_checkpoints:
         rank0_print("Resuming training from checkpoint...")
         trainer.train(resume_from_checkpoint=True)
     else:

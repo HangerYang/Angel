@@ -653,16 +653,20 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             return chunks[0]
         return self.fc(hidden_states)
 
-    def shift_aux_inject(self, left: bool = False):
-        """Pad/shift stored per-layer aux injects (legacy teacher-forcing path).
+    def shift_aux_inject(
+        self, left: bool = False, allow_progressive_target_shift: bool = False
+    ):
+        """Pad/shift stored per-layer aux injects.
 
-        Forbidden for ``progressive_staged`` / ``hawk``: after the first draft
-        token those modes must reuse draft layer outs, never shifted target HS.
+        Stock keeps the legacy no-op-ish path. Progressive may use this only
+        during explicit target-HS warmup; hawk never has target-shift semantics.
         """
-        if self.progressive_staged or self.hawk:
+        if self.hawk or (
+            self.progressive_staged and not allow_progressive_target_shift
+        ):
             raise RuntimeError(
-                "shift_aux_inject is forbidden for progressive_staged/hawk; "
-                "use take_progressive_draft_feedback (draft outs only after step 0)"
+                "shift_aux_inject is forbidden for progressive_staged/hawk unless "
+                "explicit progressive target-HS warmup is enabled"
             )
         if self._aux_inject is None:
             return

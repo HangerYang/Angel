@@ -237,7 +237,33 @@ def data_generation_work_flow(args):
     try:
         path = args.data_name_or_path
         if os.path.isfile(path) and path.endswith((".jsonl", ".json")):
-            dataset = load_dataset("json", data_files=path, split="train")
+            # Mixed text+VL openai_vl jsonl: text parts are {type,text}, image
+            # parts are {type,image}. HF schema inference locks on the first
+            # chunk (often text-only) and then fails when image keys appear.
+            load_kwargs = {}
+            if getattr(args, "data_format", None) == "openai_vl":
+                from datasets import Features, Value
+
+                load_kwargs["features"] = Features(
+                    {
+                        "id": Value("string"),
+                        "conversations": [
+                            {
+                                "role": Value("string"),
+                                "content": [
+                                    {
+                                        "type": Value("string"),
+                                        "text": Value("string"),
+                                        "image": Value("string"),
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+            dataset = load_dataset(
+                "json", data_files=path, split="train", **load_kwargs
+            )
         else:
             dataset = load_dataset(path, split="all")
     except Exception as e:
@@ -253,7 +279,13 @@ def data_generation_work_flow(args):
         convert_func = convert_openai_vl_data
     else:
         raise ValueError(f"Invalid data format: {args.data_format}")
-    dataset = dataset.map(convert_func, desc="Converting data format..")
+
+    # openai_vl convert rewrites image file paths -> image_url data-URLs.
+    # Do NOT dataset.map() that: (1) output schema != input Features and Arrow
+    # cast fails; (2) base64-ing all images into the Arrow table OOMs on large VL.
+    # Convert lazily per row below for openai_vl; map is fine for text formats.
+    if args.data_format != "openai_vl":
+        dataset = dataset.map(convert_func, desc="Converting data format..")
 
     # Initialize client pool
     try:
@@ -284,15 +316,20 @@ def data_generation_work_flow(args):
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_threads) as executor:
             futures = []
 
+            def _job(row_dict, job_idx):
+                if args.data_format == "openai_vl":
+                    row_dict = convert_func(row_dict)
+                return generator.generate_conversation(
+                    row_dict["conversations"],
+                    row_dict["id"],
+                    job_idx,
+                )
+
             for idx, row in enumerate(
                 current_dataset.select(range(start_idx, len(current_dataset)))
             ):
-                future = executor.submit(
-                    generator.generate_conversation,
-                    row["conversations"],
-                    row["id"],
-                    idx,
-                )
+                # Materialize HF row to a plain dict before queueing.
+                future = executor.submit(_job, dict(row), idx)
                 futures.append(future)
 
             # Process results with progress bar

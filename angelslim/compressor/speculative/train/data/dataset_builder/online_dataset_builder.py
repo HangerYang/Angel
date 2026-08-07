@@ -743,8 +743,29 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
         load_from_cache_file: bool = False,
     ) -> Dataset:
         try:
-            # Do not pin Features: generated openai_vl data uses image_url.
-            ds = load_dataset("json", data_files=datapath)
+            # Mixed text / VL target-gen jsonl: text parts are {type,text},
+            # image parts are {type,image_url:{url}} (and/or {type,image}).
+            # Leaving Features unset lets HF lock on the first chunk (text-only)
+            # and then fail when image_url appears.
+            features = Features(
+                {
+                    "id": Value("string"),
+                    "conversations": [
+                        {
+                            "role": Value("string"),
+                            "content": [
+                                {
+                                    "type": Value("string"),
+                                    "text": Value("string"),
+                                    "image": Value("string"),
+                                    "image_url": {"url": Value("string")},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+            ds = load_dataset("json", data_files=datapath, features=features)
 
             if shuffle:
                 ds = ds["train"].shuffle(seed=self.shuffle_seed)

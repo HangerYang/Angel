@@ -47,6 +47,9 @@ class Eagle3Trainer(Trainer, ABC):
             length: Number of speculative decoding steps
             **kwargs: Additional arguments passed to parent Trainer
         """
+        self.progressive_target_hs_warmup_steps = int(
+            kwargs.pop("progressive_target_hs_warmup_steps", 0) or 0
+        )
         super().__init__(model=draft_model, **kwargs)
         self.length = length
         self._train_start_time = None
@@ -245,7 +248,15 @@ class Eagle3Trainer(Trainer, ABC):
             getattr(draft, "progressive_staged", False) or getattr(draft, "hawk", False)
         )
         feedback_applied = 0
+        target_shift_applied = 0
         aux_vs_draft_cos_sum = 0.0
+        progressive_target_shift_warmup = (
+            log_prefix == "train"
+            and getattr(draft, "progressive_staged", False)
+            and self.progressive_target_hs_warmup_steps > 0
+            and getattr(self.state, "global_step", 0)
+            < self.progressive_target_hs_warmup_steps
+        )
         if hasattr(draft, "init_cache_hidden"):
             cache_hidden = draft.init_cache_hidden()
         else:
@@ -310,9 +321,19 @@ class Eagle3Trainer(Trainer, ABC):
                 input_ids = padding(input_ids, left=False)
                 target_logits = padding(target_logits, left=False)
                 loss_mask = padding(loss_mask, left=False)
-                # Progressive / hawk: after first token, NEVER target HS — only
-                # same-depth draft outs (h0/h1/h2). No shift_aux_inject fallback.
-                if use_draft_feedback:
+                # Progressive warmup can teacher-force with shifted target HS for
+                # all speculative substeps. Outside warmup, progressive/hawk use
+                # same-depth draft outs (h0/h1/h2).
+                if progressive_target_shift_warmup:
+                    if not hasattr(draft, "shift_aux_inject"):
+                        raise RuntimeError(
+                            "progressive target-HS warmup requires shift_aux_inject"
+                        )
+                    draft.shift_aux_inject(
+                        left=False, allow_progressive_target_shift=True
+                    )
+                    target_shift_applied += 1
+                elif use_draft_feedback:
                     if not hasattr(draft, "take_progressive_draft_feedback"):
                         raise RuntimeError(
                             "progressive/hawk draft missing take_progressive_draft_feedback"
@@ -370,10 +391,21 @@ class Eagle3Trainer(Trainer, ABC):
                 elif hasattr(draft, "shift_aux_inject"):
                     draft.shift_aux_inject(left=False)
 
-        if use_draft_feedback and feedback_applied != max(self.length - 1, 0):
+        if (
+            use_draft_feedback
+            and not progressive_target_shift_warmup
+            and feedback_applied != max(self.length - 1, 0)
+        ):
             raise RuntimeError(
                 f"draft-HS feedback expected {max(self.length - 1, 0)} applies, "
                 f"got {feedback_applied}"
+            )
+        if progressive_target_shift_warmup and target_shift_applied != max(
+            self.length - 1, 0
+        ):
+            raise RuntimeError(
+                f"target-HS warmup expected {max(self.length - 1, 0)} applies, "
+                f"got {target_shift_applied}"
             )
 
         # Step 8: Compute weighted loss
@@ -386,6 +418,11 @@ class Eagle3Trainer(Trainer, ABC):
         log[f"{log_prefix}/draft_hs_feedback"] = (
             float(feedback_applied) / float(max(self.length - 1, 1))
             if use_draft_feedback
+            else 0.0
+        )
+        log[f"{log_prefix}/target_hs_warmup"] = (
+            float(target_shift_applied) / float(max(self.length - 1, 1))
+            if progressive_target_shift_warmup
             else 0.0
         )
         if use_draft_feedback and feedback_applied > 0:
