@@ -637,6 +637,11 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         return self.layers[0]
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Target HS are often bf16 while --draft_model_dtype float32 keeps draft
+        # params in fp32 (for FP32 Adam moments under plain DDP). Match dtypes.
+        draft_dtype = next(self.parameters()).dtype
+        if hidden_states.dtype != draft_dtype:
+            hidden_states = hidden_states.to(dtype=draft_dtype)
         if self.progressive_staged or self.hawk:
             # One aux stream per draft layer (concat width = n*H).
             n = len(self.layers)
