@@ -192,19 +192,19 @@ DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-* \
   DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
   bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
 
-# Assistance mode: target verify still runs first and freezes aux HS;
-# draft steps 1+ reuse that tape (no draft-HS feedback).
-ASSISTANCE_MODE=1 DRAFT_MODEL=output/smolvlm_256m_hawk \
-  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
-  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
-
-# Optional: target-only baseline first, then assisted eagle (two result files)
-RUN_BASELINE_FIRST=1 ASSISTANCE_MODE=1 DRAFT_MODEL=output/smolvlm_256m_hawk \
+# Miracle mode (oracle GT target-HS): fused_fc / progressive / hawk.
+# A) target-only GT tokens  B) capture aux tape  C) timed eagle with tape[pos]
+MIRACLE_MODE=1 \
+  DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
   DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
   bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
 ```
 
-Look for log lines `Eagle3 hawk enabled` and `Eagle3 assistance mode` at draft load.
+`DRAFT_MODEL` must contain `config.json` (or a `checkpoint-*` child that does —
+the eval script auto-picks the latest). Miracle requires `max_num_seqs=1`
+(enforced). Look for `MIRACLE_MODE=1`, `eagle_miracle_mode: True`, and
+`Eagle3 miracle mode`. Timed metrics are **phase C only** (GT capture is not
+timed). Re-apply the progressive patch after pull (includes `eagle_miracle.py`).
 
 ### Progressive staged injection (experiment)
 
@@ -251,8 +251,10 @@ can fail on a dirty tree):
 
 ```bash
 cd third_party/vllm
-git checkout -- vllm/model_executor/models/llama_eagle3.py \
+git checkout -- vllm/envs.py \
+  vllm/model_executor/models/llama_eagle3.py \
   vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+rm -f vllm/model_executor/models/eagle_miracle.py
 cd ../..
 bash third_party/apply_vllm_patches.sh
 source third_party/env.sh
@@ -381,6 +383,53 @@ DATASET=dataset/smolvlm_256m_target_gen/data_0-36.jsonl NUM_PROMPTS=4 \
   bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
 ```
 
+### Miracle mode (oracle GT target-HS)
+
+Upper-bound eval: draft steps inject **ground-truth target aux HS** along the
+target-generated trajectory (not draft feedback, not frozen last-verify).
+Works for `fused_fc`, `progressive_staged`, and `hawk`. Requires `TEMP=0` and
+`max_num_seqs=1` (enforced).
+
+**Phases (automatic):** A) target-only GT tokens → B) capture aux tape →
+C) timed eagle with `tape[pos]` inject. Metrics are from **C only**.
+
+After `git pull`, re-apply the progressive patch (includes `eagle_miracle.py`):
+
+```bash
+cd third_party/vllm
+git checkout -- vllm/envs.py \
+  vllm/model_executor/models/llama_eagle3.py \
+  vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+rm -f vllm/model_executor/models/eagle_miracle.py
+cd ../..
+bash third_party/apply_vllm_patches.sh
+source third_party/env.sh
+```
+
+**Hawk example:**
+
+```bash
+MIRACLE_MODE=1 TEMP=0 \
+  DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
+  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+  OUTPUT_FILE=results/smolvlm-256m-hawk-miracle.jsonl \
+  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+```
+
+**Fused Eagle3 example:**
+
+```bash
+MIRACLE_MODE=1 TEMP=0 \
+  DRAFT_MODEL=output/smolvlm_256m_eagle3_online \
+  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3.json \
+  OUTPUT_FILE=results/smolvlm-256m-eagle3-miracle.jsonl \
+  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+```
+
+Expect logs: `MIRACLE_MODE=1`, `eagle_miracle_mode: True`,
+`Eagle3 miracle mode (capture|use)`. Optional: `MIRACLE_HS_DIR=...` to keep
+tapes. (`ASSISTANCE_MODE` is a deprecated alias for `MIRACLE_MODE`.)
+
 Before calling vLLM, the eval script runs:
 
 `scripts/speculative/smolvlm/prepare_draft_config_for_vllm_eval.py`
@@ -441,6 +490,7 @@ When Eagle3 eval breaks or you need to change behavior, these are the touch poin
 | **Apply aux layer ids from draft config** | `third_party/vllm/.../eagle/eagle3_utils.py` | reads `eagle_aux_hidden_state_layer_ids` |
 | **Draft forward (1- or multi-layer)** | `third_party/vllm/.../llama_eagle3.py` | `num_hidden_layers` blocks; layer 0 = 2H Eagle |
 | **Propose / multi-step draft loop** | `third_party/vllm/.../autoregressive/speculator.py` | Model Runner V2 Eagle3 propose path |
+| **Miracle GT-HS (capture/use)** | `third_party/vllm/.../eagle_miracle.py` + progressive patch | Oracle tape inject; `MIRACLE_MODE=1` |
 | **Train draft JSON** | `angelslim/.../configs/smolvlm-256m-eagle3.json` | `num_hidden_layers`, aux ids, optional init |
 
 Setup: `bash third_party/link_local_vllm.sh && source third_party/env.sh` (see `third_party/README.md`).

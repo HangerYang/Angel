@@ -50,6 +50,7 @@ def prepare_draft_config(
     draft_model: Path,
     draft_model_config_path: Optional[Path] = None,
     dry_run: bool = False,
+    eagle_miracle_mode: bool = False,
 ) -> Dict[str, Any]:
     config_path = draft_model / "config.json"
     if not config_path.is_file():
@@ -162,12 +163,20 @@ def prepare_draft_config(
         if key not in cfg and key in train_cfg:
             updates[key] = train_cfg[key]
 
+    if eagle_miracle_mode:
+        # Miracle (oracle GT-HS) works for fused_fc, progressive_staged, hawk.
+        updates["eagle_miracle_mode"] = True
+
     changed = {k: v for k, v in updates.items() if cfg.get(k) != v}
     cfg.update(updates)
+    if eagle_miracle_mode and "eagle_assistance_mode" in cfg:
+        cfg.pop("eagle_assistance_mode", None)
+        changed["eagle_assistance_mode"] = None
 
     print("SmolVLM Eagle3 draft config for vLLM eval:")
     print(f"  draft_model: {draft_model}")
     print(f"  eagle_aux_injection_mode: {injection_mode}")
+    print(f"  eagle_miracle_mode: {cfg.get('eagle_miracle_mode', False)}")
     print(f"  num_hidden_layers: {num_layers} "
           f"({'single-layer' if num_layers == 1 else f'{num_layers}-layer'} draft)")
     print(f"  aux_hidden_states_layer_ids (train): {cfg.get('aux_hidden_states_layer_ids')}")
@@ -207,6 +216,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate/print only; do not rewrite config.json",
     )
+    p.add_argument(
+        "--eagle_miracle_mode",
+        action="store_true",
+        help=(
+            "Stamp eagle_miracle_mode=true into draft config.json "
+            "(fused_fc / progressive_staged / hawk)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -216,6 +233,7 @@ def main() -> int:
         draft_model=args.draft_model,
         draft_model_config_path=args.draft_model_config_path,
         dry_run=args.dry_run,
+        eagle_miracle_mode=args.eagle_miracle_mode,
     )
     return 0
 

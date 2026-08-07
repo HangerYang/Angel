@@ -1,5 +1,35 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+old mode 100755
+new mode 100644
+index 13a19b8..dbf23e4
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1963,6 +1963,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
+     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
+     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
++    # AngelSlim: Eagle miracle (oracle GT-HS) mode. Draft steps inject
++    # position-indexed target aux along a precomputed target trajectory.
++    # Also honored via draft config eagle_miracle_mode.
++    "VLLM_EAGLE_MIRACLE_MODE": lambda: (
++        os.environ.get("VLLM_EAGLE_MIRACLE_MODE", "0").strip().lower()
++        in ("1", "true", "yes", "on")
++    ),
++    # Directory with GT token meta + captured aux tapes for miracle mode.
++    "VLLM_EAGLE_MIRACLE_HS_DIR": lambda: os.environ.get(
++        "VLLM_EAGLE_MIRACLE_HS_DIR", ""
++    ),
++    # capture | use — set by the offline eval driver.
++    "VLLM_EAGLE_MIRACLE_PHASE": lambda: os.environ.get(
++        "VLLM_EAGLE_MIRACLE_PHASE", "use"
++    )
++    .strip()
++    .lower(),
+ }
+ 
+ 
 diff --git a/vllm/model_executor/models/llama_eagle3.py b/vllm/model_executor/models/llama_eagle3.py
-index 2d859bd..d1b6e1b 100644
+index 2d859bd..c52806e 100644
 --- a/vllm/model_executor/models/llama_eagle3.py
 +++ b/vllm/model_executor/models/llama_eagle3.py
 @@ -1,6 +1,7 @@
@@ -10,7 +40,15 @@ index 2d859bd..d1b6e1b 100644
  from collections.abc import Iterable
  
  import torch
-@@ -45,9 +46,19 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+@@ -21,6 +22,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaForCausalLM
+ from vllm.multimodal.inputs import NestedTensors
+ 
++from . import eagle_miracle
+ from .utils import (
+     AutoWeightsLoader,
+     WeightsMapper,
+@@ -45,9 +47,19 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
          config = config or vllm_config.model_config.hf_config
          quant_config = self.get_quant_config(vllm_config)
  
@@ -33,7 +71,7 @@ index 2d859bd..d1b6e1b 100644
  
          # Parallel drafting checkpoints may have attention bias enabled
          qkv_bias = getattr(config, "attention_bias", False)
-@@ -95,12 +106,36 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+@@ -95,12 +107,36 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
          embeds: torch.Tensor,
          hidden_states: torch.Tensor,
          residual: torch.Tensor | None,
@@ -71,7 +109,7 @@ index 2d859bd..d1b6e1b 100644
          else:
              # Subsequent layers: process hidden_states and residuals only
              hidden_states, residual = self.input_layernorm(hidden_states, residual)
-@@ -152,6 +187,43 @@ class LlamaModel(nn.Module):
+@@ -152,6 +188,45 @@ class LlamaModel(nn.Module):
                  "norm_before_fc", getattr(self.config, "norm_before_fc", False)
              )
          )
@@ -94,28 +132,30 @@ index 2d859bd..d1b6e1b 100644
 +            )
 +        # Per-layer inject buffers set by combine_hidden_states / set_aux_inject.
 +        self._aux_inject: list[torch.Tensor] | None = None
-+        # Frozen target aux from the latest target verify (assistance mode).
-+        self._target_aux_inject: list[torch.Tensor] | None = None
 +        self._last_layer_outs: list[torch.Tensor] | None = None
 +        self.fuse_w1: ReplicatedLinear | None = None
 +        self.fuse_w2: ReplicatedLinear | None = None
-+        # Use target aux for draft steps 1+ instead of draft-HS feedback.
-+        # Env: VLLM_EAGLE_ASSISTANCE_MODE=1  or draft config eagle_assistance_mode.
-+        self.assistance_mode = bool(
-+            getattr(self.config, "eagle_assistance_mode", False)
++        # Miracle (oracle GT-HS): position-indexed target aux along a trajectory.
++        # Config eagle_miracle_mode / env VLLM_EAGLE_MIRACLE_MODE (+ HS dir/phase).
++        # Works for fused_fc, progressive_staged, and hawk.
++        self.miracle_mode = bool(
++            getattr(self.config, "eagle_miracle_mode", False)
 +        ) or (
-+            os.environ.get("VLLM_EAGLE_ASSISTANCE_MODE", "0").strip().lower()
++            os.environ.get("VLLM_EAGLE_MIRACLE_MODE", "0").strip().lower()
 +            in ("1", "true", "yes", "on")
 +        )
-+        if self.per_layer_aux and self.assistance_mode:
++        if self.miracle_mode:
++            eagle_miracle.init_from_env()
 +            logger.info(
-+                "Eagle3 assistance mode: draft steps use frozen target aux "
-+                "(not draft-HS feedback)"
++                "Eagle3 miracle mode (%s): draft uses GT target-HS tape "
++                "(eagle_aux_injection_mode=%s)",
++                os.environ.get("VLLM_EAGLE_MIRACLE_PHASE", "use"),
++                mode,
 +            )
  
          current_vllm_config = get_current_vllm_config()
  
-@@ -179,41 +251,74 @@ class LlamaModel(nn.Module):
+@@ -179,41 +254,74 @@ class LlamaModel(nn.Module):
              if self.num_aux_hidden_states is None:
                  eagle_config = getattr(self.config, "eagle_config", None) or {}
                  layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
@@ -217,7 +257,7 @@ index 2d859bd..d1b6e1b 100644
  
          self.norm_output = getattr(self.config, "norm_output", False)
          self.norm = RMSNorm(
-@@ -224,6 +329,10 @@ class LlamaModel(nn.Module):
+@@ -224,6 +332,10 @@ class LlamaModel(nn.Module):
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
  
@@ -228,7 +268,7 @@ index 2d859bd..d1b6e1b 100644
      def forward(
          self,
          input_ids: torch.Tensor,
-@@ -239,13 +348,53 @@ class LlamaModel(nn.Module):
+@@ -239,13 +351,53 @@ class LlamaModel(nn.Module):
          )
  
          residual = None
@@ -289,12 +329,11 @@ index 2d859bd..d1b6e1b 100644
          hidden_states, hidden_prenorm = self.norm(hidden_states, residual)
  
          # norm_output variant uses the post-norm hidden states.
-@@ -362,8 +511,27 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -362,7 +514,29 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
      ) -> torch.Tensor:
          if not self.model.use_aux_hidden_state:
              return hidden_states
--        # combine multiple auxiliary hidden states returned by eagle3
- 
++
 +        if self.model.per_layer_aux:
 +            # hidden_states is concat of N aux streams [T, N*H]; stash per-layer
 +            # injects. Progressive uses chunk0 as L0 seed; hawk L0 fuses
@@ -308,17 +347,19 @@ index 2d859bd..d1b6e1b 100644
 +                    f"last dim {n * h}, got {hidden_states.shape[-1]}"
 +                )
 +            chunks = list(hidden_states.split(h, dim=-1))
++            eagle_miracle.set_last_raw_chunks(chunks)
 +            self.model.set_aux_inject(chunks)
-+            # Freeze target tape for assistance mode (draft steps reuse these
-+            # instead of overwriting inject with draft layer outs).
-+            self.model._target_aux_inject = [c.detach() for c in chunks]
 +            return chunks[0]
 +
-+        # combine multiple auxiliary hidden states returned by eagle3
+         # combine multiple auxiliary hidden states returned by eagle3
++        n = self.model.num_aux_hidden_states
++        h = hidden_states.shape[-1] // n if n else hidden_states.shape[-1]
++        if n and hidden_states.shape[-1] == n * h:
++            eagle_miracle.set_last_raw_chunks(list(hidden_states.split(h, dim=-1)))
+ 
          if self.model.norm_before_fc:
              hidden_states = self.model.input_norm(hidden_states)
- 
-@@ -378,6 +546,65 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -378,6 +552,51 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
  
          return self.model.fc(hidden_states)
  
@@ -351,40 +392,26 @@ index 2d859bd..d1b6e1b 100644
 +        self.model.set_aux_inject(gathered)
 +        return gathered[0]
 +
-+    def take_progressive_target_assistance(
++    def is_miracle_mode(self) -> bool:
++        return bool(getattr(self.model, "miracle_mode", False)) and eagle_miracle.is_enabled()
++
++    def apply_miracle_hs(
 +        self,
-+        token_indices: torch.Tensor | None = None,
-+        num_tokens: int | None = None,
++        positions: torch.Tensor,
++        req_ids: list[str],
 +    ) -> torch.Tensor | None:
-+        """Assistance mode: next-step injects from frozen *target* aux, not draft.
-+
-+        Target verify already saved ``_target_aux_inject`` in
-+        ``combine_hidden_states``. Gather last-token rows for decode and keep
-+        that tape for subsequent draft steps.
-+        """
-+        src = getattr(self.model, "_target_aux_inject", None)
-+        if not src:
-+            return None
-+        gathered: list[torch.Tensor] = []
-+        for h in src:
-+            if token_indices is not None:
-+                gathered.append(h[token_indices])
-+            elif num_tokens is not None and h.shape[0] > num_tokens:
-+                gathered.append(h[:num_tokens])
-+            else:
-+                gathered.append(h)
-+        self.model.set_aux_inject(gathered)
-+        # Decode steps keep the gathered target rows (no draft overwrite).
-+        self.model._target_aux_inject = gathered
-+        return gathered[0]
-+
-+    def is_assistance_mode(self) -> bool:
-+        return bool(getattr(self.model, "assistance_mode", False))
++        """Use-phase: inject GT target aux at absolute ``positions``."""
++        return eagle_miracle.apply_miracle_hs(
++            self.model,
++            positions,
++            req_ids,
++            combine_fn=self.combine_hidden_states,
++        )
 +
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
          model_weights = {}
          includes_draft_id_mapping = False
-@@ -420,8 +647,12 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -420,8 +639,12 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
              skip_substrs.append("draft_id_to_target_id")
          if not includes_embed_tokens:
              skip_substrs.append("embed_tokens")
@@ -399,13 +426,33 @@ index 2d859bd..d1b6e1b 100644
              skip_substrs.append("input_norm.")
          loader = AutoWeightsLoader(
 diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-index 747fb3a..ff360ed 100644
+index 747fb3a..102d8c8 100644
 --- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-@@ -174,6 +174,21 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -22,6 +22,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+     DecodeSpeculatorCudaGraphManager,
+     PrefillSpeculatorCudaGraphManager,
+ )
++from vllm.model_executor.models import eagle_miracle
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+ 
+ logger = init_logger(__name__)
+@@ -174,6 +175,33 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              hidden_states = last_hidden_states
          self.hidden_states[:num_tokens].copy_(hidden_states)
  
++        # AngelSlim miracle: keep req ids for capture/use helpers.
++        self._miracle_req_ids = list(input_batch.req_ids)
++        self._miracle_active = (not dummy_run) and getattr(
++            self.model, "is_miracle_mode", lambda: False
++        )()
++        if self._miracle_active and eagle_miracle.is_capture():
++            eagle_miracle.record_verify_aux(
++                req_ids=self._miracle_req_ids,
++                positions=self.input_buffers.positions[:num_tokens],
++                num_tokens=num_tokens,
++            )
++
 +        # ---------------------------------------------------------------------
 +        # [ANGELSLIM EAGLE BP#2] Target → draft handoff (hidden states).
 +        # Target aux/last hidden states were combined and copied into
@@ -424,30 +471,54 @@ index 747fb3a..ff360ed 100644
          self._copy_request_inputs(
              num_reqs,
              input_batch.idx_mapping,
-@@ -368,6 +383,22 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -248,6 +276,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             advance_draft_positions=self.advance_draft_positions,
+         )
+ 
++        # Miracle USE: after position advance, inject GT HS at the new abs pos.
++        if getattr(self, "_miracle_active", False) and eagle_miracle.is_use():
++            seed = self.model.apply_miracle_hs(
++                self.input_buffers.positions[:num_reqs],
++                getattr(self, "_miracle_req_ids", []) or [],
++            )
++            if seed is not None:
++                self.hidden_states[:num_reqs] = seed
++
+         # Each request produces exactly 1 token per draft generation step,
+         # enabling FULL graph replay.
+         decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+@@ -362,12 +399,30 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             self.current_draft_step,
+             self.draft_logits,
+         )
++        # Miracle CAPTURE: force draft tokens onto the GT trajectory.
++        if getattr(self, "_miracle_active", False) and eagle_miracle.is_capture():
++            eagle_miracle.force_gt_draft_tokens(
++                self.draft_tokens[:num_reqs, 0],
++                positions,
++                getattr(self, "_miracle_req_ids", []) or [],
++            )
+         if last_hidden_states is hidden_states:
+             self.hidden_states[:num_reqs] = sample_hidden_states
+         else:
              self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
          self.input_buffers.positions[:num_reqs] = positions
  
-+        # Progressive / hawk decode feedback (or assistance = keep target aux).
-+        #   default: next L0 seed ← h0, injects ← h0/h1/h2 (draft outs)
-+        #   assistance: next seed/injects ← frozen target aux (from verify)
-+        draft_inner = getattr(self.model, "model", None)
-+        if draft_inner is not None and getattr(draft_inner, "per_layer_aux", False):
-+            if getattr(self.model, "is_assistance_mode", lambda: False)():
-+                seed = self.model.take_progressive_target_assistance(
-+                    token_indices=last_token_indices
-+                )
-+            else:
++        # Progressive/hawk: draft-HS feedback for step 1 (miracle applied later,
++        # after prepare_decode_inputs advances positions).
++        if not (getattr(self, "_miracle_active", False) and eagle_miracle.is_use()):
++            draft_inner = getattr(self.model, "model", None)
++            if draft_inner is not None and getattr(draft_inner, "per_layer_aux", False):
 +                seed = self.model.take_progressive_draft_feedback(
 +                    token_indices=last_token_indices
 +                )
-+            if seed is not None:
-+                self.hidden_states[:num_reqs] = seed
++                if seed is not None:
++                    self.hidden_states[:num_reqs] = seed
 +
      def _multi_step_decode(
          self,
          num_reqs: int,
-@@ -382,6 +413,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -382,6 +437,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
          attn_metadata = None
          slot_mappings_by_layer = None
          for step in range(1, self.num_speculative_steps):
@@ -467,21 +538,311 @@ index 747fb3a..ff360ed 100644
              # Rebuild every step when positions advance, or just once
              # on the first step when positions are constant (Gemma4 MTP).
              if not skip_attn and (self.advance_draft_positions or step == 1):
-@@ -465,6 +509,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -451,6 +519,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             self.draft_logits,
+         )
+ 
++        # Miracle CAPTURE: force draft tokens onto the GT trajectory.
++        if getattr(self, "_miracle_active", False) and eagle_miracle.is_capture():
++            eagle_miracle.force_gt_draft_tokens(
++                draft_tokens,
++                positions,
++                getattr(self, "_miracle_req_ids", []) or [],
++            )
++
+         # Update the inputs for the next step.
+         update_draft_inputs(
+             draft_tokens,
+@@ -465,6 +541,21 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              advance_draft_positions=self.advance_draft_positions,
          )
  
-+        # Progressive / hawk: refresh injects for next draft step.
-+        if getattr(getattr(self.model, "model", None), "per_layer_aux", False):
-+            if getattr(self.model, "is_assistance_mode", lambda: False)():
-+                seed = self.model.take_progressive_target_assistance(
-+                    num_tokens=num_reqs
-+                )
-+            else:
-+                seed = self.model.take_progressive_draft_feedback(num_tokens=num_reqs)
++        # Next-step HS after position advance.
++        if getattr(self, "_miracle_active", False) and eagle_miracle.is_use():
++            seed = self.model.apply_miracle_hs(
++                self.input_buffers.positions[:num_reqs],
++                getattr(self, "_miracle_req_ids", []) or [],
++            )
 +            if seed is not None:
 +                self.hidden_states[:num_reqs] = seed
++        else:
++            draft_inner = getattr(self.model, "model", None)
++            if draft_inner is not None and getattr(draft_inner, "per_layer_aux", False):
++                seed = self.model.take_progressive_draft_feedback(num_tokens=num_reqs)
++                if seed is not None:
++                    self.hidden_states[:num_reqs] = seed
 +
  
  @triton.jit
  def _prepare_prefill_inputs_kernel(
+diff --git a/vllm/model_executor/models/eagle_miracle.py b/vllm/model_executor/models/eagle_miracle.py
+new file mode 100644
+index 0000000..88fa142
+--- /dev/null
++++ b/vllm/model_executor/models/eagle_miracle.py
+@@ -0,0 +1,265 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""AngelSlim Eagle miracle mode: oracle GT target-HS along a trajectory.
++
++Offline eval:
++  1) Target-only generate → GT token ids (saved under MIRACLE_HS_DIR)
++  2) Eagle phase=capture: walk GT path, record verify aux at absolute positions
++  3) Eagle phase=use: draft steps inject tape[pos] (fused / progressive / hawk)
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_PHASE = "off"  # off | capture | use
++_DIR: Path | None = None
++_GT: list[dict[str, Any]] = []
++_TAPES: list[torch.Tensor | None] = []  # each [T, N, H] on CPU
++_REQ_TO_IDX: dict[str, int] = {}
++_NEXT_IDX = 0
++_LAST_RAW_CHUNKS: list[torch.Tensor] | None = None
++
++
++def _truthy(val: str | None) -> bool:
++    return (val or "").strip().lower() in ("1", "true", "yes", "on")
++
++
++def init_from_env() -> None:
++    """Call once from draft model __init__."""
++    global _PHASE, _DIR, _GT, _TAPES, _REQ_TO_IDX, _NEXT_IDX
++    enabled = _truthy(os.environ.get("VLLM_EAGLE_MIRACLE_MODE")) or _truthy(
++        os.environ.get("VLLM_EAGLE_ASSISTANCE_MODE")  # back-compat alias
++    )
++    if not enabled:
++        _PHASE = "off"
++        return
++    d = os.environ.get("VLLM_EAGLE_MIRACLE_HS_DIR", "").strip()
++    if not d:
++        logger.warning(
++            "Eagle miracle mode enabled but VLLM_EAGLE_MIRACLE_HS_DIR is empty"
++        )
++        _PHASE = "off"
++        return
++    _DIR = Path(d)
++    _DIR.mkdir(parents=True, exist_ok=True)
++    phase = os.environ.get("VLLM_EAGLE_MIRACLE_PHASE", "use").strip().lower()
++    if phase not in ("capture", "use"):
++        phase = "use"
++    _PHASE = phase
++    _REQ_TO_IDX = {}
++    _NEXT_IDX = 0
++    meta_path = _DIR / "gt_tokens.json"
++    if meta_path.is_file():
++        _GT = json.loads(meta_path.read_text(encoding="utf-8"))
++    else:
++        _GT = []
++    _TAPES = [None] * len(_GT)
++    if _PHASE == "use":
++        loaded = 0
++        for i in range(len(_GT)):
++            p = _DIR / f"{i:05d}.pt"
++            if p.is_file():
++                _TAPES[i] = torch.load(p, map_location="cpu", weights_only=True)
++                loaded += 1
++        logger.info(
++            "Eagle miracle USE: loaded %s/%s GT-HS tapes from %s",
++            loaded,
++            len(_GT),
++            _DIR,
++        )
++    else:
++        logger.info(
++            "Eagle miracle CAPTURE: will record GT-HS tapes for %s samples into %s",
++            len(_GT),
++            _DIR,
++        )
++
++
++def is_enabled() -> bool:
++    return _PHASE in ("capture", "use")
++
++
++def is_capture() -> bool:
++    return _PHASE == "capture"
++
++
++def is_use() -> bool:
++    return _PHASE == "use"
++
++
++def set_last_raw_chunks(chunks: list[torch.Tensor] | None) -> None:
++    global _LAST_RAW_CHUNKS
++    _LAST_RAW_CHUNKS = chunks
++
++
++def bind_req(req_id: str) -> int | None:
++    """Map engine req_id → sample index (sequential for offline max_num_seqs=1)."""
++    global _NEXT_IDX
++    if not is_enabled():
++        return None
++    if req_id in _REQ_TO_IDX:
++        return _REQ_TO_IDX[req_id]
++    if _NEXT_IDX >= len(_GT):
++        logger.warning(
++            "Miracle: more requests than GT samples (%s); req_id=%s",
++            len(_GT),
++            req_id,
++        )
++        return None
++    idx = _NEXT_IDX
++    _REQ_TO_IDX[req_id] = idx
++    _NEXT_IDX += 1
++    return idx
++
++
++def gt_token_at(sample_idx: int, abs_pos: int) -> int | None:
++    """Return GT token id at absolute position, or None."""
++    if sample_idx < 0 or sample_idx >= len(_GT):
++        return None
++    ids = _GT[sample_idx]["token_ids"]
++    if abs_pos < 0 or abs_pos >= len(ids):
++        return None
++    return int(ids[abs_pos])
++
++
++def record_verify_aux(
++    req_ids: list[str],
++    positions: torch.Tensor,
++    num_tokens: int,
++) -> None:
++    """During capture: write raw aux rows into the sample tape at abs positions."""
++    if not is_capture() or not _LAST_RAW_CHUNKS:
++        return
++    chunks = _LAST_RAW_CHUNKS
++    n = len(chunks)
++    # Offline miracle requires max_num_seqs=1 (one active req).
++    req_id = req_ids[0] if req_ids else None
++    if req_id is None:
++        return
++    idx = bind_req(req_id)
++    if idx is None:
++        return
++    h = chunks[0].shape[-1]
++    device = chunks[0].device
++    dtype = chunks[0].dtype
++    # Ensure tape long enough
++    max_pos = int(positions[:num_tokens].max().item()) if num_tokens > 0 else -1
++    need_t = max_pos + 1
++    tape = _TAPES[idx]
++    if tape is None or tape.shape[0] < need_t:
++        new_t = max(need_t, len(_GT[idx]["token_ids"]))
++        new_tape = torch.zeros(new_t, n, h, dtype=dtype, device="cpu")
++        if tape is not None:
++            new_tape[: tape.shape[0]] = tape
++        tape = new_tape
++        _TAPES[idx] = tape
++    for t in range(num_tokens):
++        pos = int(positions[t].item())
++        if pos < 0 or pos >= tape.shape[0]:
++            continue
++        row = torch.stack([chunks[j][t].detach().to("cpu") for j in range(n)], dim=0)
++        tape[pos] = row
++    # Persist incrementally so a crash mid-capture still leaves usable tapes.
++    if _DIR is not None and tape is not None:
++        torch.save(tape, _DIR / f"{idx:05d}.pt")
++
++
++def save_tapes() -> int:
++    """Persist captured tapes to MIRACLE_HS_DIR. Returns number saved."""
++    if _DIR is None:
++        return 0
++    n_saved = 0
++    for i, tape in enumerate(_TAPES):
++        if tape is None:
++            continue
++        torch.save(tape, _DIR / f"{i:05d}.pt")
++        n_saved += 1
++    logger.info("Eagle miracle CAPTURE: saved %s tapes to %s", n_saved, _DIR)
++    return n_saved
++
++
++def apply_miracle_hs(
++    model: Any,
++    positions: torch.Tensor,
++    req_ids: list[str],
++    combine_fn,
++) -> torch.Tensor | None:
++    """Use-phase: set inject / return L0 seed (or fused seed) for each req.
++
++    ``positions`` is [num_reqs] absolute positions of the current draft token.
++    """
++    if not is_use():
++        return None
++    num_reqs = positions.shape[0]
++    seeds: list[torch.Tensor] = []
++    per_layer = bool(getattr(model, "per_layer_aux", False))
++    injects: list[list[torch.Tensor]] | None = [] if per_layer else None
++
++    for i in range(num_reqs):
++        req_id = req_ids[i] if i < len(req_ids) else None
++        if req_id is None:
++            return None
++        idx = bind_req(req_id)
++        if idx is None or _TAPES[idx] is None:
++            return None
++        tape = _TAPES[idx]
++        assert tape is not None
++        pos = int(positions[i].item())
++        if pos < 0 or pos >= tape.shape[0]:
++            # Fall back to last available GT row.
++            pos = min(max(pos, 0), tape.shape[0] - 1)
++        row = tape[pos].to(device=positions.device, dtype=tape.dtype)  # [N, H]
++        # Match draft dtype if needed.
++        draft_dtype = next(model.parameters()).dtype
++        row = row.to(dtype=draft_dtype)
++        if per_layer:
++            chunks = [row[j] for j in range(row.shape[0])]
++            assert injects is not None
++            injects.append(chunks)
++            seeds.append(chunks[0])
++        else:
++            flat = row.reshape(1, -1)  # [1, N*H]
++            seeds.append(combine_fn(flat).squeeze(0))
++
++    if per_layer and injects:
++        # Batch inject: stack each layer's rows → [num_reqs, H]
++        n = len(injects[0])
++        gathered = [
++            torch.stack([injects[r][j] for r in range(num_reqs)], dim=0)
++            for j in range(n)
++        ]
++        model.set_aux_inject(gathered)
++
++    return torch.stack(seeds, dim=0)
++
++
++def force_gt_draft_tokens(
++    draft_tokens_col: torch.Tensor,
++    positions: torch.Tensor,
++    req_ids: list[str],
++) -> None:
++    """Capture-phase: overwrite sampled draft tokens with GT next tokens."""
++    if not is_capture():
++        return
++    num_reqs = positions.shape[0]
++    for i in range(num_reqs):
++        req_id = req_ids[i] if i < len(req_ids) else None
++        if req_id is None:
++            continue
++        idx = bind_req(req_id)
++        if idx is None:
++            continue
++        pos = int(positions[i].item())
++        tok = gt_token_at(idx, pos + 1)
++        if tok is not None:
++            draft_tokens_col[i] = tok
