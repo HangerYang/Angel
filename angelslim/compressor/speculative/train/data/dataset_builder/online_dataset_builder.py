@@ -44,6 +44,7 @@ from ..data_utils import (
     VLMHunyuanDataCollatorWithPadding,
     VLMSmolVLMDataCollatorWithPadding,
     build_image_processor_kwargs,
+    stable_hf_map_cache_files,
 )
 from .base_dataset_builder import OnlineDatasetBuilder
 from .dataset_builder_factory import DatasetBuilderFactory
@@ -158,6 +159,19 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
 
             # Store original columns for removal
             original_columns = ds.column_names
+            cache_files = stable_hf_map_cache_files(
+                datapath,
+                builder_tag=type(self).__name__,
+                max_length=self.max_length,
+                shuffle=shuffle,
+                shuffle_seed=self.shuffle_seed,
+                sample_num=sample_num,
+                min_loss_tokens=min_loss_tokens,
+            )
+            if load_from_cache_file:
+                rank0_print(
+                    f"HF map cache (load_from_cache_file=true): {cache_files['root']}"
+                )
 
             # Apply preprocessing
             processed_ds = ds.map(
@@ -166,6 +180,7 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
                 num_proc=num_proc,
                 remove_columns=original_columns,
                 load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["map"],
                 desc="Processing conversations",
             )
 
@@ -174,6 +189,8 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
                 lambda batch: [ids is not None for ids in batch["input_ids"]],
                 batched=True,
                 num_proc=num_proc,
+                load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["filter_empty"],
                 desc="Filtering empty input_ids",
             )
             if min_loss_tokens is not None:
@@ -184,6 +201,8 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
                     ],
                     batched=True,
                     num_proc=num_proc,
+                    load_from_cache_file=load_from_cache_file,
+                    cache_file_name=cache_files["filter_loss"],
                     desc=f"Filtering sequences with loss tokens < {min_loss_tokens}",
                 )
 
@@ -491,6 +510,19 @@ class OnlineVLMHunyuanVLDatasetBuilder(OnlineDatasetBuilder):
 
             # Store original columns for removal
             original_columns = ds.column_names
+            cache_files = stable_hf_map_cache_files(
+                datapath,
+                builder_tag=type(self).__name__,
+                max_length=self.max_length,
+                shuffle=shuffle,
+                shuffle_seed=self.shuffle_seed,
+                sample_num=sample_num,
+                min_loss_tokens=min_loss_tokens,
+            )
+            if load_from_cache_file:
+                rank0_print(
+                    f"HF map cache (load_from_cache_file=true): {cache_files['root']}"
+                )
 
             # Apply preprocessing
             processed_ds = ds.map(
@@ -499,6 +531,7 @@ class OnlineVLMHunyuanVLDatasetBuilder(OnlineDatasetBuilder):
                 num_proc=num_proc,
                 remove_columns=original_columns,
                 load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["map"],
                 desc="Processing conversations",
             )
 
@@ -507,6 +540,8 @@ class OnlineVLMHunyuanVLDatasetBuilder(OnlineDatasetBuilder):
                 lambda batch: [ids is not None for ids in batch["input_ids"]],
                 batched=True,
                 num_proc=num_proc,
+                load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["filter_empty"],
                 desc="Filtering empty input_ids",
             )
             if min_loss_tokens is not None:
@@ -517,6 +552,8 @@ class OnlineVLMHunyuanVLDatasetBuilder(OnlineDatasetBuilder):
                     ],
                     batched=True,
                     num_proc=num_proc,
+                    load_from_cache_file=load_from_cache_file,
+                    cache_file_name=cache_files["filter_loss"],
                     desc=f"Filtering sequences with loss tokens < {min_loss_tokens}",
                 )
             torch_columns = [c for c in processed_ds.column_names if c != "image_paths"]
@@ -776,14 +813,29 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                 ds = ds.select(range(sample_num))
 
             original_columns = ds.column_names
-            # When True, reuse HF datasets map/filter cache across restarts.
+            # Pin cache under <data_dir>/.map_cache/ so restarts actually hit
+            # (default HF fingerprints bound methods and miss every run).
             # Collator still rebuilds pixel_* each step from image_paths.
+            cache_files = stable_hf_map_cache_files(
+                datapath,
+                builder_tag=type(self).__name__,
+                max_length=self.max_length,
+                shuffle=shuffle,
+                shuffle_seed=self.shuffle_seed,
+                sample_num=sample_num,
+                min_loss_tokens=min_loss_tokens,
+            )
+            if load_from_cache_file:
+                rank0_print(
+                    f"HF map cache (load_from_cache_file=true): {cache_files['root']}"
+                )
             processed_ds = ds.map(
                 self._preprocess_function,
                 batched=True,
                 num_proc=num_proc,
                 remove_columns=original_columns,
                 load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["map"],
                 desc="Processing SmolVLM conversations",
             )
             processed_ds = processed_ds.filter(
@@ -791,6 +843,7 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                 batched=True,
                 num_proc=num_proc,
                 load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["filter_empty"],
                 desc="Filtering empty input_ids",
             )
             if min_loss_tokens is not None:
@@ -802,6 +855,7 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                     batched=True,
                     num_proc=num_proc,
                     load_from_cache_file=load_from_cache_file,
+                    cache_file_name=cache_files["filter_loss"],
                     desc=f"Filtering sequences with loss tokens < {min_loss_tokens}",
                 )
 
@@ -1119,6 +1173,19 @@ class OnlineAudioDatasetBuilder(OnlineDatasetBuilder):
 
             # Store original columns for removal
             original_columns = ds.column_names
+            cache_files = stable_hf_map_cache_files(
+                datapath,
+                builder_tag=type(self).__name__,
+                max_length=self.max_length,
+                shuffle=shuffle,
+                shuffle_seed=self.shuffle_seed,
+                sample_num=sample_num,
+                min_loss_tokens=min_loss_tokens,
+            )
+            if load_from_cache_file:
+                rank0_print(
+                    f"HF map cache (load_from_cache_file=true): {cache_files['root']}"
+                )
 
             # Apply preprocessing
             processed_ds = ds.map(
@@ -1127,6 +1194,7 @@ class OnlineAudioDatasetBuilder(OnlineDatasetBuilder):
                 num_proc=num_proc,
                 remove_columns=original_columns,
                 load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["map"],
                 desc="Processing conversations",
             )
 
@@ -1135,6 +1203,8 @@ class OnlineAudioDatasetBuilder(OnlineDatasetBuilder):
                 lambda batch: [ids is not None for ids in batch["input_ids"]],
                 batched=True,
                 num_proc=num_proc,
+                load_from_cache_file=load_from_cache_file,
+                cache_file_name=cache_files["filter_empty"],
                 desc="Filtering empty input_ids",
             )
 
@@ -1146,6 +1216,8 @@ class OnlineAudioDatasetBuilder(OnlineDatasetBuilder):
                     ],
                     batched=True,
                     num_proc=num_proc,
+                    load_from_cache_file=load_from_cache_file,
+                    cache_file_name=cache_files["filter_loss"],
                     desc=f"Filtering sequences with loss tokens < {min_loss_tokens}",
                 )
 
