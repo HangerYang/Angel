@@ -42,15 +42,20 @@ bash third_party/apply_vllm_patches.sh
 source third_party/env.sh
 ```
 
-Miracle eval (see `scripts/speculative/smolvlm/README.md` § Miracle mode):
+Miracle eval (see `scripts/speculative/smolvlm/README.md` § Miracle mode).
+Smoke (2 prompts):
 
 ```bash
-MIRACLE_MODE=1 TEMP=0 \
+MIRACLE_MODE=1 TEMP=0 NUM_PROMPTS=2 OUTPUT_LEN=32 \
+  DATASET=dataset/smolvlm_256m_target_gen/data_0-36.jsonl \
   DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
   DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+  MIRACLE_HS_DIR=results/miracle_smoke_hs \
   bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
 ```
 
+Patch must include dense capture (`input_batch.positions`) and warmup-safe
+miracle bind (`{index}-{hex}` req ids). Re-apply after every pull.
 CUDA notes: patches are **CUDA-agnostic** (Python sources). Native `.so` must
 still match the machine — choose `VLLM_CUDA=13.0` / `12.6` / `12.9` via
 `third_party/install_local_vllm.sh` (see `third_party/README.md`).
