@@ -106,7 +106,12 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
 # CUDA_VISIBLE_DEVICES — which GPU(s) this eval sees. Example: 0 | 0,1
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-# MIRACLE_HS_DIR — optional dir to keep miracle tapes ({i:05d}.pt). Empty = temp under run.
+# MIRACLE_GT_DIR — fixed root for phase-A GT tokens (shared across drafts).
+#   Layout: <MIRACLE_GT_DIR>/<dataset_name>/gt_tokens.json (+ meta.json).
+#   Reused if present and meta matches target/temp/output_len with enough prompts.
+MIRACLE_GT_DIR="${MIRACLE_GT_DIR:-results/miracle_gt}"
+
+# MIRACLE_HS_DIR — optional dir for phase-B aux tapes ({i:05d}.pt). Empty = under output.
 #   Example: MIRACLE_HS_DIR=results/miracle_smoke_hs
 MIRACLE_HS_DIR="${MIRACLE_HS_DIR:-}"
 
@@ -197,13 +202,14 @@ if [[ "${USE_EAGLE}" == "1" ]]; then
     --num_spec_tokens "${NUM_SPEC_TOKENS}"
   )
   if [[ "${MIRACLE_MODE}" == "1" ]]; then
-    EXTRA+=(--eagle_miracle_mode)
+    EXTRA+=(--eagle_miracle_mode --miracle_gt_dir "${MIRACLE_GT_DIR}")
     if [[ -n "${MIRACLE_HS_DIR}" ]]; then
       EXTRA+=(--miracle_hs_dir "${MIRACLE_HS_DIR}")
     fi
     echo "MIRACLE_MODE=1 — oracle GT target-HS along target trajectory"
     echo "  draft_model=${DRAFT_MODEL}"
-    echo "  (phase A: target-only GT, B: capture tape, C: timed eagle+inject)"
+    echo "  miracle_gt_dir=${MIRACLE_GT_DIR}  (phase A cache by dataset name)"
+    echo "  (phase A: GT load-or-generate, B: capture tape, C: timed eagle+inject)"
   fi
 else
   echo "USE_EAGLE=0 — baseline eval (no draft / speculative decoding)"

@@ -415,14 +415,19 @@ target-generated trajectory (not draft feedback, not frozen last-verify).
 Works for `fused_fc`, `progressive_staged`, and `hawk`. Requires `TEMP=0` and
 `max_num_seqs=1` (enforced).
 
-**Phases (automatic):** A) target-only GT tokens → B) capture aux tape →
+**Phases (automatic):** A) target-only GT tokens (cached) → B) capture aux tape →
 C) timed eagle with `tape[pos]` inject. Metrics are from **C only**.
 
 | Phase | What | Timed? |
 |---|---|---|
-| A | Target-only generate → `gt_tokens.json` | no |
+| A | Target-only generate → `results/miracle_gt/<dataset>/gt_tokens.json` (load if present) | no |
 | B | Eagle **capture**: force draft onto GT path; record verify aux at absolute positions → `{i:05d}.pt` | no |
 | C | Eagle **use**: inject `tape[pos]` each draft step | **yes** |
+
+Phase A is shared across drafts: fixed root `MIRACLE_GT_DIR` (default
+`results/miracle_gt`), keyed by dataset basename. Reused when `meta.json`
+matches `target_model` / `temp` / `output_len` and has ≥ `NUM_PROMPTS` samples;
+otherwise regenerated and saved there.
 
 **After every `git pull`**, refresh local vLLM (universal — includes miracle):
 
