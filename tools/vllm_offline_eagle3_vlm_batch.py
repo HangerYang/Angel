@@ -65,6 +65,98 @@ def pil_to_base64(img):
     return f"data:image/jpeg;base64,{img_str}"
 
 
+def _dataset_folder_name(dataset: str) -> str:
+    """Match eval_eagle3_vlm_batch.sh dataset_folder_name()."""
+    base = os.path.basename(dataset.rstrip("/"))
+    for suf in (".jsonl", ".json"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    return base or "dataset"
+
+
+def _miracle_gt_paths(gt_root: str, dataset: str) -> tuple[str, str, str]:
+    """Return (dataset_dir, gt_tokens.json, meta.json) under fixed GT root."""
+    ds_dir = os.path.join(gt_root, _dataset_folder_name(dataset))
+    return (
+        ds_dir,
+        os.path.join(ds_dir, "gt_tokens.json"),
+        os.path.join(ds_dir, "meta.json"),
+    )
+
+
+def _try_load_miracle_gt(
+    gt_root: str,
+    dataset: str,
+    *,
+    target_model: str,
+    temp: float,
+    output_len: int,
+    num_prompts: int,
+) -> list | None:
+    """Load cached phase-A GT if present and compatible; else None."""
+    _, gt_path, meta_path = _miracle_gt_paths(gt_root, dataset)
+    if not os.path.isfile(gt_path):
+        return None
+    meta = {}
+    if os.path.isfile(meta_path):
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+    # Require matching decode settings; older caches without meta are rejected.
+    if (
+        meta.get("target_model") != target_model
+        or float(meta.get("temp", -1)) != float(temp)
+        or int(meta.get("output_len", -1)) != int(output_len)
+    ):
+        print(
+            f"MIRACLE phase A: cache miss (meta mismatch) at {gt_path}; regenerating"
+        )
+        return None
+    with open(gt_path, encoding="utf-8") as f:
+        gt_meta = json.load(f)
+    if len(gt_meta) < num_prompts:
+        print(
+            f"MIRACLE phase A: cache has {len(gt_meta)} < num_prompts={num_prompts}; "
+            f"regenerating ({gt_path})"
+        )
+        return None
+    if len(gt_meta) > num_prompts:
+        gt_meta = gt_meta[:num_prompts]
+    print(
+        f"MIRACLE phase A: loaded {len(gt_meta)} GT trajectories from {gt_path}"
+    )
+    return gt_meta
+
+
+def _save_miracle_gt(
+    gt_root: str,
+    dataset: str,
+    gt_meta: list,
+    *,
+    target_model: str,
+    temp: float,
+    output_len: int,
+) -> str:
+    """Write phase-A GT + meta under fixed folder; return gt_tokens.json path."""
+    ds_dir, gt_path, meta_path = _miracle_gt_paths(gt_root, dataset)
+    os.makedirs(ds_dir, exist_ok=True)
+    with open(gt_path, "w", encoding="utf-8") as f:
+        json.dump(gt_meta, f)
+    meta = {
+        "dataset": dataset,
+        "dataset_name": _dataset_folder_name(dataset),
+        "target_model": target_model,
+        "temp": temp,
+        "output_len": output_len,
+        "num_prompts": len(gt_meta),
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+        f.write("\n")
+    print(f"MIRACLE phase A: saved {len(gt_meta)} GT trajectories -> {gt_path}")
+    return gt_path
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target_model", type=str, default="Qwen/Qwen3-VL-4B-Instruct")
@@ -94,7 +186,20 @@ def parse_args():
         "--miracle_hs_dir",
         type=str,
         default=None,
-        help="Directory for GT tokens + aux tapes (default: <output>_miracle_hs).",
+        help=(
+            "Directory for phase-B aux tapes (+ per-run gt_tokens.json copy). "
+            "Default: <output>_miracle_hs."
+        ),
+    )
+    parser.add_argument(
+        "--miracle_gt_dir",
+        type=str,
+        default="results/miracle_gt",
+        help=(
+            "Fixed root for phase-A GT tokens. Cached as "
+            "<miracle_gt_dir>/<dataset_name>/gt_tokens.json; reused if present "
+            "and meta matches (target/temp/output_len, enough prompts)."
+        ),
     )
     parser.add_argument(
         "--output_file", type=str, default="results/qwen3-vl-4b-eagle3-results.jsonl"
@@ -391,7 +496,7 @@ def main():
                     print(f"Wrote eagle_miracle_mode=true -> {cfg_path}")
         print(
             "Eagle MIRACLE mode ON: GT target-HS tape along target trajectory "
-            f"(dir={miracle_hs_dir})"
+            f"(gt_cache={args.miracle_gt_dir}, hs_dir={miracle_hs_dir})"
         )
 
     # Build mm_processor_kwargs based on model type (Qwen3-VL vs others)
@@ -443,25 +548,48 @@ def main():
         breakpoint()
 
     if miracle:
-        # --- Phase A: target-only GT trajectory (not timed) ---
-        print("MIRACLE phase A: target-only generate for GT tokens...")
-        llm_base = _make_llm(None)
-        baseline_outputs = llm_base.chat(prompts, sampling_params=sampling_params)
-        gt_meta = []
-        for out in baseline_outputs:
-            prompt_ids = list(out.prompt_token_ids)
-            out_ids = list(out.outputs[0].token_ids)
-            gt_meta.append(
-                {
-                    "prompt_len": len(prompt_ids),
-                    "token_ids": prompt_ids + out_ids,
-                }
+        # --- Phase A: target-only GT trajectory (not timed; cached by dataset) ---
+        n_prompts = len(prompts)
+        gt_meta = _try_load_miracle_gt(
+            args.miracle_gt_dir,
+            args.dataset,
+            target_model=args.target_model,
+            temp=args.temp,
+            output_len=args.output_len,
+            num_prompts=n_prompts,
+        )
+        if gt_meta is None:
+            print(
+                "MIRACLE phase A: target-only generate for GT tokens "
+                f"(cache under {args.miracle_gt_dir}/"
+                f"{_dataset_folder_name(args.dataset)}/)..."
             )
-        gt_path = os.path.join(miracle_hs_dir, "gt_tokens.json")
-        with open(gt_path, "w", encoding="utf-8") as f:
+            llm_base = _make_llm(None)
+            baseline_outputs = llm_base.chat(prompts, sampling_params=sampling_params)
+            gt_meta = []
+            for out in baseline_outputs:
+                prompt_ids = list(out.prompt_token_ids)
+                out_ids = list(out.outputs[0].token_ids)
+                gt_meta.append(
+                    {
+                        "prompt_len": len(prompt_ids),
+                        "token_ids": prompt_ids + out_ids,
+                    }
+                )
+            _save_miracle_gt(
+                args.miracle_gt_dir,
+                args.dataset,
+                gt_meta,
+                target_model=args.target_model,
+                temp=args.temp,
+                output_len=args.output_len,
+            )
+            del llm_base
+        # Phase B/C read gt_tokens.json from MIRACLE_HS_DIR.
+        gt_run_path = os.path.join(miracle_hs_dir, "gt_tokens.json")
+        with open(gt_run_path, "w", encoding="utf-8") as f:
             json.dump(gt_meta, f)
-        print(f"  wrote {len(gt_meta)} GT trajectories -> {gt_path}")
-        del llm_base
+        print(f"  staged GT for this run -> {gt_run_path}")
 
         # --- Phase B: capture GT aux tapes (not timed) ---
         print("MIRACLE phase B: capture GT-HS tapes (force draft onto GT path)...")
@@ -565,6 +693,7 @@ def main():
         "avg_time_per_sample": total_time / num_prompts if num_prompts > 0 else 0,
         "use_eagle": args.use_eagle,
         "eagle_miracle_mode": bool(miracle),
+        "miracle_gt_dir": args.miracle_gt_dir if miracle else None,
         "miracle_hs_dir": miracle_hs_dir if miracle else None,
         "output_throughput": output_throughput,
         "request_throughput": request_throughput,

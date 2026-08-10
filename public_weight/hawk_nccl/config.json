@@ -1,0 +1,54 @@
+{
+  "architectures": [
+    "Eagle3LlamaForCausalLM"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "aux_hidden_states_layer_ids": [
+    0,
+    13,
+    25
+  ],
+  "bos_token_id": 1,
+  "draft_layer_init_from_target": [
+    1,
+    14,
+    26
+  ],
+  "draft_vocab_size": 32000,
+  "dtype": "bfloat16",
+  "eagle_aux_hidden_state_layer_ids": [
+    1,
+    14,
+    26
+  ],
+  "eagle_aux_injection_mode": "hawk",
+  "eos_token_id": 2,
+  "head_dim": 64,
+  "hidden_act": "silu",
+  "hidden_size": 576,
+  "image_token_id": 49190,
+  "initializer_range": 0.02,
+  "intermediate_size": 1536,
+  "max_position_embeddings": 8192,
+  "mlp_bias": false,
+  "modal_type": "VLM",
+  "model_type": "llama",
+  "num_attention_heads": 9,
+  "num_hidden_layers": 3,
+  "num_key_value_heads": 3,
+  "pad_token_id": 2,
+  "pretraining_tp": 1,
+  "rms_norm_eps": 1e-05,
+  "rope_parameters": {
+    "rope_theta": 100000.0,
+    "rope_type": "default"
+  },
+  "target_model_type": "smolvlm",
+  "tie_word_embeddings": false,
+  "transformers_version": "5.14.1",
+  "use_cache": false,
+  "vocab_size": 49280,
+  "num_aux_hidden_states": 3,
+  "eagle_miracle_mode": true
+}

@@ -9,7 +9,7 @@ Usage:
   python public_weight/load_hawk.py \\
       --smolvlm HuggingFaceTB/SmolVLM-256M-Instruct \\
       --pack public_weight/hawk_warmup \\
-      --save_full /tmp/hawk_full_reload
+      --save_full ~/tmp/hawk_full_reload
 
   # In code:
   from public_weight.load_hawk import load_hawk_draft
@@ -106,7 +106,7 @@ def main() -> None:
         "--pack",
         type=Path,
         default=_HERE / "hawk_warmup",
-        help="Compact pack dir with hot_weights.safetensors + config.json",
+        help="Compact pack dir (hawk_warmup/ or hawk_nccl/) with hot_weights.safetensors",
     )
     ap.add_argument(
         "--embed_weight_key",

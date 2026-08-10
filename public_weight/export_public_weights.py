@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2025 Tencent Inc. All Rights Reserved.
-"""Export compact packs into public_weight/{hawk_warmup,real_hawk_lora}.
+"""Export compact packs into public_weight/{hawk_warmup,hawk_nccl,real_hawk_lora}.
 
 Hawk / Eagle: skip embed (bottom; reload from SmolVLM). Keep hot intermediate
 layers + fuse + draft lm_head/norm + vocab maps.
@@ -12,6 +12,7 @@ Usage:
   python public_weight/export_public_weights.py
   python public_weight/export_public_weights.py \\
       --hawk_ckpt output/smolvlm_256m_hawk_warmup \\
+      --hawk_nccl_ckpt output/smolvlm_256m_hawk_nccl \\
       --real_hawk_ckpt output/smolvlm_256m_real_hawk_nccl/checkpoint-66466
 """
 
@@ -35,7 +36,7 @@ from public_weight._common import (  # noqa: E402
 )
 
 
-def _export_hawk(ckpt: Path, out_dir: Path) -> None:
+def _export_hawk(ckpt: Path, out_dir: Path, *, kind: str = "hawk") -> None:
     ckpt = resolve_latest_checkpoint(ckpt)
     state = load_state_dict(ckpt)
     with (ckpt / "config.json").open("r", encoding="utf-8") as f:
@@ -47,7 +48,7 @@ def _export_hawk(ckpt: Path, out_dir: Path) -> None:
         hot=hot,
         draft_config=cfg,
         meta={
-            "kind": "hawk",
+            "kind": kind,
             "source_ckpt": str(ckpt.resolve()),
             "skipped": ["embed_tokens.*  (reload from SmolVLM)"],
             "kept": [
@@ -103,6 +104,11 @@ def main() -> None:
         default=_ROOT / "output" / "smolvlm_256m_hawk_warmup",
     )
     ap.add_argument(
+        "--hawk_nccl_ckpt",
+        type=Path,
+        default=_ROOT / "output" / "smolvlm_256m_hawk_nccl",
+    )
+    ap.add_argument(
         "--real_hawk_ckpt",
         type=Path,
         default=_ROOT / "output" / "smolvlm_256m_real_hawk_nccl",
@@ -111,14 +117,17 @@ def main() -> None:
         "--out_root",
         type=Path,
         default=_HERE,
-        help="public_weight/ root (writes hawk_warmup/ and real_hawk_lora/)",
+        help="public_weight/ root (writes hawk_warmup/, hawk_nccl/, real_hawk_lora/)",
     )
     ap.add_argument("--skip_hawk", action="store_true")
+    ap.add_argument("--skip_hawk_nccl", action="store_true")
     ap.add_argument("--skip_real_hawk", action="store_true")
     args = ap.parse_args()
 
     if not args.skip_hawk:
-        _export_hawk(args.hawk_ckpt, args.out_root / "hawk_warmup")
+        _export_hawk(args.hawk_ckpt, args.out_root / "hawk_warmup", kind="hawk_warmup")
+    if not args.skip_hawk_nccl:
+        _export_hawk(args.hawk_nccl_ckpt, args.out_root / "hawk_nccl", kind="hawk_nccl")
     if not args.skip_real_hawk:
         _export_real_hawk_lora(args.real_hawk_ckpt, args.out_root / "real_hawk_lora")
 
