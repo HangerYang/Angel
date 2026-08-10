@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import os
 from collections import Counter
@@ -30,6 +31,14 @@ from ...data.data_utils import process_token_dict_to_mappings
 from ..model_utils import apply_rotary_pos_emb, apply_rotary_pos_emb_mrope, repeat_kv
 from .base_model import Eagle3BaseDraftModel
 from .draft_model_factory import DraftModelFactory
+
+logger = logging.getLogger(__name__)
+
+# Hawk-shaped H-fusion drafts (fuse_w1/w2, standard H blocks).
+HAWK_FUSE_MODES = frozenset({"hawk", "real_hawk", "layer_skip_lora"})
+# Real hawk ≡ frozen target-layer copies + LoRA (+ trainable fuse/head).
+# ``layer_skip_lora`` is a back-compat alias for ``real_hawk``.
+REAL_HAWK_MODES = frozenset({"real_hawk", "layer_skip_lora"})
 
 
 def infer_target_layer_weight_prefix(embed_weight_key: str) -> str:
@@ -257,10 +266,10 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        # Eagle L0 / progressive: concat → 2H QKV. Hawk / stock L1+: plain H.
+        # Eagle L0 / progressive: concat → 2H QKV. Hawk / real_hawk / stock L1+: H.
         mode = getattr(config, "eagle_aux_injection_mode", "fused_fc")
         progressive = mode == "progressive_staged"
-        hawk = mode == "hawk"
+        hawk = mode in HAWK_FUSE_MODES
         qkv_in = (
             self.hidden_size
             if hawk or not (layer_idx == 0 or progressive)
@@ -496,7 +505,7 @@ class LlamaDecoderLayeremb(nn.Module):
         self.layer_idx = layer_idx
         mode = getattr(config, "eagle_aux_injection_mode", "fused_fc")
         self.progressive_staged = mode == "progressive_staged"
-        self.hawk = mode == "hawk"
+        self.hawk = mode in HAWK_FUSE_MODES
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
         self.mlp = LlamaMLP(config)
         # Layer 0 (and progressive L1+): dual-norm Eagle path. Hawk / stock L1+: H only.
@@ -584,7 +593,10 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         num_layers = getattr(config, "num_hidden_layers", 1)
         mode = getattr(config, "eagle_aux_injection_mode", "fused_fc")
         self.progressive_staged = mode == "progressive_staged"
-        self.hawk = mode == "hawk"
+        # real_hawk (alias layer_skip_lora): hawk fuse on frozen target layers + LoRA.
+        self.real_hawk = mode in REAL_HAWK_MODES
+        self.layer_skip_lora = self.real_hawk  # back-compat alias
+        self.hawk = mode in HAWK_FUSE_MODES
         self.layers = nn.ModuleList(
             [LlamaDecoderLayeremb(config, layer_idx=i) for i in range(num_layers)]
         )
@@ -596,7 +608,7 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Stock Eagle3: early fc 3H→H then 2H Eagle L0.
         # Progressive: per-layer 2H concat inject, no fc.
-        # Hawk (progressive-only): per-layer ê=inject@w1+left@w2 (H), then H blocks.
+        # Hawk / real_hawk: per-layer ê=inject@w1+left@w2 (H), then H blocks.
         self._aux_inject: Optional[Tuple[torch.Tensor, ...]] = None
         # Per-layer draft outs from the last encode (progressive decode feedback).
         self._last_layer_outs: Optional[List[torch.Tensor]] = None
@@ -625,11 +637,21 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         # Required by new transformers gradient checkpointing format
         self.gradient_checkpointing = False
 
+        # transformers>=5 sets all_tied_weights_keys here; from_pretrained needs it.
+        self.post_init()
+
     def is_progressive_staged(self) -> bool:
         return bool(self.progressive_staged)
 
     def is_hawk(self) -> bool:
         return bool(self.hawk)
+
+    def is_real_hawk(self) -> bool:
+        return bool(getattr(self, "real_hawk", False))
+
+    def is_layer_skip_lora(self) -> bool:
+        """Back-compat alias for :meth:`is_real_hawk`."""
+        return self.is_real_hawk()
 
     @property
     def midlayer(self):
@@ -659,20 +681,36 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         return self.fc(hidden_states)
 
     def shift_aux_inject(
-        self, left: bool = False, allow_progressive_target_shift: bool = False
+        self,
+        left: bool = False,
+        allow_target_hs_warmup: bool = False,
+        allow_progressive_target_shift: bool = False,
     ):
         """Pad/shift stored per-layer aux injects.
 
-        Stock keeps the legacy no-op-ish path. Progressive may use this only
-        during explicit target-HS warmup; hawk never has target-shift semantics.
+        Stock keeps the legacy path. For ``progressive_staged`` / ``hawk``,
+        shifting target aux is the GT target-HS *warmup* path (trainer sets
+        ``allow_target_hs_warmup=True``). Outside warmup, draft-HS feedback
+        should replace injects instead — hard forbid is lifted; we only remind.
         """
-        if self.hawk or (
-            self.progressive_staged and not allow_progressive_target_shift
-        ):
-            raise RuntimeError(
-                "shift_aux_inject is forbidden for progressive_staged/hawk unless "
-                "explicit progressive target-HS warmup is enabled"
-            )
+        allow = bool(allow_target_hs_warmup or allow_progressive_target_shift)
+        if self.hawk or self.progressive_staged:
+            mode = "hawk" if self.hawk else "progressive eagle"
+            if allow:
+                if not getattr(self, "_reminded_target_hs_warmup_shift", False):
+                    logger.info(
+                        "target-HS warmup: shifting GT aux injects (%s).",
+                        mode,
+                    )
+                    self._reminded_target_hs_warmup_shift = True
+            elif not getattr(self, "_warned_target_hs_shift_without_flag", False):
+                logger.warning(
+                    "shift_aux_inject on %s is intended for target-HS warmup "
+                    "(GT aux). Prefer allow_target_hs_warmup=True from the "
+                    "trainer warmup path; proceeding anyway.",
+                    mode,
+                )
+                self._warned_target_hs_shift_without_flag = True
         if self._aux_inject is None:
             return
         from angelslim.compressor.speculative.utils import padding as pad_fn
@@ -822,8 +860,9 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
           Layer 0 left half ← random
           Layer i>0 left half ← predecessor (``layer_ids[i]-1``)
 
-        Hawk (progressive H fusion; fuse_w1/w2 stay random):
+        Hawk / real_hawk (H fusion; fuse_w1/w2 stay random):
           full H→H copy from ``layer_ids[i]`` for each draft layer.
+          ``real_hawk`` then freezes those weights and adds LoRA.
         """
         if layer_ids is None:
             return

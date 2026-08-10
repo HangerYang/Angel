@@ -224,13 +224,23 @@ def parse_args():
         ),
     )
     training_group.add_argument(
-        "--progressive_target_hs_warmup_steps",
+        "--target_hs_warmup_steps",
         type=int,
         default=0,
         help=(
-            "For progressive_staged training only, use shifted target auxiliary "
-            "hidden states for this many optimizer steps before switching to "
-            "draft hidden-state feedback. Default: 0."
+            "Target-HS warmup: for this many optimizer steps, teacher-force all "
+            "speculative substeps with shifted ground-truth aux hidden states "
+            "(progressive eagle GT if progressive_staged; hawk GT if hawk / "
+            "real_hawk), then switch to draft-HS feedback. Default: 0."
+        ),
+    )
+    training_group.add_argument(
+        "--progressive_target_hs_warmup_steps",
+        type=int,
+        default=None,
+        help=(
+            "Deprecated alias for --target_hs_warmup_steps. Used only when "
+            "--target_hs_warmup_steps is left at 0."
         ),
     )
     training_group.add_argument(
@@ -363,6 +373,58 @@ def train():
                 draft_model_config, "target_layer_weight_prefix", None
             ),
         )
+    injection_mode_early = getattr(
+        draft_model_config, "eagle_aux_injection_mode", "fused_fc"
+    )
+    from angelslim.compressor.speculative.train.models.draft.llama_eagle3 import (
+        HAWK_FUSE_MODES,
+        REAL_HAWK_MODES,
+    )
+
+    if injection_mode_early in REAL_HAWK_MODES:
+        from angelslim.compressor.speculative.train.models.draft.lora_utils import (
+            apply_real_hawk_training_setup,
+        )
+
+        if not init_from_target:
+            raise ValueError(
+                f"{injection_mode_early} requires draft_layer_init_from_target "
+                "(consumer layers after aux, e.g. [1,14,26] for aux [0,13,25])"
+            )
+        lora_info = apply_real_hawk_training_setup(
+            draft_model,
+            r=int(getattr(draft_model_config, "lora_r", 16)),
+            alpha=float(getattr(draft_model_config, "lora_alpha", 32)),
+            dropout=float(getattr(draft_model_config, "lora_dropout", 0.0)),
+            target_modules=list(
+                getattr(
+                    draft_model_config,
+                    "lora_target_modules",
+                    [
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "o_proj",
+                        "gate_proj",
+                        "up_proj",
+                        "down_proj",
+                    ],
+                )
+            ),
+        )
+        draft_model.config.eagle_aux_injection_mode = injection_mode_early
+        draft_model.config.lora_r = int(getattr(draft_model_config, "lora_r", 16))
+        draft_model.config.lora_alpha = float(
+            getattr(draft_model_config, "lora_alpha", 32)
+        )
+        rank0_print(
+            f"{injection_mode_early}: froze base draft layers (target copies); "
+            f"injected LoRA on {len(lora_info['lora_modules'])} linears; "
+            f"trainable={lora_info['num_trainable']:,} / "
+            f"{lora_info['num_total']:,} params "
+            "(LoRA + fuse_w1/w2 + norm/lm_head)"
+        )
+        rank0_print(f"  LoRA modules: {lora_info['lora_modules']}")
     if args.draft_model_name_or_path:
         if resume_checkpoints:
             rank0_print(
@@ -412,11 +474,11 @@ def train():
         if eagle_aux_ids is None:
             # AngelSlim train uses hs[id+1]; vLLM records after layer id directly.
             eagle_aux_ids = [int(i) + 1 for i in aux_ids]
-        if injection_mode == "progressive_staged":
+        if injection_mode in HAWK_FUSE_MODES or injection_mode == "progressive_staged":
             n_layers = int(getattr(draft_model_config, "num_hidden_layers", 1))
             if len(aux_ids) != n_layers:
                 raise ValueError(
-                    "progressive_staged requires len(aux_hidden_states_layer_ids) "
+                    f"{injection_mode} requires len(aux_hidden_states_layer_ids) "
                     f"== num_hidden_layers ({n_layers}), got {len(aux_ids)}"
                 )
     if eagle_aux_ids is not None:
@@ -532,7 +594,11 @@ def train():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        progressive_target_hs_warmup_steps=args.progressive_target_hs_warmup_steps,
+        target_hs_warmup_steps=(
+            args.target_hs_warmup_steps
+            if args.target_hs_warmup_steps
+            else (args.progressive_target_hs_warmup_steps or 0)
+        ),
     )
 
     # Start training

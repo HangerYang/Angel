@@ -2,6 +2,10 @@
 # Apply AngelSlim-tracked patches onto third_party/vllm (v0.25.0).
 # Safe / idempotent: skips patches that are already applied.
 #
+# Prefer after git pull (resets stale tree + reapplies everything):
+#   bash third_party/sync_vllm_latest.sh
+#
+# Apply-only:
 #   bash third_party/apply_vllm_patches.sh
 #
 # Called from link_local_vllm.sh after the wheel .so overlay so a fresh

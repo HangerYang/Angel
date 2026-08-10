@@ -136,21 +136,30 @@ def prepare_draft_config(
                 f"== num_hidden_layers ({num_layers}), got {len(eagle_aux_ids)}"
             )
         updates["num_aux_hidden_states"] = num_layers
-    elif injection_mode == "hawk":
-        # Progressive hawk: one aux stream per draft layer (same length checks).
+    elif injection_mode in ("hawk", "real_hawk", "layer_skip_lora"):
+        # Progressive hawk / real_hawk: one aux stream per draft layer.
         if aux_ids is not None and len(aux_ids) != num_layers:
             raise ValueError(
-                "hawk requires len(aux_hidden_states_layer_ids) "
+                f"{injection_mode} requires len(aux_hidden_states_layer_ids) "
                 f"== num_hidden_layers ({num_layers}), got {len(aux_ids)}"
             )
         if eagle_aux_ids is not None and len(eagle_aux_ids) != num_layers:
             raise ValueError(
-                "hawk requires len(eagle_aux_hidden_state_layer_ids) "
+                f"{injection_mode} requires len(eagle_aux_hidden_state_layer_ids) "
                 f"== num_hidden_layers ({num_layers}), got {len(eagle_aux_ids)}"
             )
         updates["num_aux_hidden_states"] = num_layers
+        if injection_mode in ("real_hawk", "layer_skip_lora"):
+            print(
+                f"  WARNING: {injection_mode} train ckpts keep LoRA A/B — merge first:\n"
+                "    python scripts/speculative/smolvlm/export_real_hawk_for_vllm.py \\\n"
+                "      --draft_model <ckpt> --output_dir <merged>\n"
+                "  Then eval the merged dir with eagle_aux_injection_mode=hawk."
+            )
+            # Still stamp hawk so a mistaken direct eval is closer to working
+            # only after merge; leave mode as-is here and let export rewrite.
         print(
-            "  hawk: vLLM loads fuse_w1/fuse_w2; needs progressive patch "
+            "  hawk fuse: vLLM loads fuse_w1/fuse_w2; needs progressive patch "
             "(third_party/patches/vllm-v0.25.0-eagle3-progressive-staged.patch)."
         )
 
