@@ -13,7 +13,17 @@
 # limitations under the License.
 
 from .draft_model_factory import DraftModelConfig, create_draft_model
-from .llama_eagle3 import CosyVoice3Eagle3LlamaForCausalLM, Eagle3LlamaForCausalLM
+from .llama_eagle3 import (
+    CosyVoice3Eagle3LlamaForCausalLM,
+    Eagle3LlamaForCausalLM,
+    HAWK_FUSE_MODES,
+    REAL_HAWK_MODES,
+)
+from .lora_utils import (
+    apply_layer_skip_lora_training_setup,
+    apply_real_hawk_training_setup,
+    merge_lora_into_state_dict,
+)
 from .qwen_dflare import QwenDFlareDraftModel
 from .qwen_dflash import QwenDFlashDraftModel
 
@@ -24,4 +34,9 @@ __all__ = [
     "CosyVoice3Eagle3LlamaForCausalLM",
     "QwenDFlashDraftModel",
     "QwenDFlareDraftModel",
+    "HAWK_FUSE_MODES",
+    "REAL_HAWK_MODES",
+    "apply_real_hawk_training_setup",
+    "apply_layer_skip_lora_training_setup",
+    "merge_lora_into_state_dict",
 ]

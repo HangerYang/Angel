@@ -30,10 +30,10 @@ index 13a19b8..dbf23e4
  
 diff --git a/vllm/model_executor/models/eagle_miracle.py b/vllm/model_executor/models/eagle_miracle.py
 new file mode 100644
-index 0000000..9a0b486
+index 0000000..f4e779b
 --- /dev/null
 +++ b/vllm/model_executor/models/eagle_miracle.py
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,357 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""AngelSlim Eagle miracle mode: oracle GT target-HS along a trajectory.
@@ -263,15 +263,73 @@ index 0000000..9a0b486
 +    return n_saved
 +
 +
++def _tape_row(
++    sample_idx: int,
++    pos: int,
++    *,
++    device: torch.device,
++    dtype: torch.dtype,
++) -> torch.Tensor | None:
++    """Return tape[sample][pos] as [N, H] on device/dtype, or None."""
++    if sample_idx < 0 or sample_idx >= len(_TAPES) or _TAPES[sample_idx] is None:
++        return None
++    tape = _TAPES[sample_idx]
++    assert tape is not None
++    if tape.shape[0] == 0:
++        return None
++    if pos < 0 or pos >= tape.shape[0]:
++        pos = min(max(pos, 0), tape.shape[0] - 1)
++    return tape[pos].to(device=device, dtype=dtype)
++
++
++def apply_miracle_window(
++    model: Any,
++    positions: torch.Tensor,
++    req_ids: list[str],
++    num_tokens: int,
++    combine_fn,
++) -> torch.Tensor | None:
++    """USE step-0: replace the full verify-window inject with tape[pos].
++
++    Matches train ``acc_0``: at every position t, inject target aux[t] (not
++    live-verify alone, and never draft feedback). Offline miracle is
++    ``max_num_seqs=1``, so the window belongs to ``req_ids[0]``.
++    """
++    if not is_use() or num_tokens <= 0 or not req_ids:
++        return None
++    idx = bind_req(req_ids[0])
++    if idx is None:
++        return None
++    per_layer = bool(getattr(model, "per_layer_aux", False))
++    draft_dtype = next(model.parameters()).dtype
++    device = positions.device
++    rows: list[torch.Tensor] = []
++    for t in range(num_tokens):
++        pos = int(positions[t].item())
++        row = _tape_row(idx, pos, device=device, dtype=draft_dtype)
++        if row is None:
++            return None
++        rows.append(row)  # [N, H]
++    stacked = torch.stack(rows, dim=0)  # [T, N, H]
++    n = stacked.shape[1]
++    if per_layer:
++        gathered = [stacked[:, j, :] for j in range(n)]  # each [T, H]
++        model.set_aux_inject(gathered)
++        return gathered[0]
++    flat = stacked.reshape(num_tokens, -1)  # [T, N*H]
++    return combine_fn(flat)
++
++
 +def apply_miracle_hs(
 +    model: Any,
 +    positions: torch.Tensor,
 +    req_ids: list[str],
 +    combine_fn,
 +) -> torch.Tensor | None:
-+    """Use-phase: set inject / return L0 seed (or fused seed) for each req.
++    """Use-phase decode step: set inject / return L0 seed for each req.
 +
 +    ``positions`` is [num_reqs] absolute positions of the current draft token.
++    Same alignment as train step 0: input token at ``pos`` + target aux[pos].
 +    """
 +    if not is_use():
 +        return None
@@ -279,24 +337,19 @@ index 0000000..9a0b486
 +    seeds: list[torch.Tensor] = []
 +    per_layer = bool(getattr(model, "per_layer_aux", False))
 +    injects: list[list[torch.Tensor]] | None = [] if per_layer else None
++    draft_dtype = next(model.parameters()).dtype
 +
 +    for i in range(num_reqs):
 +        req_id = req_ids[i] if i < len(req_ids) else None
 +        if req_id is None:
 +            return None
 +        idx = bind_req(req_id)
-+        if idx is None or _TAPES[idx] is None:
++        if idx is None:
 +            return None
-+        tape = _TAPES[idx]
-+        assert tape is not None
 +        pos = int(positions[i].item())
-+        if pos < 0 or pos >= tape.shape[0]:
-+            # Fall back to last available GT row.
-+            pos = min(max(pos, 0), tape.shape[0] - 1)
-+        row = tape[pos].to(device=positions.device, dtype=tape.dtype)  # [N, H]
-+        # Match draft dtype if needed.
-+        draft_dtype = next(model.parameters()).dtype
-+        row = row.to(dtype=draft_dtype)
++        row = _tape_row(idx, pos, device=positions.device, dtype=draft_dtype)
++        if row is None:
++            return None
 +        if per_layer:
 +            chunks = [row[j] for j in range(row.shape[0])]
 +            assert injects is not None
@@ -307,7 +360,6 @@ index 0000000..9a0b486
 +            seeds.append(combine_fn(flat).squeeze(0))
 +
 +    if per_layer and injects:
-+        # Batch inject: stack each layer's rows → [num_reqs, H]
 +        n = len(injects[0])
 +        gathered = [
 +            torch.stack([injects[r][j] for r in range(num_reqs)], dim=0)
@@ -340,7 +392,7 @@ index 0000000..9a0b486
 +            draft_tokens_col[i] = tok
 +
 diff --git a/vllm/model_executor/models/llama_eagle3.py b/vllm/model_executor/models/llama_eagle3.py
-index 2d859bd..c52806e 100644
+index 2d859bd..dacdf78 100644
 --- a/vllm/model_executor/models/llama_eagle3.py
 +++ b/vllm/model_executor/models/llama_eagle3.py
 @@ -1,6 +1,7 @@
@@ -670,7 +722,7 @@ index 2d859bd..c52806e 100644
  
          if self.model.norm_before_fc:
              hidden_states = self.model.input_norm(hidden_states)
-@@ -378,6 +552,51 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -378,6 +552,66 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
  
          return self.model.fc(hidden_states)
  
@@ -711,7 +763,7 @@ index 2d859bd..c52806e 100644
 +        positions: torch.Tensor,
 +        req_ids: list[str],
 +    ) -> torch.Tensor | None:
-+        """Use-phase: inject GT target aux at absolute ``positions``."""
++        """Use-phase decode: inject GT target aux at absolute ``positions``."""
 +        return eagle_miracle.apply_miracle_hs(
 +            self.model,
 +            positions,
@@ -719,10 +771,25 @@ index 2d859bd..c52806e 100644
 +            combine_fn=self.combine_hidden_states,
 +        )
 +
++    def apply_miracle_window(
++        self,
++        positions: torch.Tensor,
++        req_ids: list[str],
++        num_tokens: int,
++    ) -> torch.Tensor | None:
++        """Use-phase step 0: tape inject over the full verify/prefill window."""
++        return eagle_miracle.apply_miracle_window(
++            self.model,
++            positions,
++            req_ids,
++            num_tokens,
++            combine_fn=self.combine_hidden_states,
++        )
++
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
          model_weights = {}
          includes_draft_id_mapping = False
-@@ -420,8 +639,12 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -420,8 +654,12 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
              skip_substrs.append("draft_id_to_target_id")
          if not includes_embed_tokens:
              skip_substrs.append("embed_tokens")
@@ -737,7 +804,7 @@ index 2d859bd..c52806e 100644
              skip_substrs.append("input_norm.")
          loader = AutoWeightsLoader(
 diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-index 747fb3a..89a9b64 100644
+index 747fb3a..78f3acf 100644
 --- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 @@ -22,6 +22,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
@@ -748,7 +815,7 @@ index 747fb3a..89a9b64 100644
  from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
  
  logger = init_logger(__name__)
-@@ -174,6 +175,49 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -174,6 +175,63 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              hidden_states = last_hidden_states
          self.hidden_states[:num_tokens].copy_(hidden_states)
  
@@ -765,6 +832,7 @@ index 747fb3a..89a9b64 100644
 +                eagle_miracle.bind_req(r) is not None for r in self._miracle_req_ids
 +            )
 +        )
++        n_rec = int(input_batch.num_tokens)
 +        if (
 +            self._miracle_active
 +            and eagle_miracle.is_capture()
@@ -773,12 +841,25 @@ index 747fb3a..89a9b64 100644
 +            # Record against *target* positions (input_batch), not draft
 +            # input_buffers — those are still stale until prepare_prefill_inputs.
 +            # Use num_tokens (no cudagraph pad) so pad slots do not clobber tape[0].
-+            n_rec = int(input_batch.num_tokens)
 +            eagle_miracle.record_verify_aux(
 +                req_ids=self._miracle_req_ids,
 +                positions=input_batch.positions[:n_rec],
 +                num_tokens=n_rec,
 +            )
++        # USE step 0 must look like train acc_0: inject tape[pos] over the
++        # whole window (teacher-forced target HS), not merely live verify.
++        if (
++            self._miracle_active
++            and eagle_miracle.is_use()
++            and aux_hidden_states
++        ):
++            seed = self.model.apply_miracle_window(
++                input_batch.positions[:n_rec],
++                self._miracle_req_ids,
++                n_rec,
++            )
++            if seed is not None:
++                self.hidden_states[:n_rec].copy_(seed)
 +
 +        # ---------------------------------------------------------------------
 +        # [ANGELSLIM EAGLE BP#2] Target → draft handoff (hidden states).
@@ -798,17 +879,20 @@ index 747fb3a..89a9b64 100644
          self._copy_request_inputs(
              num_reqs,
              input_batch.idx_mapping,
-@@ -248,6 +292,27 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -248,6 +306,30 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              advance_draft_positions=self.advance_draft_positions,
          )
  
-+        # Miracle USE: after position advance, inject GT HS at the new abs pos.
-+        # Fall back to draft feedback if tape lookup fails (keeps hawk injects
-+        # shaped like decode tokens).
++        # Miracle USE steps 1+: inject tape[pos] (train acc_0 target-HS).
++        # Input token is already the just-sampled draft token at ``pos``; do
++        # **not** overwrite from phase-A GT ids (those can disagree with the
++        # live temp-0 path and collapse pos_1+). When pos_0 was correct,
++        # input==GT[pos] naturally.
 +        if getattr(self, "_miracle_active", False) and eagle_miracle.is_use():
++            req_ids = getattr(self, "_miracle_req_ids", []) or []
 +            seed = self.model.apply_miracle_hs(
 +                self.input_buffers.positions[:num_reqs],
-+                getattr(self, "_miracle_req_ids", []) or [],
++                req_ids,
 +            )
 +            if seed is not None:
 +                self.hidden_states[:num_reqs] = seed
@@ -826,7 +910,7 @@ index 747fb3a..89a9b64 100644
          # Each request produces exactly 1 token per draft generation step,
          # enabling FULL graph replay.
          decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-@@ -362,12 +427,29 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -362,12 +444,30 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              self.current_draft_step,
              self.draft_logits,
          )
@@ -843,20 +927,21 @@ index 747fb3a..89a9b64 100644
              self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
          self.input_buffers.positions[:num_reqs] = positions
  
-+        # Progressive/hawk: always refresh injects to decode shape after step 0.
-+        # Miracle USE overwrites with GT tape after prepare_decode_inputs.
-+        draft_inner = getattr(self.model, "model", None)
-+        if draft_inner is not None and getattr(draft_inner, "per_layer_aux", False):
-+            seed = self.model.take_progressive_draft_feedback(
-+                token_indices=last_token_indices
-+            )
-+            if seed is not None:
-+                self.hidden_states[:num_reqs] = seed
++        # Progressive/hawk: draft-HS feedback after step 0 — unless miracle USE,
++        # which keeps target-tape injects (train acc_0) for every AR step.
++        if not (getattr(self, "_miracle_active", False) and eagle_miracle.is_use()):
++            draft_inner = getattr(self.model, "model", None)
++            if draft_inner is not None and getattr(draft_inner, "per_layer_aux", False):
++                seed = self.model.take_progressive_draft_feedback(
++                    token_indices=last_token_indices
++                )
++                if seed is not None:
++                    self.hidden_states[:num_reqs] = seed
 +
      def _multi_step_decode(
          self,
          num_reqs: int,
-@@ -382,6 +464,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -382,6 +482,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
          attn_metadata = None
          slot_mappings_by_layer = None
          for step in range(1, self.num_speculative_steps):
@@ -876,7 +961,7 @@ index 747fb3a..89a9b64 100644
              # Rebuild every step when positions advance, or just once
              # on the first step when positions are constant (Gemma4 MTP).
              if not skip_attn and (self.advance_draft_positions or step == 1):
-@@ -451,6 +546,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -451,6 +564,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              self.draft_logits,
          )
  
@@ -891,21 +976,28 @@ index 747fb3a..89a9b64 100644
          # Update the inputs for the next step.
          update_draft_inputs(
              draft_tokens,
-@@ -465,6 +568,23 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -465,6 +586,30 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              advance_draft_positions=self.advance_draft_positions,
          )
  
-+        # Next-step HS after position advance.
++        # Next-step HS after position advance (skip on final draft step).
++        step_now = int(self.current_draft_step.item())
++        has_next = step_now < self.num_speculative_steps - 1
 +        used_miracle = False
-+        if getattr(self, "_miracle_active", False) and eagle_miracle.is_use():
++        if (
++            has_next
++            and getattr(self, "_miracle_active", False)
++            and eagle_miracle.is_use()
++        ):
++            req_ids = getattr(self, "_miracle_req_ids", []) or []
 +            seed = self.model.apply_miracle_hs(
 +                self.input_buffers.positions[:num_reqs],
-+                getattr(self, "_miracle_req_ids", []) or [],
++                req_ids,
 +            )
 +            if seed is not None:
 +                self.hidden_states[:num_reqs] = seed
 +                used_miracle = True
-+        if not used_miracle:
++        if has_next and not used_miracle:
 +            draft_inner = getattr(self.model, "model", None)
 +            if draft_inner is not None and getattr(draft_inner, "per_layer_aux", False):
 +                seed = self.model.take_progressive_draft_feedback(num_tokens=num_reqs)

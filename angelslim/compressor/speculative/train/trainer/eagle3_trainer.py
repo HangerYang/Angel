@@ -47,9 +47,15 @@ class Eagle3Trainer(Trainer, ABC):
             length: Number of speculative decoding steps
             **kwargs: Additional arguments passed to parent Trainer
         """
-        self.progressive_target_hs_warmup_steps = int(
-            kwargs.pop("progressive_target_hs_warmup_steps", 0) or 0
-        )
+        # GT target-HS warmup steps (alias: progressive_target_hs_warmup_steps).
+        warmup = kwargs.pop("target_hs_warmup_steps", None)
+        if warmup is None:
+            warmup = kwargs.pop("progressive_target_hs_warmup_steps", 0)
+        else:
+            kwargs.pop("progressive_target_hs_warmup_steps", None)
+        self.target_hs_warmup_steps = int(warmup or 0)
+        # Back-compat alias used by older call sites / logs.
+        self.progressive_target_hs_warmup_steps = self.target_hs_warmup_steps
         super().__init__(model=draft_model, **kwargs)
         self.length = length
         self._train_start_time = None
@@ -58,6 +64,7 @@ class Eagle3Trainer(Trainer, ABC):
         self._eval_pending_log: dict = {}
         self._eval_pending_log_count: int = 0
         self._logged_draft_hs_feedback = False
+        self._logged_target_hs_warmup = False
         # Set by create_optimizer() for non-DeepSpeed bf16 DDP (ZeRO-equivalent).
         self._fp32_optimizer = None
 
@@ -338,13 +345,30 @@ class Eagle3Trainer(Trainer, ABC):
         sl1_layer_count = [0] * max(n_draft_layers, 0)
         # How many speculative tokens (1-indexed) to include in the metric.
         sl1_token_budget = min(3, self.length)
-        progressive_target_shift_warmup = (
+        # Warmup: always teacher-force with shifted GT target aux HS.
+        # progressive eagle → progressive GT; hawk / real_hawk → hawk GT.
+        target_hs_warmup = (
             log_prefix == "train"
-            and getattr(draft, "progressive_staged", False)
-            and self.progressive_target_hs_warmup_steps > 0
-            and getattr(self.state, "global_step", 0)
-            < self.progressive_target_hs_warmup_steps
+            and (
+                getattr(draft, "progressive_staged", False)
+                or getattr(draft, "hawk", False)
+            )
+            and self.target_hs_warmup_steps > 0
+            and getattr(self.state, "global_step", 0) < self.target_hs_warmup_steps
         )
+        if target_hs_warmup and not getattr(self, "_logged_target_hs_warmup", False):
+            warmup_kind = (
+                "progressive eagle GT"
+                if getattr(draft, "progressive_staged", False)
+                else "hawk GT"
+            )
+            logger.info(
+                "Eagle3 target-HS warmup (%s): steps 0..%d use shifted ground-truth "
+                "aux HS on every speculative substep; after that, draft-HS feedback.",
+                warmup_kind,
+                self.target_hs_warmup_steps - 1,
+            )
+            self._logged_target_hs_warmup = True
         if hasattr(draft, "init_cache_hidden"):
             cache_hidden = draft.init_cache_hidden()
         else:
@@ -434,16 +458,16 @@ class Eagle3Trainer(Trainer, ABC):
                     target_aux_tape = tuple(
                         padding(t, left=False) for t in target_aux_tape
                     )
-                # Progressive warmup can teacher-force with shifted target HS for
-                # all speculative substeps. Outside warmup, progressive/hawk use
-                # same-depth draft outs (h0/h1/h2).
-                if progressive_target_shift_warmup:
+                # Warmup: teacher-force with shifted GT target HS for all
+                # speculative substeps (progressive eagle GT or hawk GT).
+                # Outside warmup, progressive/hawk use same-depth draft outs.
+                if target_hs_warmup:
                     if not hasattr(draft, "shift_aux_inject"):
                         raise RuntimeError(
-                            "progressive target-HS warmup requires shift_aux_inject"
+                            "target-HS warmup requires shift_aux_inject"
                         )
                     draft.shift_aux_inject(
-                        left=False, allow_progressive_target_shift=True
+                        left=False, allow_target_hs_warmup=True
                     )
                     target_shift_applied += 1
                 elif use_draft_feedback:
@@ -501,16 +525,14 @@ class Eagle3Trainer(Trainer, ABC):
 
         if (
             use_draft_feedback
-            and not progressive_target_shift_warmup
+            and not target_hs_warmup
             and feedback_applied != max(self.length - 1, 0)
         ):
             raise RuntimeError(
                 f"draft-HS feedback expected {max(self.length - 1, 0)} applies, "
                 f"got {feedback_applied}"
             )
-        if progressive_target_shift_warmup and target_shift_applied != max(
-            self.length - 1, 0
-        ):
+        if target_hs_warmup and target_shift_applied != max(self.length - 1, 0):
             raise RuntimeError(
                 f"target-HS warmup expected {max(self.length - 1, 0)} applies, "
                 f"got {target_shift_applied}"
@@ -530,7 +552,7 @@ class Eagle3Trainer(Trainer, ABC):
         )
         log[f"{log_prefix}/target_hs_warmup"] = (
             float(target_shift_applied) / float(max(self.length - 1, 1))
-            if progressive_target_shift_warmup
+            if target_hs_warmup
             else 0.0
         )
         # Per-layer Smooth-L1(draft h_i, target aux_i), averaged over tokens 1..3.

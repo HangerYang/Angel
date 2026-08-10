@@ -15,14 +15,15 @@
 #   DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
 #     DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
 #     bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
-#   # → .../checkpoint-30000/eval/textvqa/results.jsonl
 #
 #   USE_EAGLE=0 bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
 #
 #   MIRACLE_MODE=1 DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
 #     DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
 #     bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
-#   # → .../checkpoint-30000/eval/textvqa_miracle/results.jsonl
+#
+# After git pull, refresh local vLLM patches (universal):
+#   bash third_party/sync_vllm_latest.sh && source third_party/env.sh
 #
 # See scripts/speculative/smolvlm/README.md § Eval + "Where to update vLLM".
 
@@ -38,33 +39,79 @@ if [[ -f "${ROOT}/third_party/env.sh" ]]; then
 fi
 
 CONFIG_DIR=angelslim/compressor/speculative/train/configs
+
+# TARGET_MODEL — frozen target VLM for vLLM. HF id or local path.
+#   Default: HuggingFaceTB/SmolVLM-256M-Instruct
 TARGET_MODEL="${TARGET_MODEL:-HuggingFaceTB/SmolVLM-256M-Instruct}"
+
+# DRAFT_MODEL — draft checkpoint dir (or parent OUTPUT_DIR; script picks latest checkpoint-*).
+#   Options:
+#     path/to/checkpoint-NNNN   — preferred (has config.json + weights)
+#     path/to/output_dir        — auto-resolves newest checkpoint-*
+#   Required when USE_EAGLE=1. Ignored for baseline (USE_EAGLE=0).
 DRAFT_MODEL="${DRAFT_MODEL:-output/smolvlm_256m_eagle3_online}"
+
+# DRAFT_MODEL_CONFIG_PATH — train-time draft JSON used to fill missing vLLM fields
+#   (num_hidden_layers, eagle_aux_hidden_state_layer_ids, injection mode).
+#   Options: same configs as train (eagle3 | progressive | hawk | real_hawk | ...).
+#   Example: .../smolvlm-256m-hawk.json
 DRAFT_MODEL_CONFIG_PATH="${DRAFT_MODEL_CONFIG_PATH:-${CONFIG_DIR}/smolvlm-256m-eagle3.json}"
+
+# DATASET — HF dataset id or local jsonl path.
+#   Examples: lmms-lab/textvqa | lmms-lab/MMMU | path/to/data.jsonl
 DATASET="${DATASET:-lmms-lab/textvqa}"
-# OUTPUT_FILE default (set below after draft resolve):
-#   {DRAFT_MODEL}/eval/{data_name}/results.jsonl
-#   {DRAFT_MODEL}/eval/{data_name}_miracle/results.jsonl   # MIRACLE_MODE=1
-#   results/baseline/eval/{data_name}/results.jsonl        # USE_EAGLE=0
-# Override anytime with OUTPUT_FILE=...
+
+# OUTPUT_FILE — results jsonl path. Empty (default) → auto layout under draft/eval/<data>/...
+#   Override anytime: OUTPUT_FILE=results/my_run.jsonl
 OUTPUT_FILE="${OUTPUT_FILE:-}"
+
+# USE_EAGLE — enable speculative Eagle3 draft.
+#   Options: 1 (default, use draft) | 0 (baseline target-only, no draft)
 USE_EAGLE="${USE_EAGLE:-1}"
+
+# MIRACLE_MODE — oracle GT target-HS inject along target trajectory (upper bound).
+#   Options: 0 (default, normal eagle) | 1 (miracle capture+use; forces MAX_NUM_SEQS=1)
+#   Needs TEMP=0. Alias: ASSISTANCE_MODE (deprecated).
 MIRACLE_MODE="${MIRACLE_MODE:-0}"
 # Back-compat: old ASSISTANCE_MODE name now means miracle.
 if [[ "${ASSISTANCE_MODE:-0}" != "0" && "${MIRACLE_MODE}" == "0" ]]; then
   echo "NOTE: ASSISTANCE_MODE is deprecated; treating as MIRACLE_MODE=1" >&2
   MIRACLE_MODE="${ASSISTANCE_MODE}"
 fi
+
+# NUM_PROMPTS — how many dataset examples to eval. Typical: 2 (smoke) | 80 | 200
 NUM_PROMPTS="${NUM_PROMPTS:-80}"
+
+# NUM_SPEC_TOKENS — speculative draft depth K (tokens proposed per verify). Typical: 3|4|5
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-4}"
+
+# MAX_NUM_SEQS — vLLM concurrent sequences. Miracle forces 1. Typical: 1 (acceptance metrics) | 8+
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
+
+# MAX_MODEL_LEN — vLLM context length cap. Must cover prompt+output. Typical: 4096|8192
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+
+# OUTPUT_LEN — max new tokens to generate per prompt. Typical: 32 (smoke) | 256|1024
 OUTPUT_LEN="${OUTPUT_LEN:-1024}"
+
+# TEMP — sampling temperature. Use 0 for greedy / miracle. Typical: 0 | 0.7
 TEMP="${TEMP:-0}"
+
+# TP — tensor-parallel size across GPUs for one engine. Typical: 1 (SmolVLM-256M)
 TP="${TP:-1}"
+
+# GPU_MEMORY_UTILIZATION — vLLM GPU mem fraction. Typical: 0.7|0.9
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+
+# CUDA_VISIBLE_DEVICES — which GPU(s) this eval sees. Example: 0 | 0,1
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+# MIRACLE_HS_DIR — optional dir to keep miracle tapes ({i:05d}.pt). Empty = temp under run.
+#   Example: MIRACLE_HS_DIR=results/miracle_smoke_hs
 MIRACLE_HS_DIR="${MIRACLE_HS_DIR:-}"
+
+# DEBUG — 1 enables --debug (EngineCore in-process for breakpoints). Options: 0|1
+# PDB   — 1 enables --pdb (ipdb on breakpoint()). Options: 0|1
 DEBUG_ARGS=()
 if [[ "${DEBUG:-0}" == "1" ]]; then
   DEBUG_ARGS+=(--debug)

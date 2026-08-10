@@ -206,6 +206,42 @@ the eval script auto-picks the latest). Miracle requires `max_num_seqs=1`
 `Eagle3 miracle mode`. Timed metrics are **phase C only** (GT capture is not
 timed). Re-apply the progressive patch after pull (includes `eagle_miracle.py`).
 
+### Real hawk (frozen target layers + LoRA)
+
+Config: `angelslim/.../configs/smolvlm-256m-real-hawk.json`
+
+vLLM-compatible **equivalent** of “draft inside the target”: separate draft with
+the same embed, **frozen copies** of target layers `[1,14,26]`, hawk
+`fuse_w1`/`fuse_w2`, and **LoRA** on attn+MLP. Train only LoRA + fuse +
+`norm`/`lm_head`. (`layer_skip_lora` / `smolvlm-256m-layer-skip-lora.json` is a
+back-compat alias.)
+
+```text
+aux HS₀  → draft L0 = target.layers[1]  + LoRA
+aux HS₁₃ → draft L1 = target.layers[14] + LoRA
+aux HS₂₅ → draft L2 = target.layers[26] + LoRA
+```
+
+```bash
+# Train
+DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-real-hawk.json \
+  OUTPUT_DIR=output/smolvlm_256m_real_hawk \
+  bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+
+# ONE-MODEL speed eval (shared W + LoRA on draft only) — report THIS speedup
+DRAFT_MODEL=output/smolvlm_256m_real_hawk_nccl/checkpoint-XXXX \
+  bash scripts/speculative/smolvlm/eval_real_hawk_one_model.sh
+
+# Optional: merged 2-model vLLM hawk (faster path, NOT the one-model claim)
+python scripts/speculative/smolvlm/export_real_hawk_for_vllm.py \
+  --draft_model output/smolvlm_256m_real_hawk/checkpoint-XXXX \
+  --output_dir output/smolvlm_256m_real_hawk_merged
+
+DRAFT_MODEL=output/smolvlm_256m_real_hawk_merged \
+  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
+  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
+```
+
 ### Progressive staged injection (experiment)
 
 Config: `angelslim/.../configs/smolvlm-256m-eagle3-progressive.json`
@@ -245,25 +281,14 @@ DRAFT_MODEL=output/smolvlm_256m_eagle3_progressive/checkpoint-* \
 Requires the local vLLM progressive patch
 (`third_party/patches/vllm-v0.25.0-eagle3-progressive-staged.patch`).
 
-After `git pull`, if an older progressive patch was already applied under
-`third_party/vllm`, reset those files then re-apply (otherwise `git apply`
-can fail on a dirty tree):
+**After every `git pull`**, refresh local vLLM from tracked patches (universal):
 
 ```bash
-cd third_party/vllm
-git checkout -- vllm/envs.py \
-  vllm/model_executor/models/llama_eagle3.py \
-  vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-rm -f vllm/model_executor/models/eagle_miracle.py
-cd ../..
-bash third_party/apply_vllm_patches.sh
+bash third_party/sync_vllm_latest.sh
 source third_party/env.sh
 ```
 
-If those files were never patched on this machine, you can skip the
-`git checkout` and only run `apply_vllm_patches.sh` (or
-`bash third_party/link_local_vllm.sh`). Look for log line
-`Eagle3 progressive_staged enabled` at draft load.
+Look for log line `Eagle3 progressive_staged enabled` at draft load.
 
 Stock `fused_fc` remains the default when the mode field is omitted.
 
@@ -399,16 +424,10 @@ C) timed eagle with `tape[pos]` inject. Metrics are from **C only**.
 | B | Eagle **capture**: force draft onto GT path; record verify aux at absolute positions → `{i:05d}.pt` | no |
 | C | Eagle **use**: inject `tape[pos]` each draft step | **yes** |
 
-**After `git pull`**, reset then re-apply the progressive patch (ships `eagle_miracle.py`):
+**After every `git pull`**, refresh local vLLM (universal — includes miracle):
 
 ```bash
-cd third_party/vllm
-git checkout -- vllm/envs.py \
-  vllm/model_executor/models/llama_eagle3.py \
-  vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-rm -f vllm/model_executor/models/eagle_miracle.py
-cd ../..
-bash third_party/apply_vllm_patches.sh
+bash third_party/sync_vllm_latest.sh
 source third_party/env.sh
 ```
 
@@ -458,11 +477,16 @@ tapes. (`ASSISTANCE_MODE` is a deprecated alias for `MIRACLE_MODE`.)
   draft buffers. Offline req ids are `{prompt_index}-{hex}`; warmup ids are
   ignored so USE init does not skip hawk draft-HS refresh.
 - Output defaults to `{DRAFT_MODEL}/eval/{data}_miracle/results.jsonl`.
-- **Hawk / progressive:** train uses target aux on draft step 0 and **draft
-  feedback** on steps 1+. Miracle still injects GT target tape on 1+ as an
-  oracle upper bound; that is OOD vs hawk training, so mean acceptance may be
-  close to (or slightly below) non-miracle hawk. Prefer **fused Eagle3** when
-  you want a clear target-shift upper bound.
+- **Train `acc_0` alignment:** every USE draft step injects `tape[pos]` with
+  input token at `pos` (same as train step 0 / target HS). Step 0 also
+  overwrites the full verify window with the tape. Steps 1+ skip draft-HS
+  feedback. Do **not** rewrite AR inputs from phase-A GT ids — when `pos_0`
+  matches, the sampled token already is the on-path token; forcing phase-A
+  ids can disagree with the live path and collapse `pos_1+`.
+- Hawk train still uses draft feedback on steps 1+, so miracle (target tape
+  on 1+) is the stronger “always `acc_0`-like HS” oracle; expect ≥ baseline
+  when wiring is correct, not a large free lunch if draft feedback is already
+  close.
 
 Before calling vLLM, the eval script runs:
 
@@ -484,27 +508,28 @@ Underlying runner (shared with Qwen3-VL / Hunyuan):
 Requires local vLLM overlay with the **tracked** SmolVLM Eagle3 patch applied
 (see below). Stock vLLM raises `Model does not support EAGLE3 interface`.
 
-### Portability (other servers)
+### Portability (other servers) — always get the latest
 
 Do **not** hand-edit only `third_party/vllm` on one machine — that tree is not
-what other servers get. Eagle3 for SmolVLM is shipped as:
+what other servers get. Eagle3/progressive/hawk/miracle live as tracked
+patches under `third_party/patches/`.
 
-`third_party/patches/vllm-v0.25.0-smolvlm-eagle3.patch`
-
-On every server (clones vLLM v0.25.0 if needed):
+**Universal refresh** (after every `git pull`, any machine):
 
 ```bash
-# CUDA 13.0 (default)
-bash third_party/install_local_vllm.sh
-
-# CUDA 12.6 server (source build; needs toolkit / nvcc)
-VLLM_CUDA=12.6 bash third_party/install_local_vllm.sh
-
+bash third_party/sync_vllm_latest.sh
 source third_party/env.sh
 ```
 
-Or only re-apply patches: `bash third_party/apply_vllm_patches.sh`  
-Details: `third_party/README.md`.
+First-time / new CUDA machine (once):
+
+```bash
+# CUDA 13.0 (default) — or VLLM_CUDA=12.6 / 12.9
+bash third_party/install_local_vllm.sh
+source third_party/env.sh
+```
+
+Details: `third_party/README.md`, `third_party/patches/README.md`.
 
 ---
 
@@ -527,4 +552,5 @@ When Eagle3 eval breaks or you need to change behavior, these are the touch poin
 | **Miracle GT-HS (capture/use)** | `third_party/vllm/.../eagle_miracle.py` + progressive patch | Oracle tape inject; `MIRACLE_MODE=1` |
 | **Train draft JSON** | `angelslim/.../configs/smolvlm-256m-eagle3.json` | `num_hidden_layers`, aux ids, optional init |
 
-Setup: `bash third_party/link_local_vllm.sh && source third_party/env.sh` (see `third_party/README.md`).
+Setup / refresh: `bash third_party/sync_vllm_latest.sh && source third_party/env.sh`  
+(first machine: `bash third_party/install_local_vllm.sh`; see `third_party/README.md`).

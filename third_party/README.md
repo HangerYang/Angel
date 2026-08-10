@@ -35,6 +35,19 @@ the matching torch/vLLM bits, then runs `link_local_vllm.sh` (`.so` overlay +
 Do **not** rely on hand-edited files inside `third_party/vllm` — those do not
 travel to other servers. Edit the `.patch` files under `third_party/patches/` instead.
 
+### Always get the latest patches (universal)
+
+After every `git pull` of AngelSlim:
+
+```bash
+bash third_party/sync_vllm_latest.sh
+source third_party/env.sh
+```
+
+Resets `third_party/vllm` to clean `v0.25.0` and re-applies all tracked
+patches. Optional: `LINK=1 bash third_party/sync_vllm_latest.sh` to also
+re-run the `.so` overlay / `.pth` link.
+
 Verify:
 
 ```bash
