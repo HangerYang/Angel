@@ -611,14 +611,12 @@ class Eagle3Trainer(Trainer, ABC):
         with deepspeed.zero.GatheredParameters(self.model.parameters()):
             state_dict = self.model.state_dict()
 
-        draft_model_state_dict = {k: v for k, v in state_dict.items() if "embed" not in k}
-
         # Only main process saves the model
         if self.args.should_save and self.accelerator.is_main_process:
             self.model.save_pretrained(
                 output_dir,
                 is_main_process=True,
-                state_dict=draft_model_state_dict,
+                state_dict=state_dict,
                 save_function=torch.save,
             )
 

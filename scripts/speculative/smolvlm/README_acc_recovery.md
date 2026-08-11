@@ -18,7 +18,8 @@ Despite the historical file name, the helper supports:
 Real-hawk / LoRA checkpoints currently need a loader fix before using this
 helper. A smoke run showed missing/unexpected LoRA/base weights when loading an
 unmerged real-hawk checkpoint, so do not trust real-hawk numbers from this
-helper until that is fixed.
+helper until that is fixed. `embed_tokens.weight` should be present in normal
+training checkpoints and public packs.
 
 ## Future SmolVLM Config Convention
 
