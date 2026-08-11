@@ -1,12 +1,15 @@
-# public_weight — compact SmolVLM Eagle drafts
+# public_weight — SmolVLM Eagle drafts
 
-Minimal publishable weights. Reload with a local/HF **SmolVLM** path.
+Publishable draft weights. Real-hawk base layers still reload from a local/HF
+**SmolVLM** path, but draft `embed_tokens.weight` is stored in the pack.
+The embed tensor is stored separately as `embed_tokens.safetensors` so each
+tracked file stays below GitHub's 100 MB limit.
 
 | Pack | Source train run | What’s stored | What’s taken from SmolVLM |
 |---|---|---|---|
-| `hawk_warmup/` | `output/smolvlm_256m_hawk_warmup` | layers + fuse + norm + lm_head + vocab maps | `embed_tokens` |
-| `hawk_nccl/` | `output/smolvlm_256m_hawk_nccl` | same as hawk_warmup | `embed_tokens` |
-| `real_hawk_lora/` | `output/smolvlm_256m_real_hawk_nccl` | LoRA A/B + fuse + norm + lm_head + vocab maps | `embed_tokens` + frozen base layers `[1,14,26]` |
+| `hawk_warmup/` | `output/smolvlm_256m_hawk_warmup` | embed + layers + fuse + norm + lm_head + vocab maps | nothing |
+| `hawk_nccl/` | `output/smolvlm_256m_hawk_nccl` | same as hawk_warmup | nothing |
+| `real_hawk_lora/` | `output/smolvlm_256m_real_hawk_nccl` | embed + LoRA A/B + fuse + norm + lm_head + vocab maps | frozen base layers `[1,14,26]` |
 
 ## Export (from local full checkpoints)
 

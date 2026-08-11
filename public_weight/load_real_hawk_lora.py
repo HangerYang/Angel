@@ -3,8 +3,9 @@
 """Load compact real_hawk LoRA pack + SmolVLM → full draft (+ LoRA-only dict).
 
 Pack (public_weight/real_hawk_lora/) stores only LoRA A/B + fuse + draft
-lm_head/norm + vocab maps. Frozen base layer weights and embed come from
-SmolVLM (layer init [1,14,26] + embed copy).
+lm_head/norm + vocab maps. New packs include embed_tokens.weight; frozen base
+layer weights come from SmolVLM layer init. The loader still initializes embed
+from SmolVLM first so older packs that omitted it remain usable.
 
 HF / vLLM eval needs plain ``*.weight`` Linear keys. Use ``--save_full``
 (always merged hawk-shaped) or ``load_real_hawk_checkpoint`` for train
@@ -138,7 +139,7 @@ def load_real_hawk_lora(
     if torch_dtype is not None:
         model = model.to(dtype=torch_dtype)
 
-    # Bottom embed from SmolVLM.
+    # Backward compatibility: old packs omitted embed_tokens.weight.
     model.load_embed_weights(str(smolvlm_path), embed_weight_key)
     model.freeze_embed_weights()
 
@@ -175,7 +176,7 @@ def load_real_hawk_lora(
 
     hot = read_hot_weights(pack_dir)
     missing, unexpected = model.load_state_dict(hot, strict=False)
-    # Allowed missing: embed + all base.weight under LoRALinear.
+    # Allowed missing: embed for old packs + all base.weight under LoRALinear.
     allowed_missing = []
     bad_missing = []
     for k in missing:

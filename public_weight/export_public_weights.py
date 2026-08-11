@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # Copyright 2025 Tencent Inc. All Rights Reserved.
-"""Export compact packs into public_weight/{hawk_warmup,hawk_nccl,real_hawk_lora}.
+"""Export packs into public_weight/{hawk_warmup,hawk_nccl,real_hawk_lora}.
 
-Hawk / Eagle: skip embed (bottom; reload from SmolVLM). Keep hot intermediate
-layers + fuse + draft lm_head/norm + vocab maps.
+Hawk / Eagle: keep embed + hot intermediate layers + fuse + draft lm_head/norm
+and vocab maps.
 
-real_hawk LoRA: skip embed + frozen base Linear weights. Keep LoRA A/B + fuse
-+ draft lm_head/norm + vocab maps. Bases reload from SmolVLM layer init.
+real_hawk LoRA: keep embed, skip frozen base Linear weights. Keep LoRA A/B,
+fuse, draft lm_head/norm, and vocab maps. Bases reload from SmolVLM layer init.
 
 Usage:
   python public_weight/export_public_weights.py
@@ -41,8 +41,8 @@ def _export_hawk(ckpt: Path, out_dir: Path, *, kind: str = "hawk") -> None:
     state = load_state_dict(ckpt)
     with (ckpt / "config.json").open("r", encoding="utf-8") as f:
         cfg = json.load(f)
-    # Skip bottom embed (reload from SmolVLM). Keep layers/fuse/head/vocab.
-    hot = filter_keys(state, drop_prefixes=("embed_tokens.",))
+    # Keep embed with the pack so it is a complete draft checkpoint.
+    hot = state
     write_pack(
         out_dir,
         hot=hot,
@@ -50,8 +50,9 @@ def _export_hawk(ckpt: Path, out_dir: Path, *, kind: str = "hawk") -> None:
         meta={
             "kind": kind,
             "source_ckpt": str(ckpt.resolve()),
-            "skipped": ["embed_tokens.*  (reload from SmolVLM)"],
+            "skipped": [],
             "kept": [
+                "embed_tokens",
                 "layers.*",
                 "fuse_w1/fuse_w2",
                 "norm",
@@ -67,11 +68,11 @@ def _export_real_hawk_lora(ckpt: Path, out_dir: Path) -> None:
     state = load_state_dict(ckpt)
     with (ckpt / "config.json").open("r", encoding="utf-8") as f:
         cfg = json.load(f)
-    # Keep LoRA + fuse + head/vocab. Drop embed and frozen base weights.
+    # Keep embed + LoRA + fuse + head/vocab. Drop only frozen base weights.
     hot = filter_keys(
         state,
         keep_substrings=("lora_A", "lora_B"),
-        keep_prefixes=("fuse_w1.", "fuse_w2.", "norm.", "lm_head."),
+        keep_prefixes=("embed_tokens.", "fuse_w1.", "fuse_w2.", "norm.", "lm_head."),
         keep_exact=("t2d", "d2t"),
     )
     write_pack(
@@ -82,10 +83,10 @@ def _export_real_hawk_lora(ckpt: Path, out_dir: Path) -> None:
             "kind": "real_hawk_lora",
             "source_ckpt": str(ckpt.resolve()),
             "skipped": [
-                "embed_tokens.*  (reload from SmolVLM)",
                 "*.base.weight / plain layer weights (reload from SmolVLM layer init)",
             ],
             "kept": [
+                "embed_tokens",
                 "layers.*.lora_A / lora_B",
                 "fuse_w1/fuse_w2",
                 "norm",

@@ -77,21 +77,39 @@ def write_pack(
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    hot = {k: v.detach().cpu().contiguous() for k, v in hot.items()}
+    embed = {}
+    if "embed_tokens.weight" in hot:
+        embed["embed_tokens.weight"] = hot.pop("embed_tokens.weight")
+
     save_file(hot, str(out_dir / "hot_weights.safetensors"))
+    embed_path = out_dir / "embed_tokens.safetensors"
+    if embed:
+        save_file(embed, str(embed_path))
+    elif embed_path.exists():
+        embed_path.unlink()
+
     with (out_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(draft_config, f, indent=2)
         f.write("\n")
+
+    all_keys = {**hot, **embed}
     meta = {
         **meta,
-        "num_tensors": len(hot),
-        "bytes": bytes_of(hot),
-        "keys": sorted(hot.keys()),
+        "num_tensors": len(all_keys),
+        "bytes": bytes_of(all_keys),
+        "files": {
+            "hot_weights.safetensors": sorted(hot.keys()),
+            "embed_tokens.safetensors": sorted(embed.keys()),
+        },
+        "keys": sorted(all_keys.keys()),
     }
     with (out_dir / "pack_meta.json").open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
         f.write("\n")
     print(
-        f"Wrote {out_dir}  tensors={len(hot)}  "
+        f"Wrote {out_dir}  tensors={len(all_keys)}  "
         f"size={meta['bytes'] / 1e6:.2f} MB"
     )
 
@@ -102,10 +120,15 @@ def read_pack_config(pack_dir: Path) -> Dict[str, Any]:
 
 
 def read_hot_weights(pack_dir: Path) -> Dict[str, torch.Tensor]:
-    path = Path(pack_dir) / "hot_weights.safetensors"
+    pack_dir = Path(pack_dir)
+    path = pack_dir / "hot_weights.safetensors"
     if not path.is_file():
         raise FileNotFoundError(path)
-    return dict(load_file(str(path)))
+    state = dict(load_file(str(path)))
+    embed_path = pack_dir / "embed_tokens.safetensors"
+    if embed_path.is_file():
+        state.update(load_file(str(embed_path)))
+    return state
 
 
 def resolve_latest_checkpoint(path: Path) -> Path:

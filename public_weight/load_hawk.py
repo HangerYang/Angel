@@ -77,13 +77,13 @@ def load_hawk_draft(
     if torch_dtype is not None:
         model = model.to(dtype=torch_dtype)
 
-    # Bottom: embed from SmolVLM (not stored in pack).
+    # Backward compatibility: old packs omitted embed_tokens.weight.
     model.load_embed_weights(str(smolvlm_path), embed_weight_key)
     model.freeze_embed_weights()
 
     hot = read_hot_weights(pack_dir)
     missing, unexpected = model.load_state_dict(hot, strict=False)
-    # Expected missing: embed_tokens.weight (loaded above).
+    # Old packs may miss embed_tokens.weight; it was loaded above.
     missing = [k for k in missing if not k.startswith("embed_tokens.")]
     if missing:
         raise RuntimeError(
