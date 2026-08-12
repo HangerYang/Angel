@@ -56,6 +56,23 @@ class Eagle3Trainer(Trainer, ABC):
         self.target_hs_warmup_steps = int(warmup or 0)
         # Back-compat alias used by older call sites / logs.
         self.progressive_target_hs_warmup_steps = self.target_hs_warmup_steps
+        draft_model_config = kwargs.pop("draft_model_config", None)
+        self.skew_kl_loss_weight = float(
+            getattr(draft_model_config, "skew_kl_loss_weight", 0.0) or 0.0
+        )
+        self.skew_kl_alpha = float(
+            getattr(draft_model_config, "skew_kl_alpha", 0.1) or 0.1
+        )
+        self.skew_kl_direction = str(
+            getattr(draft_model_config, "skew_kl_direction", "reverse") or "reverse"
+        )
+        self.skew_kl_loss_mode = str(
+            getattr(draft_model_config, "skew_kl_loss_mode", "additive")
+            or "additive"
+        )
+        self.skew_kl_stage_weights = list(
+            getattr(draft_model_config, "skew_kl_stage_weights", []) or []
+        )
         super().__init__(model=draft_model, **kwargs)
         self.length = length
         self._train_start_time = None
@@ -65,8 +82,24 @@ class Eagle3Trainer(Trainer, ABC):
         self._eval_pending_log_count: int = 0
         self._logged_draft_hs_feedback = False
         self._logged_target_hs_warmup = False
+        self._logged_aux_losses = False
         # Set by create_optimizer() for non-DeepSpeed bf16 DDP (ZeRO-equivalent).
         self._fp32_optimizer = None
+
+    @staticmethod
+    def _stage_weight(weights: List[float], idx: int, default: float = 1.0) -> float:
+        if not weights:
+            return default
+        if idx < len(weights):
+            return float(weights[idx])
+        return float(weights[-1])
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        while mask.ndim < values.ndim:
+            mask = mask.unsqueeze(-1)
+        mask = mask.to(dtype=values.dtype, device=values.device)
+        return (values * mask).sum() / mask.sum().clamp_min(1.0)
 
     def create_optimizer(self, model=None):
         """Use FP32 master Adam under plain DDP to match DeepSpeed ZeRO moments.
@@ -328,6 +361,7 @@ class Eagle3Trainer(Trainer, ABC):
 
         # Step 6: Initialize containers for losses, accuracies and cache
         plosses, acces = [], []
+        skew_kl_losses = []
         draft = self.draft_model  # unwrapped — mode flags / _aux_inject live here
         use_draft_feedback = bool(
             getattr(draft, "progressive_staged", False) or getattr(draft, "hawk", False)
@@ -438,6 +472,42 @@ class Eagle3Trainer(Trainer, ABC):
             out_logp = nn.LogSoftmax(dim=2)(logits)
             loss = -torch.sum(position_mask * target_p * out_logp, dim=2).mean()
 
+            if log_prefix == "train" and self.skew_kl_loss_weight > 0.0:
+                stage_weight = self._stage_weight(
+                    self.skew_kl_stage_weights, idx, default=1.0
+                )
+                if stage_weight != 0.0:
+                    alpha = min(max(self.skew_kl_alpha, 0.0), 1.0)
+                    out_logp_f = out_logp.float()
+                    out_p = out_logp_f.exp()
+                    eps = torch.finfo(torch.float32).tiny
+                    direction = self.skew_kl_direction.lower()
+                    terms = []
+                    if direction in ("forward", "bidirectional", "both"):
+                        mix_q = alpha * target_p + (1.0 - alpha) * out_p
+                        terms.append(
+                            target_p * (target_p.clamp_min(eps).log() - mix_q.clamp_min(eps).log())
+                        )
+                    if direction in ("reverse", "bidirectional", "both"):
+                        mix_p = alpha * out_p + (1.0 - alpha) * target_p
+                        terms.append(out_p * (out_logp_f - mix_p.clamp_min(eps).log()))
+                    if not terms:
+                        raise ValueError(
+                            "skew_kl_direction must be forward, reverse, or bidirectional"
+                        )
+                    skew_kl = sum(torch.sum(term, dim=-1, keepdim=True) for term in terms)
+                    skew_kl_step = self._masked_mean(skew_kl, position_mask)
+                    if self.skew_kl_loss_mode.lower() == "replace":
+                        beta = max(0.0, min(1.0, self.skew_kl_loss_weight * stage_weight))
+                        loss = (1.0 - beta) * loss + beta * skew_kl_step
+                        skew_kl_losses.append(skew_kl_step)
+                    elif self.skew_kl_loss_mode.lower() == "additive":
+                        skew_kl_losses.append(stage_weight * skew_kl_step)
+                    else:
+                        raise ValueError(
+                            "skew_kl_loss_mode must be additive or replace"
+                        )
+
             # Step 7.6: Compute accuracy
             with torch.no_grad():
                 correct = (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
@@ -541,9 +611,36 @@ class Eagle3Trainer(Trainer, ABC):
         # Step 8: Compute weighted loss
         ploss_weight = [0.8**i for i in range(len(plosses))]
         ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+        skew_kl_loss = (
+            sum(skew_kl_losses) / len(skew_kl_losses)
+            if skew_kl_losses
+            else ploss.new_zeros(())
+        )
+        skew_kl_add_weight = (
+            self.skew_kl_loss_weight
+            if self.skew_kl_loss_mode.lower() == "additive"
+            else 0.0
+        )
+        ploss = ploss + skew_kl_add_weight * skew_kl_loss
+
+        if (
+            log_prefix == "train"
+            and not self._logged_aux_losses
+            and self.skew_kl_loss_weight > 0.0
+        ):
+            logger.info(
+                "Eagle3 aux losses: skew_kl(w=%s,a=%s,dir=%s,mode=%s)",
+                self.skew_kl_loss_weight,
+                self.skew_kl_alpha,
+                self.skew_kl_direction,
+                self.skew_kl_loss_mode,
+            )
+            self._logged_aux_losses = True
 
         log = {f"{log_prefix}/acc_{i}": acces[i] for i in range(len(acces))}
         log.update({f"{log_prefix}/ploss_{i}": plosses[i].item() for i in range(len(plosses))})
+        if log_prefix == "train" and skew_kl_losses:
+            log[f"{log_prefix}/skew_kl_loss"] = skew_kl_loss.item()
         # 1.0 => draft-HS feedback ran every speculative step after 0; 0 => off/stock.
         log[f"{log_prefix}/draft_hs_feedback"] = (
             float(feedback_applied) / float(max(self.length - 1, 1))
