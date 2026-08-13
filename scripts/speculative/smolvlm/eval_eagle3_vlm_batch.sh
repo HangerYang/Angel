@@ -75,7 +75,8 @@ USE_EAGLE="${USE_EAGLE:-1}"
 #   Needs TEMP=0. Alias: ASSISTANCE_MODE (deprecated).
 MIRACLE_MODE="${MIRACLE_MODE:-0}"
 # Back-compat: old ASSISTANCE_MODE name now means miracle.
-if [[ "${ASSISTANCE_MODE:-0}" != "0" && "${MIRACLE_MODE}" == "0" ]]; then
+ASSISTANCE_MODE="${ASSISTANCE_MODE:-0}"
+if [[ "${ASSISTANCE_MODE}" != "0" && "${MIRACLE_MODE}" == "0" ]]; then
   echo "NOTE: ASSISTANCE_MODE is deprecated; treating as MIRACLE_MODE=1" >&2
   MIRACLE_MODE="${ASSISTANCE_MODE}"
 fi
