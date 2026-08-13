@@ -33,7 +33,7 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/vllm/model_executor/models/eagle_miracle.py
-@@ -0,0 +1,378 @@
+@@ -0,0 +1,377 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""AngelSlim Eagle miracle mode: oracle GT target-HS along a trajectory.
@@ -318,11 +318,10 @@ index 0000000..1111111
 +    num_tokens: int,
 +    combine_fn,
 +) -> torch.Tensor | None:
-+    """USE step-0: replace the full verify-window inject with tape[pos].
++    """USE step-0 helper: replace the full verify-window inject with tape[pos].
 +
-+    Matches train unroll 0 / ``acc_0``: at every position t, inject target
-+    aux[t] (not live-verify alone, and never draft feedback). Offline miracle
-+    is ``max_num_seqs=1``, so the window belongs to ``req_ids[0]``.
++    Not used by warmup-eval miracle: step 0 must keep live verify aux so
++    ``acceptance_rate_pos_0`` matches miracle-off. Kept for experiments.
 +    """
 +    if not is_use() or num_tokens <= 0 or not req_ids:
 +        return None
@@ -912,7 +911,7 @@ index 2d859bd..3bc9a0f 100644
              skip_substrs.append("input_norm.")
          loader = AutoWeightsLoader(
 diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-index 747fb3a..83b9f0e 100644
+index 747fb3a..1b42b5a 100644
 --- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 @@ -2,15 +2,24 @@
@@ -990,7 +989,7 @@ index 747fb3a..83b9f0e 100644
      @torch.inference_mode()
      def propose(
          self,
-@@ -174,6 +210,70 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -174,6 +210,62 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              hidden_states = last_hidden_states
          self.hidden_states[:num_tokens].copy_(hidden_states)
  
@@ -1028,20 +1027,12 @@ index 747fb3a..83b9f0e 100644
 +                positions=input_batch.positions[:n_rec],
 +                num_tokens=n_rec,
 +            )
-+        # USE step 0 must look like train acc_0: inject tape[pos] over the
-+        # whole window (teacher-forced target HS), not merely live verify.
-+        if (
-+            self._miracle_active
-+            and eagle_miracle.is_use()
-+            and aux_hidden_states
-+        ):
-+            seed = self.model.apply_miracle_window(
-+                input_batch.positions[:n_rec],
-+                self._miracle_req_ids,
-+                n_rec,
-+            )
-+            if seed is not None:
-+                self.hidden_states[:n_rec].copy_(seed)
++        # USE step 0 keeps *live* verify aux (same handoff as miracle-off), so
++        # acceptance_rate_pos_0 is comparable. Do not replace the window with
++        # capture-tape HS: after a rejection the padded slots still hold
++        # rejected draft tokens, while tape[pos] is GT-trajectory HS there.
++        # Train unroll 0 / eval pos_0 both use live target HS for the current
++        # tokens. Tape inject is only for draft steps 1+ (warmup).
 +
 +        # ---------------------------------------------------------------------
 +        # [ANGELSLIM EAGLE BP#2] Target → draft handoff (hidden states).
@@ -1061,7 +1052,7 @@ index 747fb3a..83b9f0e 100644
          self._copy_request_inputs(
              num_reqs,
              input_batch.idx_mapping,
-@@ -248,6 +348,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -248,6 +340,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              advance_draft_positions=self.advance_draft_positions,
          )
  
@@ -1086,7 +1077,7 @@ index 747fb3a..83b9f0e 100644
          # Each request produces exactly 1 token per draft generation step,
          # enabling FULL graph replay.
          decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-@@ -310,16 +428,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -310,16 +420,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                  hidden_states=self.hidden_states[:num_tokens],
                  inputs_embeds=inputs_embeds,
              )
@@ -1121,7 +1112,7 @@ index 747fb3a..83b9f0e 100644
          # Some MTP models declare a single-tensor contract but return
          # (logits_hidden, feedback_hidden) for final-norm correctness.
          if isinstance(ret_hidden_states, tuple):
-@@ -329,6 +455,96 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -329,6 +447,96 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              hidden_states = ret_hidden_states
          return last_hidden_states, hidden_states
  
@@ -1218,7 +1209,7 @@ index 747fb3a..83b9f0e 100644
      def _prefill(
          self,
          num_reqs: int,
-@@ -339,6 +555,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -339,6 +547,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
          cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
          mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
      ) -> None:
@@ -1226,7 +1217,7 @@ index 747fb3a..83b9f0e 100644
          last_token_indices = self.last_token_indices[:num_reqs]
          positions = self.input_buffers.positions[last_token_indices]
          idx_mapping = self.idx_mapping[:num_reqs]
-@@ -362,12 +579,30 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -362,12 +571,30 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              self.current_draft_step,
              self.draft_logits,
          )
@@ -1257,7 +1248,7 @@ index 747fb3a..83b9f0e 100644
      def _multi_step_decode(
          self,
          num_reqs: int,
-@@ -382,6 +617,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -382,6 +609,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
          attn_metadata = None
          slot_mappings_by_layer = None
          for step in range(1, self.num_speculative_steps):
@@ -1277,7 +1268,7 @@ index 747fb3a..83b9f0e 100644
              # Rebuild every step when positions advance, or just once
              # on the first step when positions are constant (Gemma4 MTP).
              if not skip_attn and (self.advance_draft_positions or step == 1):
-@@ -415,6 +663,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -415,6 +655,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                      slot_mappings_by_layer,
                      num_tokens_across_dp=num_tokens_across_dp,
                      cudagraph_runtime_mode=batch_desc.cg_mode,
@@ -1285,7 +1276,7 @@ index 747fb3a..83b9f0e 100644
                  )
  
      def _generate_draft(
-@@ -425,8 +674,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -425,8 +666,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
          slot_mappings: dict[str, torch.Tensor] | None,
          num_tokens_across_dp: torch.Tensor | None,
          cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
@@ -1296,7 +1287,7 @@ index 747fb3a..83b9f0e 100644
  
          idx_mapping = self.idx_mapping[:num_reqs]
          positions = self.input_buffers.positions[:num_reqs]
-@@ -451,6 +702,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -451,6 +694,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              self.draft_logits,
          )
  
@@ -1311,7 +1302,7 @@ index 747fb3a..83b9f0e 100644
          # Update the inputs for the next step.
          update_draft_inputs(
              draft_tokens,
-@@ -465,6 +724,28 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+@@ -465,6 +716,28 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
              advance_draft_positions=self.advance_draft_positions,
          )
  
