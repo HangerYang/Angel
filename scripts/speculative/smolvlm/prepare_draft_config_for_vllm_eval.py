@@ -172,6 +172,12 @@ def prepare_draft_config(
         if key not in cfg and key in train_cfg:
             updates[key] = train_cfg[key]
 
+    # EAGLE 3.1: always stamp so vLLM's llama_eagle3.py can read the flags.
+    updates["fc_norm"] = bool(cfg.get("fc_norm", train_cfg.get("fc_norm", False)))
+    updates["norm_output"] = bool(
+        cfg.get("norm_output", train_cfg.get("norm_output", False))
+    )
+
     if eagle_miracle_mode:
         # Miracle (oracle GT-HS) works for fused_fc, progressive_staged, hawk.
         updates["eagle_miracle_mode"] = True
@@ -186,6 +192,8 @@ def prepare_draft_config(
     print(f"  draft_model: {draft_model}")
     print(f"  eagle_aux_injection_mode: {injection_mode}")
     print(f"  eagle_miracle_mode: {cfg.get('eagle_miracle_mode', False)}")
+    print(f"  fc_norm: {cfg.get('fc_norm', False)}")
+    print(f"  norm_output: {cfg.get('norm_output', False)}")
     print(f"  num_hidden_layers: {num_layers} "
           f"({'single-layer' if num_layers == 1 else f'{num_layers}-layer'} draft)")
     print(f"  aux_hidden_states_layer_ids (train): {cfg.get('aux_hidden_states_layer_ids')}")

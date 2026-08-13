@@ -67,18 +67,16 @@ class BaseEagle3Drafter(nn.Module, ABC):
         fc_output_size = config.hidden_size
         if early_stop_method is not None:
             fc_output_size += early_stop_method.count("_") + 1
-        if hasattr(config, "target_hidden_size"):
-            self.fc = nn.Linear(
-                config.target_hidden_size * hidden_size_multiplier,
-                fc_output_size,
-                bias=False,
-            )
-        else:
-            self.fc = nn.Linear(
-                config.hidden_size * hidden_size_multiplier,
-                fc_output_size,
-                bias=False,
-            )
+        aux_ids = getattr(config, "aux_hidden_states_layer_ids", None)
+        self.num_aux_hidden_states = len(aux_ids) if aux_ids else hidden_size_multiplier
+        fc_in_size = (
+            getattr(config, "target_hidden_size", config.hidden_size)
+            * self.num_aux_hidden_states
+        )
+        self.fc = nn.Linear(fc_in_size, fc_output_size, bias=False)
+        # EAGLE 3.1 flags; `fc_norm` modules are built by the Llama drafter.
+        self.norm_output = bool(getattr(config, "norm_output", False))
+        self.fc_norm = None
 
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
@@ -229,7 +227,10 @@ class BaseEagle3Drafter(nn.Module, ABC):
             input_ids = mapped_tokens
 
         # Prepare for tree traversal
-        input_hidden = last_hidden[None].repeat(1, self.top_k, 1)
+        next_hidden = last_hidden
+        if hasattr(self, "_next_step_hidden"):
+            next_hidden = self._next_step_hidden(last_hidden)
+        input_hidden = next_hidden[None].repeat(1, self.top_k, 1)
         tree_mask = self.tree_mask_init
         topk_cs_index = torch.arange(self.top_k, device=self.embed_tokens.weight.device)
 
@@ -348,7 +349,10 @@ class BaseEagle3Drafter(nn.Module, ABC):
 
         # Update data structures
         out_ids = topk_cs_index // self.top_k
-        input_hidden = out_hidden[:, out_ids]
+        next_hidden = out_hidden
+        if hasattr(self, "_next_step_hidden"):
+            next_hidden = self._next_step_hidden(out_hidden)
+        input_hidden = next_hidden[:, out_ids]
         input_ids = topk_index.view(-1)[topk_cs_index][None]
 
         # Handle vocabulary mapping if needed
