@@ -56,6 +56,14 @@ from transformers.image_utils import load_image
 from vllm import LLM, SamplingParams
 
 
+def _cuda_sync() -> None:
+    """Block until GPU work finishes so wall-clock time is not under-counted."""
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def pil_to_base64(img):
     if img.mode != "RGB":
         img = img.convert("RGB")
@@ -179,7 +187,9 @@ def parse_args():
             "Oracle GT-HS miracle mode (fused / progressive / hawk): "
             "1) target-only generate for GT tokens, 2) capture full target "
             "aux tape along that trajectory, 3) eagle decode injecting "
-            "tape[pos] each draft step. Timed metrics are from step 3 only."
+            "tape[pos]. Progressive/hawk steps 1+ match train warmup "
+            "(L1/L2 GT tape, L0 last draft residual). Timed metrics are "
+            "from step 3 only, with CUDA synchronize around generate."
         ),
     )
     parser.add_argument(
@@ -611,14 +621,18 @@ def main():
         os.environ["VLLM_EAGLE_MIRACLE_PHASE"] = "use"
         llm = _make_llm(speculative_config)
         print("Starting generation...")
+        _cuda_sync()
         start_time = time.perf_counter()
         outputs = llm.chat(prompts, sampling_params=sampling_params)
+        _cuda_sync()
         end_time = time.perf_counter()
     else:
         llm = _make_llm(speculative_config)
         print("Starting generation...")
+        _cuda_sync()
         start_time = time.perf_counter()
         outputs = llm.chat(prompts, sampling_params=sampling_params)
+        _cuda_sync()
         end_time = time.perf_counter()
 
     total_time = end_time - start_time

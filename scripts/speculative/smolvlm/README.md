@@ -482,16 +482,15 @@ tapes. (`ASSISTANCE_MODE` is a deprecated alias for `MIRACLE_MODE`.)
   draft buffers. Offline req ids are `{prompt_index}-{hex}`; warmup ids are
   ignored so USE init does not skip hawk draft-HS refresh.
 - Output defaults to `{DRAFT_MODEL}/eval/{data}_miracle/results.jsonl`.
-- **Train `acc_0` alignment:** every USE draft step injects `tape[pos]` with
-  input token at `pos` (same as train step 0 / target HS). Step 0 also
-  overwrites the full verify window with the tape. Steps 1+ skip draft-HS
-  feedback. Do **not** rewrite AR inputs from phase-A GT ids — when `pos_0`
-  matches, the sampled token already is the on-path token; forcing phase-A
-  ids can disagree with the live path and collapse `pos_1+`.
-- Hawk train still uses draft feedback on steps 1+, so miracle (target tape
-  on 1+) is the stronger “always `acc_0`-like HS” oracle; expect ≥ baseline
-  when wiring is correct, not a large free lunch if draft feedback is already
-  close.
+- **Train warmup alignment:** USE step 0 is unroll 0 / `acc_0` (GT aux all
+  layers; L0 seed = tape chunk 0). Steps 1+ match target-HS warmup: L1/L2
+  (hawk also L0 inject) from `tape[pos]`; progressive L0 keeps last draft
+  residual (`h2`), not GT chunk 0. Draft-HS feedback is skipped. Do **not**
+  rewrite AR inputs from phase-A GT ids — when `pos_0` matches, the sampled
+  token already is the on-path token; forcing phase-A ids can disagree with
+  the live path and collapse `pos_1+`.
+- Timed tok/s is phase C only, with CUDA synchronize around `llm.chat` and
+  vectorized tape gather (no per-token `.item()` syncs on the USE path).
 
 Before calling vLLM, the eval script runs:
 

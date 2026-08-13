@@ -69,7 +69,8 @@ OUTPUT_FILE="${OUTPUT_FILE:-}"
 #   Options: 1 (default, use draft) | 0 (baseline target-only, no draft)
 USE_EAGLE="${USE_EAGLE:-1}"
 
-# MIRACLE_MODE — oracle GT target-HS inject along target trajectory (upper bound).
+# MIRACLE_MODE — oracle GT-HS along target trajectory (upper bound).
+#   Progressive/hawk steps 1+ match train warmup (L1/L2 GT, L0 last residual).
 #   Options: 0 (default, normal eagle) | 1 (miracle capture+use; forces MAX_NUM_SEQS=1)
 #   Needs TEMP=0. Alias: ASSISTANCE_MODE (deprecated).
 MIRACLE_MODE="${MIRACLE_MODE:-0}"
