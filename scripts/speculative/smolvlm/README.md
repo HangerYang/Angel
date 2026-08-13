@@ -482,8 +482,9 @@ tapes. (`ASSISTANCE_MODE` is a deprecated alias for `MIRACLE_MODE`.)
   draft buffers. Offline req ids are `{prompt_index}-{hex}`; warmup ids are
   ignored so USE init does not skip hawk draft-HS refresh.
 - Output defaults to `{DRAFT_MODEL}/eval/{data}_miracle/results.jsonl`.
-- **Train warmup alignment:** USE step 0 is unroll 0 / `acc_0` (GT aux all
-  layers; L0 seed = tape chunk 0). Steps 1+ match target-HS warmup: L1/L2
+- **Train warmup alignment:** USE step 0 is live verify aux (same as
+  miracle-off), so `acceptance_rate_pos_0` should match. Do **not** overwrite
+  that window with capture-tape HS. Steps 1+ match target-HS warmup: L1/L2
   (hawk also L0 inject) from `tape[pos]`; progressive L0 keeps last draft
   residual (`h2`), not GT chunk 0. Draft-HS feedback is skipped. Do **not**
   rewrite AR inputs from phase-A GT ids — when `pos_0` matches, the sampled
