@@ -606,24 +606,54 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         self.padding_idx = config.pad_token_id
         self.hidden_size = config.hidden_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # EAGLE 3.1: per-stream RMSNorm before FC, and post-norm next-step HS.
+        # Both default off so existing EAGLE 3 checkpoints stay valid.
+        self.norm_output = bool(getattr(config, "norm_output", False))
+        use_fc_norm = bool(getattr(config, "fc_norm", False))
+        aux_ids = getattr(config, "aux_hidden_states_layer_ids", None)
+        self.num_aux_hidden_states = len(aux_ids) if aux_ids else 3
         # Stock Eagle3: early fc 3H→H then 2H Eagle L0.
         # Progressive: per-layer 2H concat inject, no fc.
         # Hawk / real_hawk: per-layer ê=inject@w1+left@w2 (H), then H blocks.
         self._aux_inject: Optional[Tuple[torch.Tensor, ...]] = None
         # Per-layer draft outs from the last encode (progressive decode feedback).
         self._last_layer_outs: Optional[List[torch.Tensor]] = None
+        self.fc_norm: Optional[nn.ModuleList] = None
         if self.hawk:
             self.fc = None
             self.fuse_w1 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
             self.fuse_w2 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+            if use_fc_norm:
+                logger.warning("fc_norm is ignored in hawk mode (no fusion FC).")
         elif self.progressive_staged:
             self.fc = None
             self.fuse_w1 = None
             self.fuse_w2 = None
+            if use_fc_norm:
+                logger.warning(
+                    "fc_norm is ignored in progressive_staged (no fusion FC)."
+                )
         else:
-            self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
+            self.fc = nn.Linear(
+                self.hidden_size * self.num_aux_hidden_states,
+                self.hidden_size,
+                bias=False,
+            )
             self.fuse_w1 = None
             self.fuse_w2 = None
+            if use_fc_norm:
+                self.fc_norm = nn.ModuleList(
+                    [
+                        LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                        for _ in range(self.num_aux_hidden_states)
+                    ]
+                )
+        if self.norm_output or self.fc_norm is not None:
+            logger.info(
+                "EAGLE 3.1 enabled: fc_norm=%s norm_output=%s",
+                self.fc_norm is not None,
+                self.norm_output,
+            )
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
 
         # create vocab buffers
@@ -678,7 +708,28 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             self._aux_inject = chunks
             # L0 seed = first aux stream (encode will re-fuse for hawk).
             return chunks[0]
+        if self.fc_norm is not None:
+            chunks = hidden_states.split(self.hidden_size, dim=-1)
+            if len(chunks) != len(self.fc_norm):
+                raise ValueError(
+                    f"fc_norm expects {len(self.fc_norm)} aux streams, "
+                    f"got {len(chunks)} (last dim={hidden_states.shape[-1]})"
+                )
+            hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                dim=-1,
+            )
         return self.fc(hidden_states)
+
+    def next_hidden_from_encode(self, prenorm: torch.Tensor) -> torch.Tensor:
+        """Hidden states to feed the next speculative draft step.
+
+        EAGLE 3.1 ``norm_output`` uses the final RMSNorm so residual magnitude
+        does not grow across draft steps. EAGLE 3 keeps the pre-norm residual.
+        """
+        if self.norm_output:
+            return self.norm(prenorm)
+        return prenorm
 
     def shift_aux_inject(
         self,
@@ -720,14 +771,19 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
     def take_progressive_draft_feedback(self) -> Optional[torch.Tensor]:
         """After a draft encode, set next-step injects from per-layer draft outs.
 
-        Used by ``progressive_staged`` and ``hawk``. Returns L0 seed (``h0``).
-        Sets ``_aux_inject = (h0, h1, h2, ...)`` so the next speculative step
-        uses same-depth draft HS instead of shifted target aux.
+        Used by ``progressive_staged`` and ``hawk``. Sets
+        ``_aux_inject = (h0, h1, h2, ...)`` so the next speculative step uses
+        same-depth draft HS instead of shifted target aux.
+
+        Returns the L0 residual seed: ``h0`` for EAGLE 3, or post-norm of the
+        last layer out when ``norm_output`` is set (EAGLE 3.1).
         """
         outs = self._last_layer_outs
         if not outs:
             return None
         self._aux_inject = tuple(outs)
+        if self.norm_output:
+            return self.norm(outs[-1])
         return outs[0]
 
     def init_cache_hidden(self):

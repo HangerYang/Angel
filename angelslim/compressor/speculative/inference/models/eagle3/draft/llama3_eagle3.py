@@ -537,6 +537,21 @@ class Llama3Eagle3Drafter(BaseEagle3Drafter):
         )
         self.midlayer = LlamaDecoderLayeremb(config)
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if bool(getattr(config, "fc_norm", False)):
+            stream_size = getattr(config, "target_hidden_size", config.hidden_size)
+            n_aux = getattr(self, "num_aux_hidden_states", 3)
+            self.fc_norm = nn.ModuleList(
+                [
+                    LlamaRMSNorm(stream_size, eps=config.rms_norm_eps)
+                    for _ in range(n_aux)
+                ]
+            )
+
+    def _next_step_hidden(self, prenorm: torch.Tensor) -> torch.Tensor:
+        """EAGLE 3.1: feed post-norm HS into the next draft step."""
+        if getattr(self, "norm_output", False):
+            return self.norm(prenorm)
+        return prenorm
 
     def _prepare_decoder_attention_mask(
         self, attention_mask, input_shape, inputs_embeds, past_key_values_length
@@ -626,6 +641,13 @@ class Llama3Eagle3Drafter(BaseEagle3Drafter):
         inputs_embeds = inputs_embeds.to(dtype)
         hidden_states = hidden_states.to(dtype)
         if hidden_states.shape[-1] != inputs_embeds.shape[-1]:
+            if self.fc_norm is not None:
+                stream_size = hidden_states.shape[-1] // len(self.fc_norm)
+                chunks = hidden_states.split(stream_size, dim=-1)
+                hidden_states = torch.cat(
+                    [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                    dim=-1,
+                )
             hidden_states = self.fc(hidden_states)
         early_stop_signal: Optional[torch.Tensor] = None
         if self.early_stop_method is not None:

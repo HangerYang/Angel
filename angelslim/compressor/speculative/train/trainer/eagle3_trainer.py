@@ -539,6 +539,8 @@ class Eagle3Trainer(Trainer, ABC):
                     draft.shift_aux_inject(
                         left=False, allow_target_hs_warmup=True
                     )
+                    if hasattr(draft, "next_hidden_from_encode"):
+                        hidden_states = draft.next_hidden_from_encode(hidden_states)
                     target_shift_applied += 1
                 elif use_draft_feedback:
                     if not hasattr(draft, "take_progressive_draft_feedback"):
@@ -581,17 +583,25 @@ class Eagle3Trainer(Trainer, ABC):
                         )
                         logger.info(
                             "Eagle3 %s: target HS only on first draft token; "
-                            "steps 1+ use draft outs only (L0←h0, injects←h0..h%d). "
+                            "steps 1+ use draft outs only (L0←%s, injects←h0..h%d). "
                             "train/draft_hs_feedback=1 required. "
                             "Logging Smooth-L1(h_i, h_target_i) on tokens 1..%d.",
                             mode,
+                            (
+                                "post-norm(h_last)"
+                                if getattr(draft, "norm_output", False)
+                                else "h0"
+                            ),
                             len(draft.layers) - 1,
                             sl1_token_budget,
                         )
                         self._logged_draft_hs_feedback = True
-                # Stock fused_fc only: keep legacy shift if present (no-op for most).
-                elif hasattr(draft, "shift_aux_inject"):
-                    draft.shift_aux_inject(left=False)
+                # Stock fused_fc: EAGLE 3.1 feeds post-norm HS into the next step.
+                else:
+                    if hasattr(draft, "next_hidden_from_encode"):
+                        hidden_states = draft.next_hidden_from_encode(hidden_states)
+                    if hasattr(draft, "shift_aux_inject"):
+                        draft.shift_aux_inject(left=False)
 
         if (
             use_draft_feedback

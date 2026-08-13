@@ -72,7 +72,9 @@ TARGET_MODEL_NAME_OR_PATH=${TARGET_MODEL_NAME_OR_PATH:-HuggingFaceTB/SmolVLM-256
 # DRAFT_MODEL_CONFIG_PATH — draft architecture JSON (required). Builds draft from this blueprint.
 #   Options under $CONFIG_DIR:
 #     smolvlm-256m-eagle3.json                 — stock Eagle3 fused_fc, 1 draft layer
+#     smolvlm-256m-eagle3-3.1.json             — stock + EAGLE 3.1 (fc_norm + norm_output)
 #     smolvlm-256m-eagle3-progressive.json     — progressive_staged, 3 layers, init from target
+#     smolvlm-256m-eagle3-progressive-layers-1-15-23-3.1.json — progressive + norm_output
 #     smolvlm-256m-eagle3-progressive-uninit.json — progressive, no layer init
 #     smolvlm-256m-hawk.json                   — hawk (w1/w2 H-fusion, full layers trainable)
 #     smolvlm-256m-real-hawk.json              — real_hawk (frozen target-layer copies + LoRA + fuse)
