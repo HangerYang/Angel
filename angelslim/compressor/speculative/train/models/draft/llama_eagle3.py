@@ -270,11 +270,12 @@ class LlamaAttention(nn.Module):
         mode = getattr(config, "eagle_aux_injection_mode", "fused_fc")
         progressive = mode == "progressive_staged"
         hawk = mode in HAWK_FUSE_MODES
-        qkv_in = (
-            self.hidden_size
-            if hawk or not (layer_idx == 0 or progressive)
-            else self.hidden_size * 2
-        )
+        qkv_streams = 1
+        if not hawk and (layer_idx == 0 or progressive):
+            qkv_streams = 2
+            if layer_idx == 0 and bool(getattr(config, "gist_conditioning", False)):
+                qkv_streams = 3
+        qkv_in = self.hidden_size * qkv_streams
         self.q_proj = nn.Linear(qkv_in, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(
             qkv_in, self.num_key_value_heads * self.head_dim, bias=False
@@ -512,6 +513,8 @@ class LlamaDecoderLayeremb(nn.Module):
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.gist_conditioning = bool(getattr(config, "gist_conditioning", False))
+        self.gist_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -524,6 +527,7 @@ class LlamaDecoderLayeremb(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         inject: Optional[torch.Tensor] = None,
+        gist_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -542,10 +546,12 @@ class LlamaDecoderLayeremb(nn.Module):
         elif self.layer_idx == 0:
             if input_emb is None:
                 raise ValueError("Eagle layer 0 requires input_emb (token embeds).")
-            attn_input = torch.cat(
-                (self.input_layernorm(input_emb), self.hidden_norm(hidden_states)),
-                dim=-1,
-            )
+            streams = [self.input_layernorm(input_emb), self.hidden_norm(hidden_states)]
+            if self.gist_conditioning:
+                if gist_hidden is None:
+                    raise RuntimeError("gist_conditioning requires gist_hidden at layer 0")
+                streams.append(self.gist_norm(gist_hidden))
+            attn_input = torch.cat(streams, dim=-1)
             return_hidden = attn_input
         elif self.progressive_staged:
             if inject is None:
@@ -605,6 +611,15 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         self.draft_vocab_size = config.draft_vocab_size
         self.padding_idx = config.pad_token_id
         self.hidden_size = config.hidden_size
+        self.gist_conditioning = bool(getattr(config, "gist_conditioning", False))
+        self.gist_embedding_dim = int(getattr(config, "gist_embedding_dim", 0) or 0)
+        self.gist_projector = None
+        if self.gist_conditioning:
+            if self.gist_embedding_dim <= 0:
+                raise ValueError("gist_conditioning requires gist_embedding_dim > 0")
+            self.gist_projector = nn.Linear(
+                self.gist_embedding_dim, self.hidden_size, bias=False
+            )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # EAGLE 3.1: per-stream RMSNorm before FC, and post-norm next-step HS.
         # Both default off so existing EAGLE 3 checkpoints stay valid.
@@ -688,12 +703,20 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         """Legacy alias for the first draft layer (Eagle 2H block)."""
         return self.layers[0]
 
-    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        gist_embeddings: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         # Target HS are often bf16 while --draft_model_dtype float32 keeps draft
         # params in fp32 (for FP32 Adam moments under plain DDP). Match dtypes.
         draft_dtype = next(self.parameters()).dtype
         if hidden_states.dtype != draft_dtype:
             hidden_states = hidden_states.to(dtype=draft_dtype)
+        if self.gist_conditioning and (self.progressive_staged or self.hawk):
+            raise NotImplementedError(
+                "gist_conditioning is implemented for stock fused_fc EAGLE-3.1 only"
+            )
         if self.progressive_staged or self.hawk:
             # One aux stream per draft layer (concat width = n*H).
             n = len(self.layers)
@@ -720,6 +743,32 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 dim=-1,
             )
         return self.fc(hidden_states)
+
+    def apply_gist_conditioning(
+        self, hidden_states: torch.Tensor, gist_embeddings: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if not self.gist_conditioning:
+            return hidden_states
+        if self.gist_projector is None:
+            raise RuntimeError("gist_conditioning enabled without gist_projector")
+        if gist_embeddings is None:
+            raise RuntimeError("gist_conditioning requires gist_embeddings in the batch")
+        if gist_embeddings.shape[:2] != hidden_states.shape[:2]:
+            raise RuntimeError(
+                "gist_embeddings must align with hidden_states on batch and sequence "
+                f"dims, got {tuple(gist_embeddings.shape)} vs "
+                f"{tuple(hidden_states.shape)}"
+            )
+        if gist_embeddings.shape[-1] != self.gist_embedding_dim:
+            raise RuntimeError(
+                f"gist embedding dim mismatch: got {gist_embeddings.shape[-1]}, "
+                f"expected {self.gist_embedding_dim}"
+            )
+        gist_embeddings = gist_embeddings.to(
+            device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        gist_stream = self.gist_projector(gist_embeddings)
+        return torch.cat((hidden_states, gist_stream), dim=-1)
 
     def next_hidden_from_encode(self, prenorm: torch.Tensor) -> torch.Tensor:
         """Hidden states to feed the next speculative draft step.
@@ -798,7 +847,29 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         use_cache: bool,
+        gist_embeddings: Optional[torch.Tensor] = None,
     ):
+        gist_hidden = None
+        if self.gist_conditioning:
+            if self.gist_projector is None:
+                raise RuntimeError("gist_conditioning enabled without gist_projector")
+            if gist_embeddings is None:
+                raise RuntimeError("gist_conditioning requires gist_embeddings in the batch")
+            if gist_embeddings.shape[:2] != hidden_states.shape[:2]:
+                raise RuntimeError(
+                    "gist_embeddings must align with hidden_states on batch and sequence "
+                    f"dims, got {tuple(gist_embeddings.shape)} vs "
+                    f"{tuple(hidden_states.shape)}"
+                )
+            if gist_embeddings.shape[-1] != self.gist_embedding_dim:
+                raise RuntimeError(
+                    f"gist embedding dim mismatch: got {gist_embeddings.shape[-1]}, "
+                    f"expected {self.gist_embedding_dim}"
+                )
+            gist_hidden = self.gist_projector(
+                gist_embeddings.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            )
+
         # Accept legacy single-layer cache [[ks], [vs]] when num_hidden_layers==1.
         if cache_hidden is None:
             cache_hidden = self.init_cache_hidden()
@@ -841,6 +912,7 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                     output_attentions=False,
                     use_cache=use_cache,
                     inject=None,
+                    gist_hidden=gist_hidden if layer_idx == 0 else None,
                 )
                 hidden_states = layer_outputs[0]
                 layer_outs.append(hidden_states)
@@ -867,6 +939,7 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 output_attentions=False,
                 use_cache=use_cache,
                 inject=inject,
+                gist_hidden=gist_hidden if layer_idx == 0 else None,
             )
             hidden_states = layer_outputs[0]
             if self.progressive_staged:

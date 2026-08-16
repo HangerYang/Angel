@@ -130,10 +130,11 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
         attention_mask = inputs["attention_mask"]
         loss_mask = inputs["loss_mask"]
 
+        gist_embeddings = inputs.get("gist_embeddings")
         kwargs = {
             k: v
             for k, v in inputs.items()
-            if k not in ["input_ids", "attention_mask", "loss_mask"]
+            if k not in ["input_ids", "attention_mask", "loss_mask", "gist_embeddings"]
         }
         # Get hidden states and logits from target model
         hidden_states, target_logits, _, position_ids = (
@@ -150,7 +151,7 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
         input_ids = padding(input_ids, left=False)
         loss_mask = loss_mask[..., None].to(input_ids.device)
 
-        return {
+        result = {
             "hidden_states": hidden_states,
             "target_logits": target_logits,
             "input_ids": input_ids,
@@ -158,6 +159,11 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
             "position_ids": position_ids,
             "attention_mask": attention_mask,
         }
+        if gist_embeddings is not None:
+            result["gist_embeddings"] = padding(gist_embeddings, left=False).to(
+                input_ids.device
+            )
+        return result
 
 
 @Eagle3TrainerFactory.register("online", "Audio")

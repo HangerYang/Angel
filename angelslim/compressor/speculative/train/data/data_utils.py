@@ -415,6 +415,11 @@ class VLMDataCollatorWithPadding:
         }
 
         # Online training: decode image_paths -> pixel_values on-the-fly
+        if "gist_embeddings" in features[0]:
+            batch["gist_embeddings"] = torch.cat(
+                [paddingtensor(item["gist_embeddings"], max_length) for item in features]
+            )
+
         if self.processor is not None and "image_paths" in features[0]:
             all_pixel_values, all_image_grid_thw = [], []
             all_pixel_values_videos, all_video_grid_thw = [], []
@@ -538,6 +543,11 @@ class VLMSmolVLMDataCollatorWithPadding:
             "inputs_embeds": None,
             "position_ids": None,
         }
+
+        if "gist_embeddings" in features[0]:
+            batch["gist_embeddings"] = torch.cat(
+                [paddingtensor(item["gist_embeddings"], max_length) for item in features]
+            )
 
         if self.processor is not None and "image_paths" in features[0]:
             all_pixel_values, all_pixel_attention_mask = [], []

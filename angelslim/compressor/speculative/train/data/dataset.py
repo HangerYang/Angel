@@ -86,6 +86,15 @@ class DatasetManager:
                 display=display,
                 target_model_name_or_path=data_args.target_model_name_or_path,
                 output_dir=getattr(data_args, "output_dir", None),
+                gist_conditioning=getattr(data_args, "gist_conditioning", False),
+                gist_encoder_model_name_or_path=getattr(
+                    data_args, "gist_encoder_model_name_or_path", "Qwen/Qwen3-Embedding-0.6B"
+                ),
+                gist_refresh_every=getattr(data_args, "gist_refresh_every", 4),
+                gist_encoder_device=getattr(data_args, "gist_encoder_device", "cuda:0"),
+                gist_batch_size=getattr(data_args, "gist_batch_size", 32),
+                gist_embedding_dim=getattr(data_args, "gist_embedding_dim", 0),
+                gist_cache_dir=getattr(data_args, "gist_cache_dir", None),
             )
         if data_args.training_mode == "offline":
             self.offline_dataset_builder = DatasetBuilderFactory.create(

@@ -279,8 +279,9 @@ class Eagle3Trainer(Trainer, ABC):
         target_logits = data_for_draft_model["target_logits"]  # Batch x Seq x Vocab
         loss_mask = data_for_draft_model["loss_mask"]  # Batch x Seq x 1
         hidden_states = data_for_draft_model["hidden_states"]  # Batch x Seq x Hidden
+        gist_embeddings = data_for_draft_model.get("gist_embeddings")
 
-        hidden_states = self.down_project_hidden_states(hidden_states)
+        hidden_states = self.down_project_hidden_states(hidden_states, gist_embeddings)
         attention_mask, position_ids = self.prepare_attention_mask_and_position_ids(
             hidden_states, attention_mask, position_ids
         )
@@ -292,6 +293,7 @@ class Eagle3Trainer(Trainer, ABC):
             target_logits,
             loss_mask,
             log_prefix="train",
+            gist_embeddings=gist_embeddings,
         )
 
         return loss
@@ -305,14 +307,16 @@ class Eagle3Trainer(Trainer, ABC):
         """
         pass
 
-    def down_project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def down_project_hidden_states(
+        self, hidden_states: torch.Tensor, gist_embeddings: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Down project hidden states for draft model training.
         """
         # Step 4: Prepare hidden states with gradient tracking
         if not hidden_states.requires_grad:
             hidden_states.requires_grad = True
-        hidden_states = self.draft_model.combine_hidden_states(hidden_states)
+        hidden_states = self.draft_model.combine_hidden_states(hidden_states, gist_embeddings)
         return hidden_states
 
     def prepare_attention_mask_and_position_ids(
@@ -356,6 +360,7 @@ class Eagle3Trainer(Trainer, ABC):
         target_logits,
         loss_mask,
         log_prefix="",
+        gist_embeddings=None,
     ):
         _, seq_length, _ = hidden_states.shape
 
@@ -425,6 +430,7 @@ class Eagle3Trainer(Trainer, ABC):
                     attention_mask,
                     position_ids,
                     True,
+                    gist_embeddings,
                     use_reentrant=False,
                 )
             else:
@@ -435,6 +441,7 @@ class Eagle3Trainer(Trainer, ABC):
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     use_cache=True,
+                    gist_embeddings=gist_embeddings,
                 )
 
             # Step 7.2b: Smooth-L1(draft h_i, target aux_i) on tokens 1..3.
@@ -522,6 +529,10 @@ class Eagle3Trainer(Trainer, ABC):
                 input_ids = padding(input_ids, left=False)
                 target_logits = padding(target_logits, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                if gist_embeddings is not None:
+                    # Refresh position advances with the draft rollout. The same
+                    # cached vector is reused inside each refresh window.
+                    gist_embeddings = padding(gist_embeddings, left=False)
                 # Keep target aux tape aligned with the shifted sequence so
                 # tokens 2/3 still compare h_i vs the matching target HS.
                 if target_aux_tape is not None and idx + 1 < sl1_token_budget:
@@ -754,9 +765,10 @@ class Eagle3Trainer(Trainer, ABC):
         target_logits = data_for_draft_model["target_logits"]
         loss_mask = data_for_draft_model["loss_mask"]
         hidden_states = data_for_draft_model["hidden_states"]
+        gist_embeddings = data_for_draft_model.get("gist_embeddings")
 
         with torch.no_grad():
-            hidden_states = self.down_project_hidden_states(hidden_states)
+            hidden_states = self.down_project_hidden_states(hidden_states, gist_embeddings)
             attention_mask, position_ids = self.prepare_attention_mask_and_position_ids(
                 hidden_states, attention_mask, position_ids
             )
@@ -768,5 +780,6 @@ class Eagle3Trainer(Trainer, ABC):
                 target_logits,
                 loss_mask,
                 log_prefix="eval",
+                gist_embeddings=gist_embeddings,
             )
         return (loss, None, None)
