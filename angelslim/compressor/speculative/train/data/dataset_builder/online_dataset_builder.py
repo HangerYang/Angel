@@ -51,6 +51,14 @@ from .base_dataset_builder import OnlineDatasetBuilder
 from .dataset_builder_factory import DatasetBuilderFactory
 
 
+class GistEncoderUnavailableInWorkerError(RuntimeError):
+    """Raised when a ds.map(num_proc>1) worker hits a gist cache miss.
+
+    Deliberately NOT caught by _process_single_conversation's broad
+    except-and-drop-the-row handling -- see _get_gist_encoder for why.
+    """
+
+
 @DatasetBuilderFactory.register("online", "LLM")
 class OnlineLLMDatasetBuilder(OnlineDatasetBuilder):
     def __init__(
@@ -779,6 +787,18 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
         self.gist_batch_size = max(1, int(kwargs.get("gist_batch_size", 32)))
         self.gist_cache_dir = kwargs.get("gist_cache_dir")
         self.gist_embedding_dim = int(kwargs.get("gist_embedding_dim", 0) or 0)
+        # Escape hatch, off by default: gist_conditioning normally forces
+        # num_proc=None because the SentenceTransformer encoder can't safely
+        # fork across worker processes. When the on-disk gist cache is known
+        # to already cover every text this run will touch, no worker will
+        # ever need the encoder, and forcing single-process wastes the CPU
+        # tokenizer.decode()+hash lookup work that dominates when the cache
+        # is warm. Only meant to be set by a caller that has verified the
+        # cache is warm (e.g. tools/warm_map_cache.py) -- never wired to the
+        # real training CLI, so default online-training behavior is
+        # unchanged.
+        self.gist_allow_multiproc = bool(kwargs.get("gist_allow_multiproc", False))
+        self._gist_main_pid = os.getpid()
         self._gist_encoder = None
         self._gist_cache = None
         self._gist_cache_path = None
@@ -830,7 +850,7 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
             # Pin cache under <data_dir>/.map_cache/ so restarts actually hit
             # (default HF fingerprints bound methods and miss every run).
             # Collator still rebuilds pixel_* each step from image_paths.
-            if self.gist_conditioning:
+            if self.gist_conditioning and not self.gist_allow_multiproc:
                 if num_proc is not None:
                     rank0_print(
                         "Oracle gist preprocessing uses an in-process encoder/cache; "
@@ -926,6 +946,11 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                 else:
                     for key in new_examples:
                         new_examples[key].append(None)
+            except GistEncoderUnavailableInWorkerError:
+                # Not a per-row data problem -- let it abort the whole
+                # map() call instead of silently dropping every row that
+                # needed it.
+                raise
             except Exception as e:
                 rank0_print(f"Error processing example: {e}")
                 for key in new_examples:
@@ -1116,6 +1141,25 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
 
     def _get_gist_encoder(self):
         if self._gist_encoder is None:
+            if self.gist_allow_multiproc and os.getpid() != self._gist_main_pid:
+                # A worker process (forked by ds.map(num_proc>1)) hit a gist
+                # cache miss and needs to load the encoder itself. CUDA
+                # cannot be reinitialized in a forked subprocess (PyTorch
+                # requires 'spawn'), so this would otherwise crash inside
+                # SentenceTransformer(...) with an opaque error, and the
+                # caller's broad except-and-drop-the-row handling would
+                # silently discard every row that needed it -- not a
+                # per-row data problem, a systemic one. Fail loudly instead
+                # so the whole map() aborts and the gap gets prewarmed
+                # properly (e.g. scripts/speculative/smolvlm/prewarm_gist_cache.sh)
+                # rather than silently producing an incomplete dataset.
+                raise GistEncoderUnavailableInWorkerError(
+                    "Oracle gist cache miss inside a ds.map(num_proc>1) worker "
+                    f"process (pid={os.getpid()}, main={self._gist_main_pid}). "
+                    "gist_allow_multiproc=True assumes the on-disk cache is "
+                    "already complete; it is not. Re-run the prewarm script to "
+                    "close the gap, then retry -- do not ignore this."
+                )
             from sentence_transformers import SentenceTransformer
 
             rank0_print(
@@ -1301,6 +1345,10 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                     input_ids, loss_mask
                 )
             return result
+        except GistEncoderUnavailableInWorkerError:
+            # Not a per-row data problem -- let it abort the whole map() call
+            # instead of silently dropping every row that needed it.
+            raise
         except Exception as e:
             rank0_print(f"Error processing conversation: {e}")
             return None

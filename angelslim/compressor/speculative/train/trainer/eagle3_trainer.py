@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import time
@@ -370,7 +371,7 @@ class Eagle3Trainer(Trainer, ABC):
         draft = self.draft_model  # unwrapped — mode flags / _aux_inject live here
         use_draft_feedback = bool(
             getattr(draft, "progressive_staged", False) or getattr(draft, "hawk", False)
-        )
+        ) and not bool(getattr(draft, "disable_progressive_feedback", False))
         feedback_applied = 0
         target_shift_applied = 0
         # Snapshot target aux tape (h_target per draft layer) before feedback
@@ -388,6 +389,7 @@ class Eagle3Trainer(Trainer, ABC):
         # progressive eagle → progressive GT; hawk / real_hawk → hawk GT.
         target_hs_warmup = (
             log_prefix == "train"
+            and not bool(getattr(draft, "disable_progressive_feedback", False))
             and (
                 getattr(draft, "progressive_staged", False)
                 or getattr(draft, "hawk", False)
@@ -713,6 +715,25 @@ class Eagle3Trainer(Trainer, ABC):
         else:
             # Fall back to parent class save_model
             super().save_model(output_dir, _internal_call)
+            self._save_banded_aux_mix_weights(output_dir)
+
+    def _save_banded_aux_mix_weights(self, output_dir: str) -> None:
+        """Log and persist learned band weights alongside each checkpoint."""
+        if not self.args.should_save or not self.accelerator.is_main_process:
+            return
+        getter = getattr(self.draft_model, "get_banded_aux_mix_weights", None)
+        if getter is None:
+            return
+        weights = getter()
+        if not weights:
+            return
+        logger.info("Progressive banded aux mix weights: %s", weights)
+        os.makedirs(output_dir, exist_ok=True)
+        with open(
+            os.path.join(output_dir, "banded_aux_mix_weights.json"), "w"
+        ) as output_file:
+            json.dump(weights, output_file, indent=2, sort_keys=True)
+            output_file.write("\n")
 
     def _save_zero3_model(self, output_dir: str, _internal_call: bool = False):
         """
@@ -728,6 +749,9 @@ class Eagle3Trainer(Trainer, ABC):
         # All processes must participate in parameter gathering to avoid deadlock
         with deepspeed.zero.GatheredParameters(self.model.parameters()):
             state_dict = self.model.state_dict()
+            # The scalar logits may be ZeRO-partitioned, so inspect them while
+            # all parameters are gathered.
+            self._save_banded_aux_mix_weights(output_dir)
 
         # Only main process saves the model
         if self.args.should_save and self.accelerator.is_main_process:

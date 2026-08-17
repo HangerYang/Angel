@@ -39,6 +39,9 @@ HAWK_FUSE_MODES = frozenset({"hawk", "real_hawk", "layer_skip_lora"})
 # Real hawk ≡ frozen target-layer copies + LoRA (+ trainable fuse/head).
 # ``layer_skip_lora`` is a back-compat alias for ``real_hawk``.
 REAL_HAWK_MODES = frozenset({"real_hawk", "layer_skip_lora"})
+# Progressive drafts share the same layered 2H attention architecture.
+# ``progressive_banded_mix`` differs only in how its target aux streams are built.
+PROGRESSIVE_MODES = frozenset({"progressive_staged", "progressive_banded_mix"})
 
 
 def infer_target_layer_weight_prefix(embed_weight_key: str) -> str:
@@ -268,7 +271,7 @@ class LlamaAttention(nn.Module):
 
         # Eagle L0 / progressive: concat → 2H QKV. Hawk / real_hawk / stock L1+: H.
         mode = getattr(config, "eagle_aux_injection_mode", "fused_fc")
-        progressive = mode == "progressive_staged"
+        progressive = mode in PROGRESSIVE_MODES
         hawk = mode in HAWK_FUSE_MODES
         qkv_streams = 1
         if not hawk and (layer_idx == 0 or progressive):
@@ -505,7 +508,7 @@ class LlamaDecoderLayeremb(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         mode = getattr(config, "eagle_aux_injection_mode", "fused_fc")
-        self.progressive_staged = mode == "progressive_staged"
+        self.progressive_staged = mode in PROGRESSIVE_MODES
         self.hawk = mode in HAWK_FUSE_MODES
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
         self.mlp = LlamaMLP(config)
@@ -598,7 +601,11 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         super().__init__(config)
         num_layers = getattr(config, "num_hidden_layers", 1)
         mode = getattr(config, "eagle_aux_injection_mode", "fused_fc")
-        self.progressive_staged = mode == "progressive_staged"
+        self.progressive_banded_mix = mode == "progressive_banded_mix"
+        self.progressive_staged = mode in PROGRESSIVE_MODES
+        self.disable_progressive_feedback = bool(
+            getattr(config, "disable_progressive_feedback", False)
+        )
         # real_hawk (alias layer_skip_lora): hawk fuse on frozen target layers + LoRA.
         self.real_hawk = mode in REAL_HAWK_MODES
         self.layer_skip_lora = self.real_hawk  # back-compat alias
@@ -627,6 +634,55 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         use_fc_norm = bool(getattr(config, "fc_norm", False))
         aux_ids = getattr(config, "aux_hidden_states_layer_ids", None)
         self.num_aux_hidden_states = len(aux_ids) if aux_ids else 3
+        self.aux_layer_bands: Tuple[Tuple[int, ...], ...] = tuple()
+        self.aux_mix_norms: Optional[nn.ModuleList] = None
+        if self.progressive_banded_mix:
+            raw_bands = getattr(config, "eagle_aux_layer_bands", None)
+            if not raw_bands:
+                raise ValueError("progressive_banded_mix requires eagle_aux_layer_bands")
+            self.aux_layer_bands = tuple(
+                tuple(int(layer_id) for layer_id in band) for band in raw_bands
+            )
+            if len(self.aux_layer_bands) != num_layers or any(
+                not band for band in self.aux_layer_bands
+            ):
+                raise ValueError(
+                    "progressive_banded_mix requires one non-empty aux band per "
+                    f"draft layer (expected {num_layers}, got {self.aux_layer_bands})"
+                )
+            flat_band_ids = [layer_id for band in self.aux_layer_bands for layer_id in band]
+            if aux_ids is None or flat_band_ids != [int(layer_id) for layer_id in aux_ids]:
+                raise ValueError(
+                    "aux_hidden_states_layer_ids must equal the flattened "
+                    f"eagle_aux_layer_bands; got {aux_ids} vs {flat_band_ids}"
+                )
+            init_layer_ids = list(
+                getattr(
+                    config,
+                    "eagle_aux_band_init_layer_ids",
+                    [band[0] for band in self.aux_layer_bands],
+                )
+            )
+            if len(init_layer_ids) != len(self.aux_layer_bands):
+                raise ValueError(
+                    "eagle_aux_band_init_layer_ids must have one id per aux band"
+                )
+            for band_idx, (band, init_layer_id) in enumerate(
+                zip(self.aux_layer_bands, init_layer_ids)
+            ):
+                if int(init_layer_id) not in band:
+                    raise ValueError(
+                        f"band {band_idx} init layer {init_layer_id} is not in {band}"
+                    )
+                logits = torch.zeros(len(band), dtype=torch.float32)
+                logits[band.index(int(init_layer_id))] = 4.0
+                self.register_parameter(f"band{band_idx}_mix_logits", nn.Parameter(logits))
+            self.aux_mix_norms = nn.ModuleList(
+                [
+                    LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                    for _ in self.aux_layer_bands
+                ]
+            )
         # Stock Eagle3: early fc 3H→H then 2H Eagle L0.
         # Progressive: per-layer 2H concat inject, no fc.
         # Hawk / real_hawk: per-layer ê=inject@w1+left@w2 (H), then H blocks.
@@ -634,6 +690,8 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         # Per-layer draft outs from the last encode (progressive decode feedback).
         self._last_layer_outs: Optional[List[torch.Tensor]] = None
         self.fc_norm: Optional[nn.ModuleList] = None
+        self.progressive_fc: Optional[nn.ModuleList] = None
+        self.progressive_per_layer_fc: bool = False
         if self.hawk:
             self.fc = None
             self.fuse_w1 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
@@ -644,7 +702,36 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             self.fc = None
             self.fuse_w1 = None
             self.fuse_w2 = None
-            if use_fc_norm:
+            # Per-layer FC fusion: each draft layer gets its own independent
+            # nH->H projection over ALL aux streams (vs. the default raw
+            # one-stream-per-layer inject below). Opt-in, decoupled from
+            # eagle_aux_injection_mode so it doesn't collide with the separate
+            # (unimplemented) "per_layer_weighted_sum" mode.
+            self.progressive_per_layer_fc = bool(
+                getattr(config, "progressive_per_layer_fc", False)
+            )
+            if self.progressive_per_layer_fc:
+                self.progressive_fc = nn.ModuleList(
+                    [
+                        nn.Linear(
+                            self.hidden_size * self.num_aux_hidden_states,
+                            self.hidden_size,
+                            bias=False,
+                        )
+                        for _ in range(num_layers)
+                    ]
+                )
+                if use_fc_norm:
+                    # One norm per raw aux stream, shared across every layer's
+                    # FC (matches stock fc_norm semantics; keeps param count
+                    # independent of num_layers).
+                    self.fc_norm = nn.ModuleList(
+                        [
+                            LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                            for _ in range(self.num_aux_hidden_states)
+                        ]
+                    )
+            elif use_fc_norm:
                 logger.warning(
                     "fc_norm is ignored in progressive_staged (no fusion FC)."
                 )
@@ -717,6 +804,50 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
             raise NotImplementedError(
                 "gist_conditioning is implemented for stock fused_fc EAGLE-3.1 only"
             )
+        if self.progressive_banded_mix:
+            expected = self.hidden_size * self.num_aux_hidden_states
+            if hidden_states.shape[-1] != expected:
+                raise ValueError(
+                    "progressive_banded_mix expects concat aux HS of size "
+                    f"{expected}, got {hidden_states.shape[-1]}"
+                )
+            source_chunks = hidden_states.split(self.hidden_size, dim=-1)
+            mixed_chunks = []
+            offset = 0
+            assert self.aux_mix_norms is not None
+            for band_idx, (band, norm) in enumerate(
+                zip(self.aux_layer_bands, self.aux_mix_norms)
+            ):
+                band_chunks = source_chunks[offset : offset + len(band)]
+                band_stack = torch.stack(band_chunks, dim=-1)
+                logits = getattr(self, f"band{band_idx}_mix_logits")
+                weights = torch.softmax(logits.float(), dim=0).to(
+                    device=band_stack.device, dtype=band_stack.dtype
+                )
+                mixed_chunks.append(norm(torch.matmul(band_stack, weights)))
+                offset += len(band)
+            self._aux_inject = tuple(mixed_chunks)
+            return mixed_chunks[0]
+        if self.progressive_staged and self.progressive_per_layer_fc:
+            # Every draft layer sees ALL aux streams via its own independent
+            # nH->H projection (vs. the raw one-stream-per-layer inject
+            # below), so num_aux_hidden_states need not equal num_layers here.
+            expected = self.hidden_size * self.num_aux_hidden_states
+            if hidden_states.shape[-1] != expected:
+                raise ValueError(
+                    "progressive_per_layer_fc expects concat aux HS of size "
+                    f"{expected} (=num_aux_hidden_states*H), got {hidden_states.shape[-1]}"
+                )
+            if self.fc_norm is not None:
+                chunks = hidden_states.split(self.hidden_size, dim=-1)
+                hidden_states = torch.cat(
+                    [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                    dim=-1,
+                )
+            aux_all = hidden_states  # [B, S, num_aux*H], computed once, shared by every layer
+            fused = tuple(fc(aux_all) for fc in self.progressive_fc)
+            self._aux_inject = fused
+            return fused[0]
         if self.progressive_staged or self.hawk:
             # One aux stream per draft layer (concat width = n*H).
             n = len(self.layers)
@@ -827,6 +958,8 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         Returns the L0 residual seed: ``h0`` for EAGLE 3, or post-norm of the
         last layer out when ``norm_output`` is set (EAGLE 3.1).
         """
+        if self.disable_progressive_feedback:
+            return None
         outs = self._last_layer_outs
         if not outs:
             return None
@@ -834,6 +967,19 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
         if self.norm_output:
             return self.norm(outs[-1])
         return outs[0]
+
+    def get_banded_aux_mix_weights(self) -> Dict[str, Dict[str, float]]:
+        """Return layer-labelled softmax weights for checkpoint diagnostics."""
+        if not self.progressive_banded_mix:
+            return {}
+        result: Dict[str, Dict[str, float]] = {}
+        for band_idx, band in enumerate(self.aux_layer_bands):
+            logits = getattr(self, f"band{band_idx}_mix_logits")
+            weights = torch.softmax(logits.detach().float(), dim=0).cpu().tolist()
+            result[f"band{band_idx}"] = {
+                str(layer_id): weight for layer_id, weight in zip(band, weights)
+            }
+        return result
 
     def init_cache_hidden(self):
         """Per-draft-layer KV cache containers for the speculative train loop."""

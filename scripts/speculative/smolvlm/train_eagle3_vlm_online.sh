@@ -57,7 +57,12 @@ esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT"
 
+# Repo must be first so its angelslim/ shadows any installed package.
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+
+# PYTHON — interpreter to use for single-process launch.
+#   Override to point at a conda env: PYTHON=/home/hyang/miniconda3/envs/angel/bin/python
+PYTHON=${PYTHON:-python}
 if [[ -f "${ROOT}/third_party/env.sh" ]]; then
   # shellcheck disable=SC1091
   source "${ROOT}/third_party/env.sh"
@@ -249,7 +254,7 @@ case "${LAUNCH}" in
     unset RANK LOCAL_RANK WORLD_SIZE GROUP_RANK LOCAL_WORLD_SIZE MASTER_ADDR MASTER_PORT \
       TORCHELASTIC_RUN_ID TORCHELASTIC_RESTART_COUNT TORCHELASTIC_MAX_RESTARTS \
       TORCHELASTIC_USE_AGENT_STORE 2>/dev/null || true
-    python "${ARGS[@]}"
+    "${PYTHON}" "${ARGS[@]}"
     ;;
   *)
     echo "ERROR: LAUNCH must be torchrun or python, got: ${LAUNCH}" >&2

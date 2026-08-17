@@ -105,6 +105,13 @@ TP="${TP:-1}"
 # GPU_MEMORY_UTILIZATION — vLLM GPU mem fraction. Typical: 0.7|0.9
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
 
+# ALLOW_CUDA_GRAPHS - 1 lets vLLM use torch.compile/CUDA graphs.
+#   Default keeps historical behavior: eager execution.
+ALLOW_CUDA_GRAPHS="${ALLOW_CUDA_GRAPHS:-0}"
+
+# MAX_CUDAGRAPH_CAPTURE_SIZE - explicit capture bound for small bs1 graph tests.
+MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-24}"
+
 # CUDA_VISIBLE_DEVICES — which GPU(s) this eval sees. Example: 0 | 0,1
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
@@ -244,9 +251,13 @@ CMD=(
   --gpu_memory_utilization "${GPU_MEMORY_UTILIZATION}"
   --output_len "${OUTPUT_LEN}"
   --tp "${TP}"
+  --max_cudagraph_capture_size "${MAX_CUDAGRAPH_CAPTURE_SIZE}"
   --output_file "${OUTPUT_FILE}"
 )
 CMD+=("${EXTRA[@]}")
+if [[ "${ALLOW_CUDA_GRAPHS}" != "1" ]]; then
+  CMD+=(--enforce_eager)
+fi
 if [[ ${#DEBUG_ARGS[@]} -gt 0 ]]; then
   CMD+=("${DEBUG_ARGS[@]}")
 fi

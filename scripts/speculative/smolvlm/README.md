@@ -388,6 +388,59 @@ So: Gloo 4-GPU ≡ NCCL 4-GPU (same step count). Plain python does **not** need 
 
 Also lower HF datasets workers if mp is flaky: `NUM_PROC=1`.
 
+### Angel conda environment
+
+If your system Python is not the right interpreter (e.g. the Angel env at
+`/home/hyang/miniconda3/envs/angel`), use the `PYTHON` override.
+`TRAIN_MODE=python` is required for single-GPU runs without torchrun.
+
+The repo must lead `PYTHONPATH` so the local `angelslim/` shadows any
+installed package — the script already handles this, but if you see
+`ModuleNotFoundError: angelslim.compressor.qat` it means a stale pip install
+is winning; verify `PYTHONPATH` starts with the repo root.
+
+**Eagle3 (1 draft layer, stock fused_fc):**
+
+```bash
+TRAIN_MODE=python \
+PYTHON=/home/hyang/miniconda3/envs/angel/bin/python \
+CUDA_VISIBLE_DEVICES=0 \
+TRAIN_DATA_PATH=/path/to/conversations.jsonl \
+OUTPUT_DIR=output/smolvlm_256m_eagle3 \
+NUM_PROC=1 \
+  bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+```
+
+**Progressive Eagle3 (3 draft layers, aux injected per layer):**
+
+```bash
+TRAIN_MODE=python \
+PYTHON=/home/hyang/miniconda3/envs/angel/bin/python \
+CUDA_VISIBLE_DEVICES=0 \
+DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3-progressive.json \
+TRAIN_DATA_PATH=/path/to/conversations.jsonl \
+OUTPUT_DIR=output/smolvlm_256m_eagle3_progressive \
+TARGET_HS_WARMUP_STEPS=200 \
+NUM_PROC=1 \
+  bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+```
+
+`TARGET_HS_WARMUP_STEPS` controls how many optimizer steps each draft layer is
+forced to use ground-truth target aux HS before switching to its own prior-step
+output. Set to 0 to disable warmup entirely (not recommended for progressive).
+
+**Smoke run (2 steps, no checkpoint):**
+
+```bash
+TRAIN_MODE=python \
+PYTHON=/home/hyang/miniconda3/envs/angel/bin/python \
+CUDA_VISIBLE_DEVICES=0 \
+TRAIN_DATA_PATH=/home/hyang/AngelSlim/dataset/mixed_text_vl_36/mixed_text_vl_36.jsonl \
+OUTPUT_DIR=/tmp/eagle3_smoke \
+MAX_STEPS=2 SAVE_STRATEGY=no NUM_PROC=1 \
+  bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+```
+
 ---
 
 ## 4. Offline vLLM Eagle3 eval
