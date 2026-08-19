@@ -667,15 +667,10 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 raise ValueError(
                     "eagle_aux_band_init_layer_ids must have one id per aux band"
                 )
-            for band_idx, (band, init_layer_id) in enumerate(
-                zip(self.aux_layer_bands, init_layer_ids)
-            ):
-                if int(init_layer_id) not in band:
-                    raise ValueError(
-                        f"band {band_idx} init layer {init_layer_id} is not in {band}"
-                    )
+            for band_idx, band in enumerate(self.aux_layer_bands):
+                # Uniform init: all-zeros logits → equal softmax weight across all
+                # layers in the band. Lets training discover the best mix freely.
                 logits = torch.zeros(len(band), dtype=torch.float32)
-                logits[band.index(int(init_layer_id))] = 4.0
                 self.register_parameter(f"band{band_idx}_mix_logits", nn.Parameter(logits))
             self.aux_mix_norms = nn.ModuleList(
                 [
