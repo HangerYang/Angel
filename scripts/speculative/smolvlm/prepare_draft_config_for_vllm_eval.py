@@ -136,6 +136,36 @@ def prepare_draft_config(
                 f"== num_hidden_layers ({num_layers}), got {len(eagle_aux_ids)}"
             )
         updates["num_aux_hidden_states"] = num_layers
+    elif injection_mode == "progressive_banded_mix":
+        # Banded mix: N aux streams (N > num_layers) are grouped into num_layers
+        # bands; each band is softmax-mixed to one stream per draft layer.
+        # num_aux_hidden_states = total number of aux streams (= len of flat bands).
+        raw_bands = cfg.get("eagle_aux_layer_bands", train_cfg.get("eagle_aux_layer_bands"))
+        if not raw_bands:
+            raise ValueError(
+                "progressive_banded_mix requires eagle_aux_layer_bands in draft "
+                "config.json or train config. Run this script with "
+                "--draft_model_config_path pointing at the train JSON."
+            )
+        flat_band_ids = [layer_id for band in raw_bands for layer_id in band]
+        num_aux = len(flat_band_ids)
+        if eagle_aux_ids is not None and len(eagle_aux_ids) != num_aux:
+            raise ValueError(
+                "progressive_banded_mix: len(eagle_aux_hidden_state_layer_ids) "
+                f"({len(eagle_aux_ids)}) must equal total aux streams in bands "
+                f"({num_aux})"
+            )
+        updates["num_aux_hidden_states"] = num_aux
+        # Propagate band fields from checkpoint or train config if missing.
+        for key in ("eagle_aux_layer_bands", "eagle_aux_band_init_layer_ids"):
+            val = cfg.get(key, train_cfg.get(key))
+            if val is not None:
+                updates[key] = val
+            elif key == "eagle_aux_layer_bands":
+                raise ValueError(
+                    f"progressive_banded_mix requires {key}; not found in "
+                    "checkpoint config or train config."
+                )
     elif injection_mode in ("hawk", "real_hawk", "layer_skip_lora"):
         # Progressive hawk / real_hawk: one aux stream per draft layer.
         if aux_ids is not None and len(aux_ids) != num_layers:
@@ -196,9 +226,13 @@ def prepare_draft_config(
     print(f"  norm_output: {cfg.get('norm_output', False)}")
     print(f"  num_hidden_layers: {num_layers} "
           f"({'single-layer' if num_layers == 1 else f'{num_layers}-layer'} draft)")
+    print(f"  num_aux_hidden_states: {cfg.get('num_aux_hidden_states')}")
     print(f"  aux_hidden_states_layer_ids (train): {cfg.get('aux_hidden_states_layer_ids')}")
     print(f"  eagle_aux_hidden_state_layer_ids (vLLM): "
           f"{cfg.get('eagle_aux_hidden_state_layer_ids')}")
+    if injection_mode == "progressive_banded_mix":
+        print(f"  eagle_aux_layer_bands: {cfg.get('eagle_aux_layer_bands')}")
+        print(f"  eagle_aux_band_init_layer_ids: {cfg.get('eagle_aux_band_init_layer_ids')}")
     if draft_init is not None:
         print(f"  draft_layer_init_from_target: {draft_init}")
     if changed:

@@ -1,3 +1,58 @@
+diff --git a/vllm/angelslim_latency.py b/vllm/angelslim_latency.py
+new file mode 100644
+index 0000000..c507db9
+--- /dev/null
++++ b/vllm/angelslim_latency.py
+@@ -0,0 +1,49 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Tiny opt-in latency logger for AngelSlim EAGLE debugging."""
++
++from __future__ import annotations
++
++import json
++import os
++import time
++from contextlib import contextmanager
++from typing import Any, Iterator
++
++
++def enabled() -> bool:
++    return os.environ.get("ANGELSLIM_EAGLE_LATENCY", "").strip().lower() in {
++        "1",
++        "true",
++        "yes",
++        "on",
++    }
++
++
++def _sync() -> None:
++    try:
++        import torch
++
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++    except Exception:
++        pass
++
++
++@contextmanager
++def time_block(name: str, **meta: Any) -> Iterator[None]:
++    if not enabled():
++        yield
++        return
++    _sync()
++    t0 = time.perf_counter()
++    try:
++        yield
++    finally:
++        _sync()
++        rec = {
++            "event": name,
++            "ms": (time.perf_counter() - t0) * 1000.0,
++            "pid": os.getpid(),
++            **meta,
++        }
++        print("[ANGELSLIM_EAGLE_LATENCY] " + json.dumps(rec, sort_keys=True), flush=True)
 diff --git a/vllm/envs.py b/vllm/envs.py
 old mode 100755
 new mode 100644
@@ -30,7 +85,7 @@ index 13a19b8..dbf23e4
  
 diff --git a/vllm/model_executor/models/eagle_miracle.py b/vllm/model_executor/models/eagle_miracle.py
 new file mode 100644
-index 0000000..1111111
+index 0000000..ad7ca99
 --- /dev/null
 +++ b/vllm/model_executor/models/eagle_miracle.py
 @@ -0,0 +1,377 @@
@@ -411,11 +466,50 @@ index 0000000..1111111
 +        if tok is not None:
 +            draft_tokens_col[i] = tok
 +
+diff --git a/vllm/model_executor/models/idefics3.py b/vllm/model_executor/models/idefics3.py
+index cf7d51c..c935224 100644
+--- a/vllm/model_executor/models/idefics3.py
++++ b/vllm/model_executor/models/idefics3.py
+@@ -58,6 +58,7 @@ from .idefics2_vision_model import (
+ )
+ from .interfaces import (
+     MultiModalEmbeddings,
++    SupportsEagle3,
+     SupportsLoRA,
+     SupportsMultiModal,
+ )
+@@ -546,7 +547,9 @@ class Idefics3Model(nn.Module):
+     info=Idefics3ProcessingInfo,
+     dummy_inputs=Idefics3DummyInputsBuilder,
+ )
+-class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA):
++class Idefics3ForConditionalGeneration(
++    nn.Module, SupportsMultiModal, SupportsLoRA, SupportsEagle3
++):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -598,6 +601,15 @@ class Idefics3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLo
+             self.lm_head.weight = self.model.text_model.embed_tokens.weight
+         self.logits_processor = LogitsProcessor(config.text_config.vocab_size)
+ 
++    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        # text_model is LlamaModel (EagleModelMixin); default SupportsEagle3
++        # expects language_model.model, which Idefics3/SmolVLM does not have.
++        self.model.text_model._set_aux_hidden_state_layers(layers)
++
++    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
++        num_layers = len(self.model.text_model.layers)
++        return (2, num_layers // 2, num_layers - 3)
++
+     def _parse_and_validate_image_input(self, **kwargs: object) -> ImageInputs | None:
+         pixel_values = kwargs.pop("pixel_values", None)
+         image_embeds = kwargs.pop("image_embeds", None)
 diff --git a/vllm/model_executor/models/llama_eagle3.py b/vllm/model_executor/models/llama_eagle3.py
-index 2d859bd..3bc9a0f 100644
+index 2d859bd..0d8e6d0 100644
 --- a/vllm/model_executor/models/llama_eagle3.py
 +++ b/vllm/model_executor/models/llama_eagle3.py
-@@ -1,6 +1,7 @@
+@@ -1,14 +1,18 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  
@@ -423,15 +517,18 @@ index 2d859bd..3bc9a0f 100644
  from collections.abc import Iterable
  
  import torch
-@@ -9,6 +10,7 @@ from transformers import LlamaConfig
+ import torch.nn as nn
+ from transformers import LlamaConfig
++from transformers.activations import ACT2FN
  
++from vllm.angelslim_latency import time_block as angelslim_time_block
  from vllm.compilation.decorators import support_torch_compile
  from vllm.config import VllmConfig, get_current_vllm_config
 +from vllm.forward_context import override_forward_context
  from vllm.logger import init_logger
  from vllm.model_executor.layers.layernorm import RMSNorm
  from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
-@@ -21,6 +23,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+@@ -21,6 +25,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
  from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaForCausalLM
  from vllm.multimodal.inputs import NestedTensors
  
@@ -439,7 +536,36 @@ index 2d859bd..3bc9a0f 100644
  from .utils import (
      AutoWeightsLoader,
      WeightsMapper,
-@@ -45,9 +48,19 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+@@ -31,6 +36,28 @@ from .utils import (
+ 
+ logger = init_logger(__name__)
+ 
++PROGRESSIVE_MODES = frozenset({"progressive_staged", "progressive_banded_mix"})
++
++
++class EarlyExitBridge(nn.Module):
++    """Residual MLP: approx_h_next = h + w2(act(w1(norm(h)))).
++
++    w2 is zero-initialized so the bridge starts as pure identity.
++    """
++
++    def __init__(
++        self, hidden_size: int, intermediate_size: int, hidden_act: str, rms_norm_eps: float
++    ):
++        super().__init__()
++        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
++        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
++        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
++        self.act_fn = ACT2FN[hidden_act]
++        nn.init.zeros_(self.w2.weight)
++
++    def forward(self, h: torch.Tensor) -> torch.Tensor:
++        return h + self.w2(self.act_fn(self.w1(self.norm(h))))
++
+ 
+ class LlamaDecoderLayer(LlamaDecoderLayer):
+     def __init__(
+@@ -45,9 +72,24 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
          config = config or vllm_config.model_config.hf_config
          quant_config = self.get_quant_config(vllm_config)
  
@@ -447,7 +573,8 @@ index 2d859bd..3bc9a0f 100644
 -        # Subsequent layers use hidden_size (only hidden_states, no embeds)
 -        qkv_input_size = 2 * self.hidden_size if layer_idx == 0 else self.hidden_size
 +        mode = getattr(config, "eagle_aux_injection_mode", "fused_fc")
-+        self.progressive_staged = mode == "progressive_staged"
++        self.progressive_staged = mode in PROGRESSIVE_MODES
++        self.per_layer_weighted_sum = mode == "per_layer_weighted_sum"
 +        self.hawk = mode == "hawk"
 +        # Hawk: always H. Progressive: 2H on every layer. Stock: 2H only on L0.
 +        qkv_input_size = (
@@ -455,14 +582,18 @@ index 2d859bd..3bc9a0f 100644
 +            if self.hawk
 +            else (
 +                2 * self.hidden_size
-+                if (layer_idx == 0 or self.progressive_staged)
++                if (
++                    layer_idx == 0
++                    or self.progressive_staged
++                    or self.per_layer_weighted_sum
++                )
 +                else self.hidden_size
 +            )
 +        )
  
          # Parallel drafting checkpoints may have attention bias enabled
          qkv_bias = getattr(config, "attention_bias", False)
-@@ -95,12 +108,36 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+@@ -95,12 +137,49 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
          embeds: torch.Tensor,
          hidden_states: torch.Tensor,
          residual: torch.Tensor | None,
@@ -482,10 +613,15 @@ index 2d859bd..3bc9a0f 100644
              embeds = self.input_layernorm(embeds)
              hidden_states, residual = self._residual_norm(hidden_states=hidden_states)
              hidden_states = torch.cat([embeds, hidden_states], dim=-1)
-+        elif self.progressive_staged:
++        elif self.progressive_staged or self.per_layer_weighted_sum:
 +            if inject is None:
++                mode_name = (
++                    "per_layer_weighted_sum"
++                    if self.per_layer_weighted_sum
++                    else "progressive_staged"
++                )
 +                raise ValueError(
-+                    f"progressive_staged layer {self.layer_idx} requires inject HS"
++                    f"{mode_name} layer {self.layer_idx} requires inject HS"
 +                )
 +            # vLLM layers return (mlp_out, residual) with the add deferred to the
 +            # next layer. Materialize h_prev before staged inject so we match
@@ -496,25 +632,79 @@ index 2d859bd..3bc9a0f 100644
 +            left = self.input_layernorm(hidden_states)
 +            residual = hidden_states
 +            right = self.hidden_norm(inject)
++            if right.shape[0] != left.shape[0]:
++                if right.shape[0] > left.shape[0]:
++                    right = right[: left.shape[0]]
++                else:
++                    pad = right.new_zeros(
++                        left.shape[0] - right.shape[0], right.shape[1]
++                    )
++                    right = torch.cat([right, pad], dim=0)
 +            hidden_states = torch.cat([left, right], dim=-1)
          else:
              # Subsequent layers: process hidden_states and residuals only
              hidden_states, residual = self.input_layernorm(hidden_states, residual)
-@@ -152,6 +189,52 @@ class LlamaModel(nn.Module):
+@@ -119,13 +198,25 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+         return hidden_states, residual
+ 
+ 
++def _should_compile_eagle3_draft(vllm_config: VllmConfig) -> bool:
++    hf_config = vllm_config.speculative_config.draft_model_config.hf_config
++    mode = getattr(hf_config, "eagle_aux_injection_mode", "fused_fc")
++    return mode not in {
++        "progressive_staged",
++        "progressive_banded_mix",
++        "hawk",
++        "per_layer_weighted_sum",
++    }
++
++
+ @support_torch_compile(
+     dynamic_arg_dims={
+         "input_ids": 0,
+         "positions": -1,
+         "hidden_states": 0,
+         "input_embeds": 0,
+-    }
++    },
++    enable_if=_should_compile_eagle3_draft,
+ )
+ class LlamaModel(nn.Module):
+     def __init__(
+@@ -152,6 +243,86 @@ class LlamaModel(nn.Module):
                  "norm_before_fc", getattr(self.config, "norm_before_fc", False)
              )
          )
 +        mode = getattr(self.config, "eagle_aux_injection_mode", "fused_fc")
-+        self.progressive_staged = mode == "progressive_staged"
++        self.progressive_banded_mix = mode == "progressive_banded_mix"
++        self.progressive_staged = mode in PROGRESSIVE_MODES
++        self.progressive_per_layer_fc = bool(
++            getattr(self.config, "progressive_per_layer_fc", False)
++        )
++        if self.progressive_per_layer_fc and mode != "progressive_staged":
++            raise ValueError(
++                "progressive_per_layer_fc requires "
++                "eagle_aux_injection_mode='progressive_staged'"
++            )
++        self.disable_progressive_feedback = bool(
++            getattr(self.config, "disable_progressive_feedback", False)
++        )
++        self.per_layer_weighted_sum = mode == "per_layer_weighted_sum"
 +        self.hawk = mode == "hawk"
 +        self.drop_image_l0_replace = (
 +            self.progressive_staged
++            and not bool(
++                getattr(self.config, "hivis_remove_image_tokens", False)
++                or getattr(self.config, "remove_image_tokens", False)
++            )
 +            and os.environ.get("VLLM_EAGLE_DROP_IMAGE_L0_REPLACE", "0").strip().lower()
 +            in ("1", "true", "yes", "on")
 +        )
 +        self.image_token_id = int(getattr(self.config, "image_token_id", 49190))
 +        # Per-layer aux (progressive concat or hawk H-fusion); no early fc.
-+        self.per_layer_aux = self.progressive_staged or self.hawk
++        self.per_layer_aux = (
++            self.progressive_staged or self.hawk or self.per_layer_weighted_sum
++        )
 +        if self.progressive_staged:
 +            logger.info(
 +                "Eagle3 progressive_staged enabled: per-layer aux inject, no fc "
@@ -527,18 +717,33 @@ index 2d859bd..3bc9a0f 100644
 +                "(num_hidden_layers=%s)",
 +                self.config.num_hidden_layers,
 +            )
++        if self.per_layer_weighted_sum:
++            logger.info(
++                "Eagle3 per_layer_weighted_sum enabled: learned static aux mix, no fc "
++                "(num_hidden_layers=%s)",
++                self.config.num_hidden_layers,
++            )
 +        # Per-layer inject buffers set by combine_hidden_states / set_aux_inject.
 +        self._aux_inject: list[torch.Tensor] | None = None
 +        self._last_layer_outs: list[torch.Tensor] | None = None
-+        self._l0_compact_prefill: tuple[torch.Tensor, torch.Tensor, object] | None = None
++        self._early_exit_threshold = float(
++            getattr(self.config, "early_exit_threshold", -1.0)
++        )
++        self._early_exit_min_layer = int(getattr(self.config, "early_exit_min_layer", 0))
++        # Callback set by Eagle3LlamaForCausalLM after it creates lm_head.
++        self._early_exit_compute_logits = None
++        self._l0_compact_prefill: tuple[torch.Tensor, torch.Tensor, object] | None = (
++            None
++        )
 +        self.fuse_w1: ReplicatedLinear | None = None
 +        self.fuse_w2: ReplicatedLinear | None = None
++        self.progressive_fc: nn.ModuleList | None = None
++        self.aux_mix_norms: nn.ModuleList | None = None
++        self.aux_layer_bands: tuple[tuple[int, ...], ...] = ()
 +        # Miracle (oracle GT-HS): position-indexed target aux along a trajectory.
 +        # Config eagle_miracle_mode / env VLLM_EAGLE_MIRACLE_MODE (+ HS dir/phase).
 +        # Works for fused_fc, progressive_staged, and hawk.
-+        self.miracle_mode = bool(
-+            getattr(self.config, "eagle_miracle_mode", False)
-+        ) or (
++        self.miracle_mode = bool(getattr(self.config, "eagle_miracle_mode", False)) or (
 +            os.environ.get("VLLM_EAGLE_MIRACLE_MODE", "0").strip().lower()
 +            in ("1", "true", "yes", "on")
 +        )
@@ -553,7 +758,7 @@ index 2d859bd..3bc9a0f 100644
  
          current_vllm_config = get_current_vllm_config()
  
-@@ -179,41 +262,74 @@ class LlamaModel(nn.Module):
+@@ -179,41 +350,240 @@ class LlamaModel(nn.Module):
              if self.num_aux_hidden_states is None:
                  eagle_config = getattr(self.config, "eagle_config", None) or {}
                  layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
@@ -571,6 +776,7 @@ index 2d859bd..3bc9a0f 100644
              target_hidden_size = getattr(
                  self.config, "target_hidden_size", self.config.hidden_size
              )
++            self.target_hidden_size = int(target_hidden_size)
              self.fc_input_size = target_hidden_size * self.num_aux_hidden_states
  
 -            if self.norm_before_fc:
@@ -589,21 +795,173 @@ index 2d859bd..3bc9a0f 100644
 -                    [
 -                        RMSNorm(target_hidden_size, eps=self.config.rms_norm_eps)
 -                        for _ in range(self.num_aux_hidden_states)
--                    ]
--                )
--            else:
-                 self.fc_norm = None
--
--            self.fc = ReplicatedLinear(
--                input_size=self.fc_input_size,
--                output_size=self.config.hidden_size,
--                bias=False,
--                params_dtype=vllm_config.model_config.dtype,
--                quant_config=self.quant_config,
--                prefix=maybe_prefix(prefix, "fc"),
--                return_bias=False,
--            )
++                self.fc_norm = None
 +                self.fc = None
++                if (
++                    self.progressive_staged
++                    and not self.progressive_banded_mix
++                    and not self.progressive_per_layer_fc
++                    and self.target_hidden_size != self.config.hidden_size
++                ):
++                    self.aux_proj = nn.ModuleList(
++                        [
++                            ReplicatedLinear(
++                                input_size=self.target_hidden_size,
++                                output_size=self.config.hidden_size,
++                                bias=False,
++                                params_dtype=vllm_config.model_config.dtype,
++                                quant_config=self.quant_config,
++                                prefix=maybe_prefix(prefix, f"aux_proj.{i}"),
++                                return_bias=False,
++                            )
++                            for i in range(self.config.num_hidden_layers)
++                        ]
++                    )
++                else:
++                    self.aux_proj = None
++                if self.progressive_banded_mix:
++                    if self.target_hidden_size != self.config.hidden_size:
++                        raise ValueError(
++                            "progressive_banded_mix requires target_hidden_size "
++                            "to equal hidden_size"
++                        )
++                    raw_bands = getattr(self.config, "eagle_aux_layer_bands", None)
++                    if not raw_bands:
++                        raise ValueError(
++                            "progressive_banded_mix requires eagle_aux_layer_bands"
++                        )
++                    self.aux_layer_bands = tuple(
++                        tuple(int(layer_id) for layer_id in band) for band in raw_bands
++                    )
++                    if len(self.aux_layer_bands) != len(self.layers) or any(
++                        not band for band in self.aux_layer_bands
++                    ):
++                        raise ValueError(
++                            "progressive_banded_mix requires one non-empty aux band "
++                            f"per draft layer; got {self.aux_layer_bands}"
++                        )
++                    aux_ids = getattr(self.config, "aux_hidden_states_layer_ids", None)
++                    flat_band_ids = [
++                        layer_id for band in self.aux_layer_bands for layer_id in band
+                     ]
++                    if aux_ids is None or flat_band_ids != [
++                        int(layer_id) for layer_id in aux_ids
++                    ]:
++                        raise ValueError(
++                            "aux_hidden_states_layer_ids must equal flattened "
++                            f"eagle_aux_layer_bands; got {aux_ids} vs {flat_band_ids}"
++                        )
++                    if len(flat_band_ids) != self.num_aux_hidden_states:
++                        raise ValueError(
++                            "progressive_banded_mix aux stream count mismatch: "
++                            f"bands contain {len(flat_band_ids)}, config expects "
++                            f"{self.num_aux_hidden_states}"
++                        )
++                    init_layer_ids = list(
++                        getattr(
++                            self.config,
++                            "eagle_aux_band_init_layer_ids",
++                            [band[0] for band in self.aux_layer_bands],
++                        )
++                    )
++                    if len(init_layer_ids) != len(self.aux_layer_bands):
++                        raise ValueError(
++                            "eagle_aux_band_init_layer_ids must have one id per band"
++                        )
++                    for band_idx, (band, init_layer_id) in enumerate(
++                        zip(self.aux_layer_bands, init_layer_ids)
++                    ):
++                        init_layer_id = int(init_layer_id)
++                        if init_layer_id not in band:
++                            raise ValueError(
++                                f"band {band_idx} init layer {init_layer_id} "
++                                f"is not in {band}"
++                            )
++                        logits = torch.zeros(len(band), dtype=torch.float32)
++                        logits[band.index(init_layer_id)] = 4.0
++                        self.register_parameter(
++                            f"band{band_idx}_mix_logits", nn.Parameter(logits)
++                        )
++                    self.aux_mix_norms = nn.ModuleList(
++                        [
++                            RMSNorm(
++                                self.config.hidden_size,
++                                eps=self.config.rms_norm_eps,
++                            )
++                            for _ in self.aux_layer_bands
++                        ]
++                    )
++                if self.progressive_per_layer_fc:
++                    self.progressive_fc = nn.ModuleList(
++                        [
++                            ReplicatedLinear(
++                                input_size=self.fc_input_size,
++                                output_size=self.config.hidden_size,
++                                bias=False,
++                                params_dtype=vllm_config.model_config.dtype,
++                                quant_config=self.quant_config,
++                                prefix=maybe_prefix(prefix, f"progressive_fc.{i}"),
++                                return_bias=False,
++                            )
++                            for i in range(self.config.num_hidden_layers)
++                        ]
++                    )
++                    if bool(getattr(self.config, "fc_norm", False)):
++                        self.fc_norm = nn.ModuleList(
++                            [
++                                RMSNorm(
++                                    self.target_hidden_size,
++                                    eps=self.config.rms_norm_eps,
++                                )
++                                for _ in range(self.num_aux_hidden_states)
++                            ]
++                        )
++                # Early-exit bridges: residual MLPs for approximating deeper layers
++                self.early_exit_bridges = bool(
++                    getattr(self.config, "early_exit_bridges", False)
+                 )
++                self.bridges: nn.ModuleList | None = None
++                if self.early_exit_bridges:
++                    bridge_mid = int(
++                        getattr(self.config, "bridge_intermediate_size", None)
++                        or self.config.hidden_size
++                    )
++                    self.bridges = nn.ModuleList(
++                        [
++                            EarlyExitBridge(
++                                self.config.hidden_size,
++                                bridge_mid,
++                                self.config.hidden_act,
++                                self.config.rms_norm_eps,
++                            )
++                            for _ in range(self.config.num_hidden_layers - 1)
++                        ]
++                    )
++                # progressive_fc_draft_feedback: step 1+ mirrors step 0 via FC
++                self.progressive_fc_draft_feedback = bool(
++                    getattr(self.config, "progressive_fc_draft_feedback", False)
++                )
++                if self.progressive_fc_draft_feedback and not self.progressive_per_layer_fc:
++                    raise ValueError(
++                        "progressive_fc_draft_feedback requires progressive_per_layer_fc=True"
++                    )
++                if self.per_layer_weighted_sum:
++                    self.aux_fuse_logits = nn.Parameter(
++                        torch.zeros(
++                            self.config.num_hidden_layers,
++                            self.num_aux_hidden_states,
++                            dtype=vllm_config.model_config.dtype,
++                        )
++                    )
++                    self.aux_fuse_norms = nn.ModuleList(
++                        [
++                            RMSNorm(
++                                self.config.hidden_size,
++                                eps=self.config.rms_norm_eps,
++                            )
++                            for _ in range(self.config.num_hidden_layers)
++                        ]
++                    )
 +                if self.hawk:
 +                    self.fuse_w1 = ReplicatedLinear(
 +                        input_size=self.config.hidden_size,
@@ -623,7 +981,8 @@ index 2d859bd..3bc9a0f 100644
 +                        prefix=maybe_prefix(prefix, "fuse_w2"),
 +                        return_bias=False,
 +                    )
-+            else:
+             else:
+-                self.fc_norm = None
 +                if self.norm_before_fc:
 +                    self.input_norm = RMSNorm(
 +                        self.fc_input_size,
@@ -631,7 +990,16 @@ index 2d859bd..3bc9a0f 100644
 +                    )
 +                else:
 +                    self.input_norm = None
-+
+ 
+-            self.fc = ReplicatedLinear(
+-                input_size=self.fc_input_size,
+-                output_size=self.config.hidden_size,
+-                bias=False,
+-                params_dtype=vllm_config.model_config.dtype,
+-                quant_config=self.quant_config,
+-                prefix=maybe_prefix(prefix, "fc"),
+-                return_bias=False,
+-            )
 +                use_fc_norm = getattr(self.config, "fc_norm", False)
 +                if use_fc_norm:
 +                    self.fc_norm = nn.ModuleList(
@@ -655,7 +1023,7 @@ index 2d859bd..3bc9a0f 100644
  
          self.norm_output = getattr(self.config, "norm_output", False)
          self.norm = RMSNorm(
-@@ -224,6 +340,21 @@ class LlamaModel(nn.Module):
+@@ -224,6 +594,21 @@ class LlamaModel(nn.Module):
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
  
@@ -677,7 +1045,7 @@ index 2d859bd..3bc9a0f 100644
      def forward(
          self,
          input_ids: torch.Tensor,
-@@ -239,13 +370,100 @@ class LlamaModel(nn.Module):
+@@ -239,13 +624,167 @@ class LlamaModel(nn.Module):
          )
  
          residual = None
@@ -692,7 +1060,11 @@ index 2d859bd..3bc9a0f 100644
 +        start_layer_idx = 0
 +
 +        compact_l0 = self._l0_compact_prefill
-+        if compact_l0 is not None and self.progressive_staged and self._aux_inject is not None:
++        if (
++            compact_l0 is not None
++            and self.progressive_staged
++            and self._aux_inject is not None
++        ):
 +            token_indices, compact_positions, compact_context = compact_l0
 +            if token_indices.numel() > 0 and token_indices.numel() <= input_ids.numel():
 +                layer0 = self.layers[0]
@@ -706,9 +1078,7 @@ index 2d859bd..3bc9a0f 100644
 +                        residual=None,
 +                        inject=None,
 +                    )
-+                h0_complete = (
-+                    hidden0 + residual0 if residual0 is not None else hidden0
-+                )
++                h0_complete = hidden0 + residual0 if residual0 is not None else hidden0
 +                if token_indices.numel() == input_ids.numel():
 +                    # Decode step: all rows are text draft rows, but L0 still
 +                    # uses the compact text-only position/KV timeline.
@@ -724,7 +1094,9 @@ index 2d859bd..3bc9a0f 100644
 +                layer_outs.append(layer_h0)
 +                start_layer_idx = 1
 +
-+        for layer_idx, layer in enumerate(self.layers[start_layer_idx:], start_layer_idx):
++        for layer_idx, layer in enumerate(
++            self.layers[start_layer_idx:], start_layer_idx
++        ):
 +            if self.hawk:
 +                if self.fuse_w1 is None or self.fuse_w2 is None:
 +                    raise RuntimeError("hawk mode missing fuse_w1 / fuse_w2")
@@ -748,20 +1120,34 @@ index 2d859bd..3bc9a0f 100644
 +                )
 +            else:
 +                inject = None
-+                if self.progressive_staged and layer_idx > 0:
++                if (
++                    self.progressive_staged or self.per_layer_weighted_sum
++                ) and layer_idx > 0:
 +                    if self._aux_inject is None or layer_idx >= len(self._aux_inject):
++                        mode_name = (
++                            "per_layer_weighted_sum"
++                            if self.per_layer_weighted_sum
++                            else "progressive_staged"
++                        )
 +                        raise ValueError(
-+                            "progressive_staged forward missing aux inject "
-+                            f"for layer {layer_idx}"
++                            f"{mode_name} forward missing aux inject for layer "
++                            f"{layer_idx}"
 +                        )
 +                    inject = self._aux_inject[layer_idx]
-+                hidden_states, residual = layer(
-+                    positions=positions,
-+                    embeds=input_embeds,
-+                    hidden_states=hidden_states,
-+                    residual=residual,
-+                    inject=inject,
-+                )
++                with angelslim_time_block(
++                    "draft_layer_forward",
++                    layer_idx=int(layer_idx),
++                    progressive=bool(self.progressive_staged),
++                    has_inject=bool(inject is not None),
++                    num_tokens=int(input_ids.numel()),
++                ):
++                    hidden_states, residual = layer(
++                        positions=positions,
++                        embeds=input_embeds,
++                        hidden_states=hidden_states,
++                        residual=residual,
++                        inject=inject,
++                    )
 +            if self.per_layer_aux:
 +                # Materialize full layer output (vLLM defers residual add).
 +                h_complete = (
@@ -780,32 +1166,167 @@ index 2d859bd..3bc9a0f 100644
 +                        hidden_states = h_complete
 +                        residual = None
 +                layer_outs.append(h_complete)
++                if (
++                    self._early_exit_threshold > 0
++                    and self._early_exit_compute_logits is not None
++                    and self.per_layer_aux
++                    and layer_idx >= self._early_exit_min_layer
++                    and layer_idx < len(self.layers) - 1
++                ):
++                    _norm_out = self.norm(h_complete)
++                    h_norm = _norm_out[0] if isinstance(_norm_out, tuple) else _norm_out
++                    logits = self._early_exit_compute_logits(h_norm)
++                    if logits is not None:
++                        conf = logits.float().softmax(-1).amax(-1)
++                        _conf_val = conf.min().item()
++                        # Track confidence distribution and exit events.
++                        if not hasattr(self, "_ee_conf_hist"):
++                            self._ee_conf_hist = {}
++                            self._ee_exit_counts = {}
++                            self._ee_total = 0
++                        self._ee_conf_hist.setdefault(layer_idx, []).append(_conf_val)
++                        self._ee_total += 1
++                        if _conf_val >= self._early_exit_threshold:
++                            self._ee_exit_counts[layer_idx] = (
++                                self._ee_exit_counts.get(layer_idx, 0) + 1
++                            )
++                            break
++                        if self._ee_total % 5000 == 0:
++                            import numpy as np
++                            total = self._ee_total
++                            exits = sum(self._ee_exit_counts.values())
++                            print(
++                                f"[early_exit] checked={total} exited={exits} "
++                                f"({exits/total*100:.1f}%) by_layer={self._ee_exit_counts}",
++                                flush=True,
++                            )
++                            for li, vals in sorted(self._ee_conf_hist.items()):
++                                v = np.array(vals[-5000:])
++                                print(
++                                    f"  layer{li} conf: mean={v.mean():.3f} "
++                                    f"p90={np.percentile(v,90):.3f} "
++                                    f"p99={np.percentile(v,99):.3f} "
++                                    f"max={v.max():.3f}",
++                                    flush=True,
++                                )
++        # Pad layer_outs to full depth when exited early so
++        # take_progressive_draft_feedback always has one inject per layer.
++        if self.per_layer_aux and layer_outs and len(layer_outs) < len(self.layers):
++            last_h = layer_outs[-1]
++            while len(layer_outs) < len(self.layers):
++                layer_outs.append(last_h)
 +        self._last_layer_outs = layer_outs if self.per_layer_aux else None
 +
          hidden_states, hidden_prenorm = self.norm(hidden_states, residual)
  
          # norm_output variant uses the post-norm hidden states.
-@@ -362,7 +580,29 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -301,6 +840,8 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+         self.logits_processor = LogitsProcessor(
+             self.config.draft_vocab_size, scale=logit_scale
+         )
++        # Give LlamaModel access to logit computation for early-exit confidence.
++        self.model._early_exit_compute_logits = self.compute_logits
+         self.draft_id_to_target_id = nn.Parameter(
+             torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+             requires_grad=False,
+@@ -362,7 +903,106 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
      ) -> torch.Tensor:
          if not self.model.use_aux_hidden_state:
              return hidden_states
 +
 +        if self.model.per_layer_aux:
-+            # hidden_states is concat of N aux streams [T, N*H]; stash per-layer
-+            # injects. Progressive uses chunk0 as L0 seed; hawk L0 fuses
-+            # inject0+embed and only needs shape-H placeholder.
++            # hidden_states is concat of N aux streams. Reduced-width progressive
++            # receives target_hidden_size chunks and projects them down to H.
 +            n = self.model.num_aux_hidden_states
 +            h = self.config.hidden_size
-+            mode = "hawk" if self.model.hawk else "progressive_staged"
-+            if hidden_states.shape[-1] != n * h:
++            chunk_h = (
++                self.model.target_hidden_size
++                if self.model.progressive_staged
++                and (
++                    self.model.aux_proj is not None
++                    or self.model.progressive_per_layer_fc
++                )
++                else h
++            )
++            if self.model.hawk:
++                mode = "hawk"
++            elif self.model.progressive_banded_mix:
++                mode = "progressive_banded_mix"
++            elif self.model.progressive_per_layer_fc:
++                mode = "progressive_per_layer_fc"
++            elif self.model.per_layer_weighted_sum:
++                mode = "per_layer_weighted_sum"
++            else:
++                mode = "progressive_staged"
++            if hidden_states.shape[-1] != n * chunk_h:
 +                raise ValueError(
 +                    f"{mode} combine_hidden_states expected "
-+                    f"last dim {n * h}, got {hidden_states.shape[-1]}"
++                    f"last dim {n * chunk_h}, got {hidden_states.shape[-1]}"
 +                )
-+            chunks = list(hidden_states.split(h, dim=-1))
-+            eagle_miracle.set_last_raw_chunks(chunks)
-+            self.model.set_aux_inject(chunks)
-+            return chunks[0]
++            raw_chunks = list(hidden_states.split(chunk_h, dim=-1))
++            eagle_miracle.set_last_raw_chunks(raw_chunks)
++            if self.model.progressive_banded_mix:
++                if self.model.aux_mix_norms is None:
++                    raise RuntimeError("progressive_banded_mix missing aux_mix_norms")
++                mixed_chunks: list[torch.Tensor] = []
++                offset = 0
++                for band_idx, (band, norm) in enumerate(
++                    zip(self.model.aux_layer_bands, self.model.aux_mix_norms)
++                ):
++                    band_chunks = raw_chunks[offset : offset + len(band)]
++                    band_stack = torch.stack(band_chunks, dim=-1)
++                    logits = getattr(self.model, f"band{band_idx}_mix_logits")
++                    weights = torch.softmax(logits.float(), dim=0).to(
++                        device=band_stack.device, dtype=band_stack.dtype
++                    )
++                    mixed_chunks.append(norm(torch.matmul(band_stack, weights)))
++                    offset += len(band)
++                self.model.set_aux_inject(mixed_chunks)
++                return mixed_chunks[0]
++            if self.model.progressive_per_layer_fc:
++                if self.model.progressive_fc is None:
++                    raise RuntimeError(
++                        "progressive_per_layer_fc missing progressive_fc modules"
++                    )
++                chunks = raw_chunks
++                if self.model.fc_norm is not None:
++                    chunks = [
++                        norm(chunk) for norm, chunk in zip(self.model.fc_norm, chunks)
++                    ]
++                aux_all = torch.cat(chunks, dim=-1)
++                fused = [fc(aux_all) for fc in self.model.progressive_fc]
++                self.model.set_aux_inject(fused)
++                return fused[0]
++            chunks = raw_chunks
++            if self.model.progressive_staged and self.model.aux_proj is not None:
++                with angelslim_time_block(
++                    "progressive_aux_project",
++                    num_chunks=int(len(raw_chunks)),
++                    num_tokens=int(hidden_states.shape[0]),
++                ):
++                    chunks = [
++                        proj(chunk)
++                        for proj, chunk in zip(self.model.aux_proj, raw_chunks)
++                    ]
++            if self.model.per_layer_weighted_sum:
++                stacked = torch.stack(chunks, dim=1)
++                weights = torch.softmax(
++                    self.model.aux_fuse_logits.to(dtype=stacked.dtype), dim=-1
++                )
++                mixed = torch.einsum("lt,nth->lnh", weights, stacked)
++                aux_inject = [
++                    norm(mixed[layer_idx])
++                    for layer_idx, norm in enumerate(self.model.aux_fuse_norms)
++                ]
++                self.model.set_aux_inject(aux_inject)
++                return aux_inject[0]
++            with angelslim_time_block(
++                "progressive_set_aux_inject",
++                num_chunks=int(len(chunks)),
++                num_tokens=int(hidden_states.shape[0]),
++            ):
++                self.model.set_aux_inject(chunks)
++                return chunks[0]
 +
          # combine multiple auxiliary hidden states returned by eagle3
 +        n = self.model.num_aux_hidden_states
@@ -815,10 +1336,25 @@ index 2d859bd..3bc9a0f 100644
  
          if self.model.norm_before_fc:
              hidden_states = self.model.input_norm(hidden_states)
-@@ -378,6 +618,80 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -376,7 +1016,147 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+                 dim=-1,
+             )
  
-         return self.model.fc(hidden_states)
- 
+-        return self.model.fc(hidden_states)
++        with angelslim_time_block(
++            "fused_fc_aux_combine",
++            num_tokens=int(hidden_states.shape[0]),
++        ):
++            return self.model.fc(hidden_states)
++
++    def compact_aux_inject(self, indices: torch.Tensor) -> None:
++        """Keep only selected rows of per-layer aux (HiViS compact draft)."""
++        if self.model._aux_inject is None:
++            return
++        self.model._aux_inject = [
++            chunk.index_select(0, indices) for chunk in self.model._aux_inject
++        ]
++
 +    def set_aux_inject_from_list(self, aux_list: list[torch.Tensor]) -> None:
 +        """Set progressive per-layer aux injects (e.g. after gathering last tokens)."""
 +        self.model.set_aux_inject(aux_list)
@@ -838,26 +1374,80 @@ index 2d859bd..3bc9a0f 100644
 +    ) -> torch.Tensor | None:
 +        """After a draft forward, build next-step feedback from draft layer outs.
 +
-+        Returns L0 seed (prev ``h0``). Also sets per-layer injects to
-+        ``[h0, h1, h2, ...]`` so decode reuses drafter HS instead of stale
-+        target aux.
++        Default (Run B): sets per-layer injects to raw ``[h0, h1, h2, ...]``.
++
++        When ``progressive_fc_draft_feedback=True`` (Updated Run B): mirrors
++        step-0 by concatenating all draft layer outputs and projecting through
++        the same per-layer FCs, so every layer sees all depths at step 1+.
++
++        When ``early_exit_bridges`` is on: optionally uses bridges to approximate
++        missing layers when a shallow exit is detected.
++
++        Returns L0 seed: post-norm of the last layer out when ``norm_output``
++        is set (EAGLE 3.1), otherwise ``h0``.
 +        """
-+        outs = getattr(self.model, "_last_layer_outs", None)
-+        if not outs:
-+            return None
-+        gathered: list[torch.Tensor] = []
-+        for h in outs:
-+            if token_indices is not None:
-+                gathered.append(h[token_indices])
-+            elif num_tokens is not None:
-+                gathered.append(h[:num_tokens])
++        with angelslim_time_block(
++            "progressive_draft_feedback",
++            num_tokens=int(num_tokens or 0),
++            has_token_indices=bool(token_indices is not None),
++        ):
++            outs = getattr(self.model, "_last_layer_outs", None)
++            if not outs or self.model.disable_progressive_feedback:
++                return None
++            gathered: list[torch.Tensor] = []
++            for h in outs:
++                if token_indices is not None:
++                    gathered.append(h[token_indices])
++                elif num_tokens is not None:
++                    gathered.append(h[:num_tokens])
++                else:
++                    gathered.append(h)
++
++            # Bridge-based approximation: if bridges available and gathered is shallow,
++            # use bridges to approximate missing layers
++            if (
++                getattr(self.model, "early_exit_bridges", False)
++                and self.model.bridges is not None
++                and len(gathered) < len(self.model.layers)
++            ):
++                exit_depth = len(gathered) - 1
++                h_cur = gathered[-1]
++                for i in range(exit_depth, len(self.model.layers) - 1):
++                    h_cur = self.model.bridges[i](h_cur)
++                    gathered.append(h_cur)
++
++            # Updated Run B: concat all and project through per-layer FCs
++            if (
++                getattr(self.model, "progressive_fc_draft_feedback", False)
++                and self.model.progressive_fc is not None
++            ):
++                fc_norm = getattr(self.model, "fc_norm", None)
++                if fc_norm is not None:
++                    if len(fc_norm) != len(gathered):
++                        raise RuntimeError(
++                            f"progressive_fc_draft_feedback: fc_norm length "
++                            f"({len(fc_norm)}) must equal number of draft "
++                            f"layer outputs ({len(gathered)})"
++                        )
++                    normed = [norm(h) for norm, h in zip(fc_norm, gathered)]
++                else:
++                    normed = gathered
++                draft_all = torch.cat(normed, dim=-1)
++                fused = [fc(draft_all) for fc in self.model.progressive_fc]
++                self.model.set_aux_inject(fused)
 +            else:
-+                gathered.append(h)
-+        self.model.set_aux_inject(gathered)
-+        return gathered[0]
++                # Run B: raw per-layer feedback
++                self.model.set_aux_inject(gathered)
++
++            if self.model.norm_output:
++                return self.model.norm(gathered[-1])
++            return gathered[0]
 +
 +    def is_miracle_mode(self) -> bool:
-+        return bool(getattr(self.model, "miracle_mode", False)) and eagle_miracle.is_enabled()
++        return (
++            bool(getattr(self.model, "miracle_mode", False))
++            and eagle_miracle.is_enabled()
++        )
 +
 +    def apply_miracle_hs(
 +        self,
@@ -892,18 +1482,47 @@ index 2d859bd..3bc9a0f 100644
 +            num_tokens,
 +            combine_fn=self.combine_hidden_states,
 +        )
-+
+ 
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
          model_weights = {}
-         includes_draft_id_mapping = False
-@@ -420,8 +734,12 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+@@ -415,13 +1195,41 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+                 "Please provide mask_hidden in the weights."
+             )
+ 
++        required_fusion_weights: set[str] = set()
++        if self.model.progressive_banded_mix:
++            for band_idx in range(len(self.model.aux_layer_bands)):
++                required_fusion_weights.add(f"model.band{band_idx}_mix_logits")
++                required_fusion_weights.add(f"model.aux_mix_norms.{band_idx}.weight")
++        if self.model.progressive_per_layer_fc:
++            for layer_idx in range(len(self.model.layers)):
++                required_fusion_weights.add(f"model.progressive_fc.{layer_idx}.weight")
++            if self.model.fc_norm is not None:
++                for stream_idx in range(self.model.num_aux_hidden_states):
++                    required_fusion_weights.add(f"model.fc_norm.{stream_idx}.weight")
++        missing_fusion_weights = required_fusion_weights.difference(model_weights)
++        if missing_fusion_weights:
++            missing = ", ".join(sorted(missing_fusion_weights))
++            raise ValueError(
++                "Progressive EAGLE checkpoint is missing required fusion "
++                f"weights: {missing}"
++            )
++
+         skip_substrs = ["mask_hidden"]
+         if not includes_draft_id_mapping:
              skip_substrs.append("draft_id_to_target_id")
          if not includes_embed_tokens:
              skip_substrs.append("embed_tokens")
 -        if not self.model.use_aux_hidden_state:
+-            skip_substrs.append("fc.")
++        # Training registers gist_norm on every draft layer even when gist
++        # conditioning is disabled. It is unused by B/C and has no vLLM peer.
++        skip_substrs.append("gist_norm.")
 +        if not self.model.use_aux_hidden_state or self.model.per_layer_aux:
 +            # Progressive / hawk have no early fc; skip if present in older ckpts.
-             skip_substrs.append("fc.")
++            # Use "model.fc." (not "fc.") so we don't accidentally skip
++            # "model.progressive_fc.*" weights in progressive_per_layer_fc mode.
++            skip_substrs.append("model.fc.")
 +        if not self.model.hawk:
 +            skip_substrs.append("fuse_w1.")
 +            skip_substrs.append("fuse_w2.")
@@ -1331,3 +1950,28 @@ index 747fb3a..1b42b5a 100644
  
  @triton.jit
  def _prepare_prefill_inputs_kernel(
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+index 11961ce..880932d 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+@@ -41,7 +41,19 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+         if hasattr(target_model, "get_language_model")
+         else target_model
+     )
+-    target_inner = target_language_model.model
++    # Most VLMs expose ForCausalLM-style language_model.model (inner decoder).
++    # Idefics3/SmolVLM's get_language_model() returns LlamaModel directly.
++    if hasattr(target_language_model, "model") and hasattr(
++        target_language_model.model, "layers"
++    ):
++        target_inner = target_language_model.model
++    elif hasattr(target_language_model, "layers"):
++        target_inner = target_language_model
++    else:
++        raise AttributeError(
++            f"Cannot locate target decoder layers on "
++            f"{type(target_language_model).__name__}"
++        )
+     draft_inner = eagle_model.model
+ 
+     # Skip embedding sharing under PP — each rank owns its own embedding.

@@ -582,6 +582,10 @@ def main():
             ds = load_dataset(args.dataset, split="val", trust_remote_code=True)
         elif args.dataset == "opendatalab/OmniDocBench":
             ds = load_dataset(args.dataset, split="train", trust_remote_code=True)
+        elif args.dataset == "lmms-lab/COCO-Caption":
+            # Captioning: the fixed instruction ships in the dataset's own
+            # "question" column, so the prompt branch is the same as textvqa.
+            ds = load_dataset(args.dataset, split="val", trust_remote_code=True)
         elif _norm_dataset_name(args.dataset) in GENERIC_VLM_DATASETS:
             ds = _load_hf_dataset_with_fallback(args.dataset)
         else:
@@ -617,7 +621,7 @@ def main():
                 if prompt_content:
                     prompts.append([{"role": "user", "content": prompt_content}])
 
-    elif args.dataset == "lmms-lab/textvqa":
+    elif args.dataset in ("lmms-lab/textvqa", "lmms-lab/COCO-Caption"):
         for item in ds:
             # Convert PIL image to base64
             image_url = pil_to_base64(item["image"])
@@ -882,6 +886,16 @@ def main():
                     "question": ds[i]["question"],
                     "generated_text": generated_text,
                     "answers": ds[i]["answers"],
+                }
+            )
+        elif args.dataset == "lmms-lab/COCO-Caption":
+            results_data.append(
+                {
+                    "question_id": ds[i]["question_id"],
+                    "id": ds[i]["id"],
+                    "question": ds[i]["question"],
+                    "generated_text": generated_text,
+                    "answers": ds[i]["answer"],
                 }
             )
         elif args.dataset == "HuggingFaceH4/MATH-500":
