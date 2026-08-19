@@ -110,6 +110,105 @@ Results land at `<DRAFT_MODEL>/eval/<dataset>/results.jsonl`.
 plus the two band fields into the checkpoint's `config.json`. Without that step
 vLLM builds the wrong number of aux streams.
 
+## Trying other layer setups
+
+"More layers" is two different experiments, and only one of them is cheap.
+
+| config | draft layers | aux streams | concat width | mix params | total params |
+|---|---|---|---|---|---|
+| `...-banded-mix-uninit` | 3 | 9 | 5184 | 9 | 59.10M |
+| `...-banded-mix-L4` | 4 | 12 | 6912 | 12 | 63.20M |
+| `...-banded-mix-dense14` | 3 | 14 | 8064 | 14 | 59.10M |
+
+- **More target aux layers (denser bands)** costs one float per added layer. The
+  band mix collapses each band to a single stream, so the draft does not grow:
+  9 -> 14 streams left it at 59.10M. This is the axis banded mix exists for —
+  `progressive_per_layer_fc` cannot widen this way without growing its `nH->H`
+  projections.
+- **More draft layers** costs +4.1M params *and* a slower draft step, paid on
+  every speculation. Judge it on end-to-end throughput, not
+  `mean_acceptance_length` — acceptance can rise while wall-clock speedup falls.
+
+### Fields to set
+
+Four fields must stay mutually consistent or `Eagle3LlamaForCausalLM.__init__`
+raises:
+
+```json
+"num_hidden_layers": 4,
+"eagle_aux_layer_bands": [[2,4,6],[9,11,13],[16,18,20],[23,26,28]],
+"aux_hidden_states_layer_ids":      [2,4,6,9,11,13,16,18,20,23,26,28],
+"eagle_aux_hidden_state_layer_ids": [3,5,7,10,12,14,17,19,21,24,27,29],
+"eagle_aux_band_init_layer_ids": [2,9,16,23]
+```
+
+- `len(eagle_aux_layer_bands) == num_hidden_layers`, every band non-empty
+- `aux_hidden_states_layer_ids` must equal the **flattened bands in order** — it
+  is compared element-wise, not as a set
+- `eagle_aux_hidden_state_layer_ids[i] == aux_hidden_states_layer_ids[i] + 1`
+- ids are 0..29 (SmolVLM-256M's text tower is 30 layers, hidden size 576)
+
+`eagle_aux_band_init_layer_ids` is **inert**: it is length-validated and then
+ignored, because band logits are always zero-initialised (uniform softmax) so
+training can discover the mix freely. Set it to satisfy the check; expect no
+effect from its values.
+
+Nothing needs changing on the eval side —
+`prepare_draft_config_for_vllm_eval.py` derives `num_aux_hidden_states` from the
+bands.
+
+### Generating and validating a new variant
+
+```python
+import json, pathlib
+base = json.load(open("angelslim/compressor/speculative/train/configs/"
+                      "smolvlm-256m-eagle3-progressive-banded-mix-uninit.json"))
+
+def make(name, num_layers, bands):
+    c = dict(base)
+    c["num_hidden_layers"] = num_layers
+    c["eagle_aux_layer_bands"] = bands
+    flat = [i for b in bands for i in b]
+    c["aux_hidden_states_layer_ids"] = flat
+    c["eagle_aux_hidden_state_layer_ids"] = [i + 1 for i in flat]
+    c["eagle_aux_band_init_layer_ids"] = [b[0] for b in bands]
+    pathlib.Path(f"angelslim/compressor/speculative/train/configs/{name}.json"
+                 ).write_text(json.dumps(c, indent=2) + "\n")
+
+make("smolvlm-256m-eagle3-progressive-banded-mix-L4",
+     4, [[2,4,6],[9,11,13],[16,18,20],[23,26,28]])
+```
+
+Confirm it builds before spending GPU-hours:
+
+```bash
+python - <<'EOF'
+import json
+from transformers import LlamaConfig
+from angelslim.compressor.speculative.train.models.draft.llama_eagle3 import (
+    Eagle3LlamaForCausalLM,
+)
+name = "smolvlm-256m-eagle3-progressive-banded-mix-L4"
+d = json.load(open(f"angelslim/compressor/speculative/train/configs/{name}.json"))
+m = Eagle3LlamaForCausalLM(
+    LlamaConfig(**{k: v for k, v in d.items() if k != "architectures"})
+)
+print("OK", sum(p.numel() for p in m.parameters()) / 1e6, "M params")
+EOF
+```
+
+Then train as in section 3, swapping `DRAFT_MODEL_CONFIG_PATH` and `OUTPUT_DIR`.
+
+### What to watch
+
+- Smoke-eval a new **draft depth** with `NUM_PROMPTS=2` first. Depth != 3 is
+  verified to build in the training path but has not been run through vLLM's
+  banded decode.
+- Read `banded_aux_mix_weights.json` after epoch 1. The 3x9 run came out sharply
+  peaked (band0: 0.76 on layer 2; band2: 0.88 on layer 26). If a denser band
+  still concentrates that hard, the extra layers are not buying anything and the
+  experiment has answered itself early.
+
 ## Measured result
 
 2-epoch run, `checkpoint-66466`, temp=0, K=4 spec tokens, N=80 prompts,
