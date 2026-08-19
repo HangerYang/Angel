@@ -24,9 +24,12 @@ Config: [`smolvlm-256m-eagle3-progressive-banded-mix-uninit.json`](../../../ange
 band mix is the only thing under study.
 
 The learned mixture is dumped at every save to
-`<checkpoint>/banded_aux_mix_weights.json`. From the 2-epoch run, the mix is
-sharply peaked rather than uniform — band0 puts 0.76 on layer 2, band2 puts 0.88
-on layer 26 — i.e. training does express a preference inside each band.
+`<checkpoint>/banded_aux_mix_weights.json`. Read it against the **initial**
+distribution, not against uniform: this run was spike-initialised (see below),
+so every band started at 95-98% on one layer and training moved weight *away*
+from it. band1 diffused hardest (0.965 -> 0.756 -> 0.488 across epochs,
+spreading onto layers 18 and 20), band0 moderately, band2 least. The other
+members of each band do contribute.
 
 ## Where the code lives
 
@@ -148,10 +151,24 @@ raises:
 - `eagle_aux_hidden_state_layer_ids[i] == aux_hidden_states_layer_ids[i] + 1`
 - ids are 0..29 (SmolVLM-256M's text tower is 30 layers, hidden size 576)
 
-`eagle_aux_band_init_layer_ids` is **inert**: it is length-validated and then
-ignored, because band logits are always zero-initialised (uniform softmax) so
-training can discover the mix freely. Set it to satisfy the check; expect no
-effect from its values.
+`eagle_aux_band_init_layer_ids` **matters** — it picks the layer each band
+starts concentrated on:
+
+```python
+logits = torch.zeros(len(band), dtype=torch.float32)
+logits[band.index(int(init_layer_id))] = 4.0     # spike init
+```
+
+These are pre-softmax logits, so a 4.0 spike in a 4-member band means
+`e**4 / (e**4 + 3) = 0.948` initial weight on that layer. The id must be a
+member of its own band or init raises. The `banded-mix-uninit` run used
+`[2, 15, 26]`; `uninit` in that name refers to `draft_layer_init_from_target`,
+not to these logits.
+
+An all-zeros alternative gives `softmax([0,...,0]) = 1/n`, i.e. a genuinely
+uniform start that lets training find the mix unaided. That variant is **not**
+on this branch — changing the init changes what a new run is comparable to, so
+switch deliberately and note it when reporting numbers.
 
 Nothing needs changing on the eval side —
 `prepare_draft_config_for_vllm_eval.py` derives `num_aux_hidden_states` from the
@@ -204,10 +221,14 @@ Then train as in section 3, swapping `DRAFT_MODEL_CONFIG_PATH` and `OUTPUT_DIR`.
 - Smoke-eval a new **draft depth** with `NUM_PROMPTS=2` first. Depth != 3 is
   verified to build in the training path but has not been run through vLLM's
   banded decode.
-- Read `banded_aux_mix_weights.json` after epoch 1. The 3x9 run came out sharply
-  peaked (band0: 0.76 on layer 2; band2: 0.88 on layer 26). If a denser band
-  still concentrates that hard, the extra layers are not buying anything and the
+- Read `banded_aux_mix_weights.json` after epoch 1 and compare against the
+  band's *initial* weight, not against uniform. Under spike init the question is
+  how far weight diffuses away from the seeded layer; if a denser band stays
+  pinned near its 0.95 start, the extra layers are not buying anything and the
   experiment has answered itself early.
+- Keep `eagle_aux_band_init_layer_ids` fixed across variants you intend to
+  compare. Seeding a band at a layer the previous run never contained makes the
+  comparison two-variable.
 
 ## Measured result
 
