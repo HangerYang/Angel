@@ -207,6 +207,8 @@ def prepare_draft_config(
     updates["norm_output"] = bool(
         cfg.get("norm_output", train_cfg.get("norm_output", False))
     )
+    # QK-norm: vLLM builds self_attn.q_norm/k_norm only when this flag is on.
+    updates["qk_norm"] = bool(cfg.get("qk_norm", train_cfg.get("qk_norm", False)))
 
     if eagle_miracle_mode:
         # Miracle (oracle GT-HS) works for fused_fc, progressive_staged, hawk.
@@ -224,6 +226,7 @@ def prepare_draft_config(
     print(f"  eagle_miracle_mode: {cfg.get('eagle_miracle_mode', False)}")
     print(f"  fc_norm: {cfg.get('fc_norm', False)}")
     print(f"  norm_output: {cfg.get('norm_output', False)}")
+    print(f"  qk_norm: {cfg.get('qk_norm', False)}")
     print(f"  num_hidden_layers: {num_layers} "
           f"({'single-layer' if num_layers == 1 else f'{num_layers}-layer'} draft)")
     print(f"  num_aux_hidden_states: {cfg.get('num_aux_hidden_states')}")

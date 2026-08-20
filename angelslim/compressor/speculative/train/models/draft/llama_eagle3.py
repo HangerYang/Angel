@@ -287,6 +287,17 @@ class LlamaAttention(nn.Module):
             qkv_in, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        # QK-norm (Qwen3 / Gemma-style): per-head RMSNorm on Q and K before
+        # RoPE. Weights init to ones, so an untrained draft starts identical to
+        # the no-QK-norm model and nothing needs copying from the target.
+        self.use_qk_norm = bool(getattr(config, "qk_norm", False))
+        if self.use_qk_norm:
+            self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
         self._init_rope()
 
     def _init_rope(self):
@@ -354,6 +365,11 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
+
+        # RMSNorm over head_dim (last dim), applied pre-RoPE.
+        if self.use_qk_norm:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
 
         cos, sin = self.rotary_emb(
             query_states, seq_len=q_len + lck, position_ids=position_ids + lck

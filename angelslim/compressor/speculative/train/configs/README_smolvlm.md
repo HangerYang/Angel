@@ -16,6 +16,7 @@ Ops / launch modes / eval: `scripts/speculative/smolvlm/README.md`.
 |---|---|---|---|---|
 | `smolvlm-256m-eagle3.json` | `fused_fc` (default) | 1 | `[1,14,26]` → `[2,15,27]` | Stock Eagle3: `fc` 3H→H + 2H L0 |
 | `smolvlm-256m-eagle3-3.1.json` | `fused_fc` | 1 | same | Stock + EAGLE 3.1 (`fc_norm` + `norm_output`) |
+| `smolvlm-256m-eagle3-3.1-qk-norm.json` | `fused_fc` | 1 | same | 3.1 + **QK-norm**: per-head RMSNorm on Q/K pre-RoPE (`qk_norm: true`); adds `self_attn.q_norm/k_norm`, ones-init so step 0 matches 3.1 |
 | `smolvlm-256m-eagle3-progressive.json` | `progressive_staged` | 3 | `[0,13,25]` → `[1,14,26]` | Per-layer 2H concat inject; needs progressive vLLM patch |
 | `smolvlm-256m-eagle3-progressive-layers-1-15-23-3.1.json` | `progressive_staged` | 3 | `[1,15,23]` → `[2,16,24]` | Progressive 1/15/23 + EAGLE 3.1 `norm_output` (no `fc_norm`) |
 | `smolvlm-256m-eagle3-progressive-uninit.json` | `progressive_staged` | 3 | same | Same as progressive, **no** `draft_layer_init_*` |

@@ -10,6 +10,7 @@ Stock vLLM rejects Eagle3 for SmolVLM/Idefics3 (`Model does not support EAGLE3 i
 |---|---|
 | `vllm-v0.25.0-smolvlm-eagle3.patch` | `SupportsEagle3` on Idefics3/SmolVLM + `load_eagle_model` `text_model` wiring |
 | `vllm-v0.25.0-eagle3-progressive-staged.patch` | Progressive staged + hawk + **miracle** (oracle GT-HS tape for fused/progressive/hawk) |
+| `vllm-v0.25.0-eagle3-qk-norm.patch` | QK-norm draft attention (`qk_norm: true`): per-head RMSNorm on Q/K pre-RoPE, loads `self_attn.q_norm/k_norm.weight` |
 
 ## Apply / always get the latest (universal)
 
