@@ -38,7 +38,7 @@ so their weights are read against uniform.
 | Draft model (band construction, mixing, forward) | `angelslim/compressor/speculative/train/models/draft/llama_eagle3.py` |
 | Mix-weight dump on save | `angelslim/compressor/speculative/train/trainer/eagle3_trainer.py` |
 | vLLM-facing config prep | `scripts/speculative/smolvlm/prepare_draft_config_for_vllm_eval.py` |
-| vLLM runtime support | `third_party/patches/vllm-v0.25.0-eagle3-progressive-staged.patch` |
+| vLLM runtime support | `third_party/patches/10-vllm-v0.25.0-eagle3-progressive-staged.patch` |
 
 ## Reproducing on another server
 

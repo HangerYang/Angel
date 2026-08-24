@@ -46,8 +46,16 @@ fi
 git checkout -f "${VLLM_TAG}" >/dev/null
 git reset --hard "${VLLM_TAG}"
 # Drop previously patched *tracked* paths to clean tag; keep untracked .so.
-# Also remove known patch-added files that git clean would leave if ignored.
-rm -f vllm/model_executor/models/eagle_miracle.py
+# Patch-added files are untracked, so the reset above leaves them behind and the
+# next `git apply` would fail with "already exists". Delete exactly the paths the
+# patches create, read out of the patches themselves so this never goes stale.
+while IFS= read -r added; do
+  [[ -n "${added}" ]] && rm -f "${added}"
+done < <(
+  cat "${ROOT}"/third_party/patches/*.patch 2>/dev/null |
+    awk '/^diff --git /{path=$4; sub(/^b\//, "", path); next}
+         /^new file mode /{if (path != "") print path; path=""}'
+)
 
 echo "=== sync_vllm_latest: apply AngelSlim patches ==="
 cd "${ROOT}"
