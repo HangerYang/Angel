@@ -10,6 +10,7 @@ Stock vLLM rejects Eagle3 for SmolVLM/Idefics3 (`Model does not support EAGLE3 i
 |---|---|
 | `vllm-v0.25.0-smolvlm-eagle3.patch` | `SupportsEagle3` on Idefics3/SmolVLM + `load_eagle_model` `text_model` wiring |
 | `vllm-v0.25.0-eagle3-banded-mix-fc.patch` | `banded_mix_fc`: learned band mix in front of the stock fused_fc EAGLE 3.1 path |
+| `vllm-v0.25.0-odyssey-rejection-sampler.patch` | Env-gated Odyssey rejection sampler hook (`ODYSSEY_BRANCH`), default vLLM path unchanged |
 
 ## Apply / always get the latest (universal)
 
