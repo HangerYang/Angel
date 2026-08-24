@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-layer draft comparison: 4 runs x 8 benchmarks x temp 0/1.
+"""One-layer draft comparison: 7 runs x 8 benchmarks x temp 0/1.
 
 Canonical source = the answer_then_describe (ATD, "long prompt") sweep written by
 scripts/speculative/smolvlm/run_atd_acceptance.sh into the `atd_temp{t}` /
@@ -26,7 +26,10 @@ RUNS = [
     (BASELINE, "my_angel/no_eagle_baseline/atd_temp{t}"),
     ("baseline_1layer", "my_angel/eagle/baseline_1layer/rerun_atd/temp{t}"),
     ("banded_mix_fc_3.1", "my_angel/eagle/smolvlm-256m-eagle3-banded-mix-fc-3.1/rerun_atd/temp{t}"),
+    ("banded_mix_wide_3.1", "my_angel/eagle/smolvlm-256m-eagle3-banded-mix-wide-3.1/rerun_atd/temp{t}"),
     ("branch_change_top1_w01", "my_angel/eagle/branch-change-top1-w01/rerun_atd/temp{t}"),
+    ("branch_distill_top1_w01", "my_angel/eagle/branch-distill-top1-w01/rerun_atd/temp{t}"),
+    ("vistoken_k1", "my_angel/eagle/vistoken-k1/rerun_atd/temp{t}"),
 ]
 DRAFTS = [r for r in RUNS if r[0] != BASELINE]
 
@@ -137,9 +140,12 @@ L = [
     "| `no_eagle_baseline` | target only, no speculative decoding |",
     "| `baseline_1layer` | stock EAGLE-3: 3 aux layers, 3H→H fusion FC, 2H layer 0 |",
     "| `banded_mix_fc_3.1` | 9 aux layers → 3 learned band mixes → 3H→H FC, EAGLE 3.1 |",
+    "| `banded_mix_wide_3.1` | same 3 band mixes, **no** FC: 4H layer 0 `[emb｜band0｜band1｜seed]` |",
     "| `branch_change_top1_w01` | `banded_mix_fc_3.1` + branch-change distillation: where the draft's "
     "top-1 is not the teacher's but sits in the teacher's top-3, fork one draft step onto that "
     "token and match the teacher's centered-logit *delta* (w=0.1, 1 step). The default. |",
+    "| `branch_distill_top1_w01` | `banded_mix_fc_3.1` + branch-aware distillation (draft top-1 vs teacher top-3, w=0.1, 1 step) |",
+    "| `vistoken_k1` | `banded_mix_fc_3.1` + learned-query row compression: each tile's 64 visual rows → k=1 summary |",
     "", "## Prompt", "",
     "Every benchmark uses the long prompt: the model answers first and then justifies,",
     "so outputs are long enough for speculative decoding to pay. The question text",
