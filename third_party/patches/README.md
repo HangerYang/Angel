@@ -9,7 +9,7 @@ Stock vLLM rejects Eagle3 for SmolVLM/Idefics3 (`Model does not support EAGLE3 i
 | Patch | Purpose |
 |---|---|
 | `vllm-v0.25.0-smolvlm-eagle3.patch` | `SupportsEagle3` on Idefics3/SmolVLM + `load_eagle_model` `text_model` wiring |
-| `vllm-v0.25.0-eagle3-progressive-staged.patch` | Progressive staged + hawk + **miracle** (oracle GT-HS tape for fused/progressive/hawk) |
+| `vllm-v0.25.0-eagle3-banded-mix-fc.patch` | `banded_mix_fc`: learned band mix in front of the stock fused_fc EAGLE 3.1 path |
 
 ## Apply / always get the latest (universal)
 
@@ -40,18 +40,6 @@ LINK=1 bash third_party/sync_vllm_latest.sh  # also re-link .so / .pth
 ```
 
 Do **not** hand-edit `third_party/vllm` for portable changes — edit `.patch` files.
-
-Miracle eval (see `scripts/speculative/smolvlm/README.md` § Miracle mode).
-Smoke (2 prompts):
-
-```bash
-MIRACLE_MODE=1 TEMP=0 NUM_PROMPTS=2 OUTPUT_LEN=32 \
-  DATASET=dataset/smolvlm_256m_target_gen/data_0-36.jsonl \
-  DRAFT_MODEL=output/smolvlm_256m_hawk/checkpoint-30000 \
-  DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-hawk.json \
-  MIRACLE_HS_DIR=results/miracle_smoke_hs \
-  bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh
-```
 
 CUDA notes: patches are **CUDA-agnostic** (Python sources). Native `.so` must
 still match the machine — choose `VLLM_CUDA=13.0` / `12.6` / `12.9` via

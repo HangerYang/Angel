@@ -17,6 +17,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
+try:
+    from ....vistoken.splice import compress_image_rows
+except ModuleNotFoundError:
+    compress_image_rows = None
 from ...utils import padding
 from .eagle3_trainer import Eagle3Trainer
 from .trainer_factory import Eagle3TrainerFactory
@@ -130,11 +134,20 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
         attention_mask = inputs["attention_mask"]
         loss_mask = inputs["loss_mask"]
 
+        gist_embeddings = inputs.get("gist_embeddings")
         kwargs = {
             k: v
             for k, v in inputs.items()
-            if k not in ["input_ids", "attention_mask", "loss_mask"]
+            if k not in ["input_ids", "attention_mask", "loss_mask", "gist_embeddings"]
         }
+        if self.branch_distill_loss_weight > 0.0:
+            # Branch distillation re-scores a substituted copy of this sequence,
+            # so keep it (and the image kwargs) before the left shift below.
+            self._branch_ctx = {
+                "input_ids": input_ids.clone(),
+                "attention_mask": attention_mask,
+                "kwargs": kwargs,
+            }
         # Get hidden states and logits from target model
         hidden_states, target_logits, _, position_ids = (
             self.target_model.get_hidden_states_and_logits(
@@ -145,12 +158,42 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
             )
         )
 
+        # Row compression, before the left shift: every tensor here is still
+        # aligned 1:1 on absolute positions, so one splice keeps them so.
+        compressor = getattr(self.draft_model, "vistoken", None)
+        if compressor is not None:
+            if compress_image_rows is None:
+                raise RuntimeError(
+                    "vistoken compression is not available on clean main; use the visual compression feature branch"
+                )
+            spliced = compress_image_rows(
+                compressor,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                target_logits=target_logits,
+                position_ids=position_ids,
+                image_token_id=self.draft_model.vistoken_image_token_id,
+            )
+            hidden_states = spliced["hidden_states"]
+            input_ids = spliced["input_ids"]
+            target_logits = spliced["target_logits"]
+            loss_mask = spliced["loss_mask"]
+            attention_mask = spliced["attention_mask"]
+            position_ids = spliced["position_ids"]
+            if gist_embeddings is not None:
+                raise NotImplementedError(
+                    "gist conditioning and row compression both rewrite the "
+                    "draft sequence; they have not been reconciled"
+                )
+
         # Apply right padding and move tensors to correct device
         target_logits = padding(target_logits, left=False).to(input_ids.device)
         input_ids = padding(input_ids, left=False)
         loss_mask = loss_mask[..., None].to(input_ids.device)
 
-        return {
+        result = {
             "hidden_states": hidden_states,
             "target_logits": target_logits,
             "input_ids": input_ids,
@@ -158,6 +201,32 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
             "position_ids": position_ids,
             "attention_mask": attention_mask,
         }
+        if gist_embeddings is not None:
+            result["gist_embeddings"] = padding(gist_embeddings, left=False).to(
+                input_ids.device
+            )
+        return result
+
+    def branch_teacher_logits(self, input_ids):
+        """Re-score a branch-substituted sequence with the target model.
+
+        Same images and mask as the batch it came from; only the token ids at
+        the branch positions differ.
+        """
+        ctx = getattr(self, "_branch_ctx", None)
+        if ctx is None:
+            raise RuntimeError(
+                "branch distillation ran before prepare_data_for_draft_model "
+                "stashed the unshifted sequence"
+            )
+        with torch.no_grad():
+            _, target_logits, _, _ = self.target_model.get_hidden_states_and_logits(
+                input_ids=input_ids,
+                attention_mask=ctx["attention_mask"],
+                aux_hidden_states_layer_ids=self._aux_hidden_states_layer_ids,
+                **ctx["kwargs"],
+            )
+        return target_logits.detach().to(input_ids.device)
 
 
 @Eagle3TrainerFactory.register("online", "Audio")

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import time
@@ -73,6 +74,86 @@ class Eagle3Trainer(Trainer, ABC):
         self.skew_kl_stage_weights = list(
             getattr(draft_model_config, "skew_kl_stage_weights", []) or []
         )
+        # Multi-depth CE: apply the shared lm_head to each layer's output.
+        # Weights indexed [h0_weight, h1_weight, ..., h_last_weight].
+        self.multi_depth_ce_weights: List[float] = list(
+            getattr(draft_model_config, "multi_depth_ce_weights", []) or []
+        )
+        # Bridge distillation: ||h_{i+1} - bridge_i(h_i)||² loss weight.
+        self.bridge_loss_weight: float = float(
+            getattr(draft_model_config, "bridge_loss_weight", 0.0) or 0.0
+        )
+        # Branch distillation. When the draft's top-1 is NOT the teacher's top-1
+        # but sits inside the teacher's top-k, fork one extra draft step onto
+        # that token and train it against what the teacher says *after taking
+        # it* — which costs a second teacher forward on the substituted
+        # sequence, since the stored target_logits only cover the real one.
+        self.branch_distill_loss_weight: float = float(
+            getattr(draft_model_config, "branch_distill_loss_weight", 0.0) or 0.0
+        )
+        self.branch_distill_target_top_k: int = int(
+            getattr(draft_model_config, "branch_distill_target_top_k", 3) or 3
+        )
+        self.branch_distill_prob_ratio_threshold: float = float(
+            getattr(draft_model_config, "branch_distill_prob_ratio_threshold", 0.0)
+            or 0.0
+        )
+        self.branch_distill_objective: str = str(
+            getattr(draft_model_config, "branch_distill_objective", "ce") or "ce"
+        ).lower()
+        # Curriculum: hold the branch term at 0 for the first warmup steps, then
+        # ramp it linearly to the configured weight. Early on the branch loss
+        # competes with main CE, which is still improving fast.
+        self.branch_distill_warmup_steps: int = int(
+            getattr(draft_model_config, "branch_distill_warmup_steps", 0) or 0
+        )
+        self.branch_distill_ramp_steps: int = int(
+            getattr(draft_model_config, "branch_distill_ramp_steps", 0) or 0
+        )
+        # Synthetic counterfactuals: besides the natural "draft picked the
+        # teacher's rank-2 token" branches, substitute the teacher's rank-2
+        # token at a sampled set of other positions (draft wrong on some other
+        # token, or draft correct), capped relative to the natural count.
+        self.branch_distill_synthetic: bool = bool(
+            getattr(draft_model_config, "branch_distill_synthetic", False)
+        )
+        self.branch_distill_synthetic_ratio: float = float(
+            getattr(draft_model_config, "branch_distill_synthetic_ratio", 1.0)
+        )
+        # "change" objective only: weight each branch position by how much the
+        # teacher's logits actually moved (RMS of the target delta), normalised
+        # so the mean active weight stays ~1. Branches that barely change the
+        # future then contribute proportionally less supervision.
+        self.branch_distill_change_delta_weight: bool = bool(
+            getattr(draft_model_config, "branch_distill_change_delta_weight", False)
+        )
+        if self.branch_distill_objective not in ("ce", "change"):
+            raise ValueError(
+                "branch_distill_objective must be 'ce' or 'change' "
+                f"(got {self.branch_distill_objective!r})"
+            )
+        # Leading TTT steps that get a branch. Each one is a full extra teacher
+        # forward, so the default is the first step only.
+        self.branch_distill_steps: int = int(
+            getattr(draft_model_config, "branch_distill_steps", 1) or 1
+        )
+        # Every branch position is substituted into one sequence and scored in a
+        # single teacher forward, so a position's prefix can contain an earlier
+        # position's substitution. Dense signal, slightly contaminated context.
+        _bd_draft_k = getattr(draft_model_config, "branch_distill_top_k", 1)
+        if self.branch_distill_loss_weight > 0.0 and _bd_draft_k not in (None, 1):
+            raise ValueError(
+                "branch_distill_top_k must be 1: the branch is taken on the "
+                f"draft's top-1 token only (got {_bd_draft_k})"
+            )
+        # Simulated exit probabilities: [p_max_exit0, p_max_exit1, ...].
+        # Ramped from 0 → p_max over exit_prob_ramp_steps training steps.
+        self.exit_prob_max: List[float] = list(
+            getattr(draft_model_config, "exit_prob_max", []) or []
+        )
+        self.exit_prob_ramp_steps: int = int(
+            getattr(draft_model_config, "exit_prob_ramp_steps", 0) or 0
+        )
         super().__init__(model=draft_model, **kwargs)
         self.length = length
         self._train_start_time = None
@@ -83,6 +164,7 @@ class Eagle3Trainer(Trainer, ABC):
         self._logged_draft_hs_feedback = False
         self._logged_target_hs_warmup = False
         self._logged_aux_losses = False
+        self._logged_branch_distill = False
         # Set by create_optimizer() for non-DeepSpeed bf16 DDP (ZeRO-equivalent).
         self._fp32_optimizer = None
 
@@ -101,6 +183,57 @@ class Eagle3Trainer(Trainer, ABC):
         mask = mask.to(dtype=values.dtype, device=values.device)
         return (values * mask).sum() / mask.sum().clamp_min(1.0)
 
+    @staticmethod
+    def _shift_left(tensor: torch.Tensor, n: int) -> torch.Tensor:
+        """Advance a sequence tensor n positions, zero-padding the tail."""
+        for _ in range(n):
+            tensor = padding(tensor, left=False)
+        return tensor
+
+    @staticmethod
+    def _fork_cache(cache):
+        """Copy the nested list structure of cache_hidden, sharing the tensors.
+
+        The branch step must not append its keys/values to the rollout the main
+        loop keeps using; the tensors themselves are never written in place.
+        """
+        if isinstance(cache, list):
+            return [Eagle3Trainer._fork_cache(c) for c in cache]
+        return cache
+
+    def branch_teacher_logits(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Teacher logits for a token sequence carrying branch substitutions.
+
+        Returns [B, S, V] aligned to `input_ids` (position p holds the
+        distribution for token p+1). Only trainers that keep the target model
+        in memory can answer this; offline ones cannot.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot run branch distillation: it has no "
+            "target model in memory to re-score the substituted sequence. Use "
+            "an online trainer or set branch_distill_loss_weight to 0."
+        )
+
+    def _vistoken_param_split(self):
+        """(compressor params, drafter params, compressor lr) or None.
+
+        The row compressor is ~40k params learning routing from scratch; the
+        drafter is a pretrained-ish 2H block being nudged. One LR cannot serve
+        both, so they get their own groups.
+        """
+        compressor = getattr(self.draft_model, "vistoken", None)
+        if compressor is None:
+            return None
+        names = {id(p) for p in compressor.parameters()}
+        hot, rest = [], []
+        for p in self.model.parameters():
+            if not p.requires_grad:
+                continue
+            (hot if id(p) in names else rest).append(p)
+        if not hot:
+            return None
+        return hot, rest, float(compressor.cfg.lr)
+
     def create_optimizer(self, model=None):
         """Use FP32 master Adam under plain DDP to match DeepSpeed ZeRO moments.
 
@@ -109,15 +242,53 @@ class Eagle3Trainer(Trainer, ABC):
         with FP32MasterWeightOptimizer when DeepSpeed is off.
         """
         if self.is_deepspeed_enabled:
-            return super().create_optimizer()
+            split = self._vistoken_param_split()
+            if split is None:
+                return super().create_optimizer()
+            # ZeRO keeps FP32 moments itself; all we need is the LR split, and
+            # the ZeRO configs here leave the optimizer to HF/torch.
+            from torch.optim import AdamW as _AdamW
+
+            hot, rest, hot_lr = split
+            args = self.args
+            self.optimizer = _AdamW(
+                [
+                    {"params": rest, "lr": args.learning_rate},
+                    {"params": hot, "lr": hot_lr, "weight_decay": 0.0},
+                ],
+                lr=args.learning_rate,
+                betas=(
+                    getattr(args, "adam_beta1", 0.9),
+                    getattr(args, "adam_beta2", 0.999),
+                ),
+                eps=getattr(args, "adam_epsilon", 1e-8),
+                weight_decay=args.weight_decay,
+            )
+            logger.info(
+                "Eagle3 (DeepSpeed): LR split -- drafter %g, vistoken compressor %g.",
+                args.learning_rate,
+                hot_lr,
+            )
+            return self.optimizer
 
         from torch.optim import AdamW
 
         from .fp32_master_optimizer import FP32MasterWeightOptimizer, FP32StateAdamW
 
+        split = self._vistoken_param_split()
+
         if self.is_fsdp_enabled:
             args = self.args
-            param_groups = [{"params": [p for p in self.model.parameters() if p.requires_grad]}]
+            if split is not None:
+                hot, rest, hot_lr = split
+                param_groups = [
+                    {"params": rest},
+                    {"params": hot, "lr": hot_lr, "weight_decay": 0.0},
+                ]
+            else:
+                param_groups = [
+                    {"params": [p for p in self.model.parameters() if p.requires_grad]}
+                ]
             optimizer = FP32StateAdamW(
                 param_groups,
                 lr=args.learning_rate,
@@ -140,8 +311,25 @@ class Eagle3Trainer(Trainer, ABC):
             return super().create_optimizer()
 
         args = self.args
+        if split is not None:
+            hot, rest, hot_lr = split
+            bf16_params = [rest, hot]
+            adam_params = [
+                {"params": rest, "lr": args.learning_rate},
+                {"params": hot, "lr": hot_lr, "weight_decay": 0.0},
+            ]
+            logger.info(
+                "Eagle3: LR split -- drafter %g (%d tensors), vistoken "
+                "compressor %g (%d tensors).",
+                args.learning_rate,
+                len(rest),
+                hot_lr,
+                len(hot),
+            )
+        else:
+            adam_params = bf16_params
         inner_optimizer = AdamW(
-            bf16_params,
+            adam_params,
             lr=args.learning_rate,
             betas=(
                 getattr(args, "adam_beta1", 0.9),
@@ -279,8 +467,9 @@ class Eagle3Trainer(Trainer, ABC):
         target_logits = data_for_draft_model["target_logits"]  # Batch x Seq x Vocab
         loss_mask = data_for_draft_model["loss_mask"]  # Batch x Seq x 1
         hidden_states = data_for_draft_model["hidden_states"]  # Batch x Seq x Hidden
+        gist_embeddings = data_for_draft_model.get("gist_embeddings")
 
-        hidden_states = self.down_project_hidden_states(hidden_states)
+        hidden_states = self.down_project_hidden_states(hidden_states, gist_embeddings)
         attention_mask, position_ids = self.prepare_attention_mask_and_position_ids(
             hidden_states, attention_mask, position_ids
         )
@@ -292,6 +481,7 @@ class Eagle3Trainer(Trainer, ABC):
             target_logits,
             loss_mask,
             log_prefix="train",
+            gist_embeddings=gist_embeddings,
         )
 
         return loss
@@ -305,14 +495,23 @@ class Eagle3Trainer(Trainer, ABC):
         """
         pass
 
-    def down_project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def down_project_hidden_states(
+        self, hidden_states: torch.Tensor, gist_embeddings: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Down project hidden states for draft model training.
         """
         # Step 4: Prepare hidden states with gradient tracking
         if not hidden_states.requires_grad:
             hidden_states.requires_grad = True
-        hidden_states = self.draft_model.combine_hidden_states(hidden_states)
+        if os.environ.get("EAGLE3_RMS_PROBE") == "1":
+            with torch.no_grad():
+                _H = self.draft_model.hidden_size
+                self._probe_aux_rms = [
+                    c.detach().float().pow(2).mean().sqrt().item()
+                    for c in hidden_states.split(_H, dim=-1)
+                ]
+        hidden_states = self.draft_model.combine_hidden_states(hidden_states, gist_embeddings)
         return hidden_states
 
     def prepare_attention_mask_and_position_ids(
@@ -347,6 +546,261 @@ class Eagle3Trainer(Trainer, ABC):
 
         return attention_mask, position_ids
 
+    def branch_weight_now(self) -> float:
+        """Branch loss weight at the current step, after the curriculum ramp."""
+        w = self.branch_distill_loss_weight
+        if w <= 0.0:
+            return 0.0
+        warmup = self.branch_distill_warmup_steps
+        ramp = self.branch_distill_ramp_steps
+        if warmup <= 0 and ramp <= 0:
+            return w
+        step = int(getattr(self.state, "global_step", 0) or 0)
+        if step < warmup:
+            return 0.0
+        if ramp <= 0:
+            return w
+        return w * min(1.0, (step - warmup) / float(ramp))
+
+    def _branch_decide(self, idx, draft, logits, target_logits, loss_mask):
+        """Pick branch positions and re-ask the teacher what follows them.
+
+        At TTT step `idx`, index j predicts absolute position a = j + idx + 2:
+        `input_ids` and `target_logits` were advanced once before the loop and
+        once per step. A position branches when the draft's top-1 differs from
+        the teacher's top-1 yet appears in the teacher's top-k. Those tokens are
+        substituted at their absolute positions in ONE copy of the original
+        sequence, which is scored by a single teacher forward.
+
+        Returns the branch mask, the branch tokens, and the teacher's
+        continuation logit change relative to the real path — all aligned to
+        the *next* step's index frame, which is where the branch step is
+        actually run.
+        """
+        ctx = getattr(self, "_branch_ctx", None)
+        if ctx is None:
+            raise RuntimeError(
+                "branch distillation needs the unshifted token sequence; "
+                "prepare_data_for_draft_model must set self._branch_ctx"
+            )
+        with torch.no_grad():
+            draft_top1_d = logits.argmax(-1)
+            # d2t stores target_id - draft_id, so add it back to get target ids.
+            draft_top1 = draft_top1_d + draft.d2t[draft_top1_d]
+            teacher_top1 = target_logits.argmax(-1)
+            k = max(int(self.branch_distill_target_top_k), 1)
+            teacher_topk = target_logits.topk(k, dim=-1).indices
+            scorable = loss_mask[..., 0].bool()
+            candidate_mask = (
+                (teacher_topk == draft_top1[..., None]).any(-1)
+                & (draft_top1 != teacher_top1)
+                & scorable
+            )
+            # The token each branch substitutes. Natural branches take the
+            # draft's own (wrong) top-1; synthetic ones take the teacher's
+            # rank-2 token, which is only defined when k >= 2.
+            sub_token = draft_top1
+            rank2_token = (
+                teacher_topk[..., 1] if teacher_topk.shape[-1] > 1 else None
+            )
+            teacher_top1_logit = target_logits.gather(
+                -1, teacher_top1[..., None]
+            ).squeeze(-1).float()
+            draft_token_logit = target_logits.gather(
+                -1, draft_top1[..., None].to(target_logits.device)
+            ).squeeze(-1).float()
+            prob_ratio = (draft_token_logit - teacher_top1_logit).exp()
+
+            offset = idx + 2
+            orig_ids = ctx["input_ids"]
+            seq_len = orig_ids.shape[1]
+            cols = torch.arange(candidate_mask.shape[1], device=orig_ids.device)
+            # Drop branches whose token would land past the end of the sequence.
+            candidate_mask = candidate_mask & (cols + offset < seq_len)[None, :]
+            threshold = max(float(self.branch_distill_prob_ratio_threshold), 0.0)
+            branch_mask = candidate_mask
+            if threshold > 0.0:
+                branch_mask = branch_mask & (prob_ratio > threshold)
+            survivor_ratio = prob_ratio[branch_mask]
+            n_synthetic = 0
+            if self.branch_distill_synthetic:
+                if rank2_token is None:
+                    raise ValueError(
+                        "branch_distill_synthetic needs branch_distill_target_"
+                        "top_k >= 2 to have a rank-2 token to substitute"
+                    )
+                # Every other scorable in-range position is eligible: draft
+                # wrong on a token that is not the teacher's rank 2, or draft
+                # correct. Sample enough to roughly match the natural branches.
+                eligible = scorable & (cols + offset < seq_len)[None, :] & ~branch_mask
+                budget = int(
+                    round(
+                        float(branch_mask.sum().item())
+                        * max(self.branch_distill_synthetic_ratio, 0.0)
+                    )
+                )
+                n_eligible = int(eligible.sum().item())
+                budget = min(budget, n_eligible)
+                if budget > 0:
+                    # Random scores on eligible positions; take the top `budget`.
+                    scores = torch.rand(
+                        eligible.shape, device=eligible.device
+                    ).masked_fill(~eligible, -1.0)
+                    pick = torch.topk(scores.flatten(), budget).indices
+                    chosen = torch.zeros_like(eligible.flatten())
+                    chosen[pick] = True
+                    chosen = chosen.view_as(eligible)
+                    sub_token = torch.where(chosen, rank2_token, sub_token)
+                    branch_mask = branch_mask | chosen
+                    n_synthetic = budget
+            self._branch_last_stats = {
+                "candidates": float(candidate_mask.sum().item()),
+                "survivors": float(branch_mask.sum().item()),
+                "synthetic": float(n_synthetic),
+                "ratio_mean": (
+                    float(survivor_ratio.mean().item())
+                    if survivor_ratio.numel()
+                    else 0.0
+                ),
+                "ratio_median": (
+                    float(survivor_ratio.median().item())
+                    if survivor_ratio.numel()
+                    else 0.0
+                ),
+            }
+            if not bool(branch_mask.any()):
+                return None
+
+            sub_ids = orig_ids.clone()
+            rows, at = torch.nonzero(branch_mask, as_tuple=True)
+            sub_ids[rows, at + offset] = sub_token[rows, at].to(sub_ids.dtype)
+
+            branch_logits = self.branch_teacher_logits(sub_ids).detach()
+            # branch_logits[:, a] is the distribution for a + 1; the branch step
+            # predicts it at index j = a - offset.
+            branch_logits = self._shift_left(branch_logits, offset).to(
+                target_logits.device
+            )
+            real_next_logits = self._shift_left(target_logits, 1).to(
+                branch_logits.device
+            )
+            branch_top1 = branch_logits.argmax(-1)
+            branch_in_logits = branch_logits[..., draft.t2d].float()
+            real_in_logits = real_next_logits[..., draft.t2d].float()
+            target_p = nn.Softmax(dim=2)(branch_in_logits)
+            branch_centered = branch_in_logits - branch_in_logits.mean(
+                dim=-1, keepdim=True
+            )
+            real_centered = real_in_logits - real_in_logits.mean(
+                dim=-1, keepdim=True
+            )
+            target_delta = branch_centered - real_centered
+            entropy = -(target_p * target_p.clamp_min(1e-9).log()).sum(
+                -1, keepdim=True
+            )
+            invocab_mass = (
+                torch.logsumexp(branch_in_logits, dim=-1)
+                - torch.logsumexp(branch_logits, dim=-1).float()
+            ).exp()[..., None]
+            return {
+                "mask": branch_mask,
+                "tokens": sub_token,
+                "target_p": target_p,
+                "in_draft_vocab": draft.t2d[branch_top1][..., None].int(),
+                "entropy": entropy,
+                "invocab_mass": invocab_mass,
+                "target_delta": target_delta,
+            }
+
+    def _branch_loss(
+        self,
+        pending,
+        draft,
+        input_ids,
+        hidden_states,
+        cache_hidden,
+        attention_mask,
+        position_ids,
+        loss_mask,
+        gist_embeddings,
+        base_logits,
+    ):
+        """Run the forked draft step and score its logit change.
+
+        Called at the top of the step that follows the decision, so the rollout
+        state (hidden_states, cache, aux injects) is exactly what the normal
+        step consumed — the branch only swaps the input token.
+        """
+        mask = pending["mask"]
+        branch_ids = torch.where(mask, pending["tokens"].to(input_ids.dtype), input_ids)
+        branch_embeds = draft.embed_input_ids(branch_ids)
+        saved_layer_outs = getattr(draft, "_last_layer_outs", None)
+        branch_hidden, _ = draft.encode_layers(
+            inputs_embeds=branch_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=self._fork_cache(cache_hidden),
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+            gist_embeddings=gist_embeddings,
+        )
+        # The main loop owns the rollout's per-layer outs; give them back.
+        draft._last_layer_outs = saved_layer_outs
+        branch_logits = draft.compute_logits(branch_hidden)
+        position_mask = mask[..., None].int() * loss_mask
+        if self.branch_distill_objective == "change":
+            denom = position_mask.sum().clamp_min(1).to(branch_logits.dtype)
+            branch_centered = branch_logits.float() - branch_logits.float().mean(
+                dim=-1, keepdim=True
+            )
+            base_centered = base_logits.float() - base_logits.float().mean(
+                dim=-1, keepdim=True
+            )
+            draft_delta = branch_centered - base_centered
+            target_delta = pending["target_delta"].to(
+                device=draft_delta.device, dtype=draft_delta.dtype
+            )
+            delta_mse = (draft_delta - target_delta).pow(2).mean(dim=2, keepdim=True)
+            active = position_mask.to(delta_mse.dtype)
+            per_pos_sq = target_delta.pow(2).mean(dim=2, keepdim=True)
+            if self.branch_distill_change_delta_weight:
+                # alpha_i = RMS(delta_T^i) / mean_active(RMS(delta_T)), so the
+                # loss stays a weighted *average* -- same scale as unweighted,
+                # which keeps the configured branch weight comparable.
+                s = per_pos_sq.detach().clamp_min(0).sqrt()
+                s_mean = (active * s).sum() / denom
+                alpha = active * (s / s_mean.clamp_min(1e-6))
+                loss = (alpha * delta_mse).sum() / alpha.sum().clamp_min(1e-6)
+            else:
+                loss = (active * delta_mse).sum() / denom
+            with torch.no_grad():
+                target_delta_rms = (active * per_pos_sq).sum() / denom
+                draft_delta_rms = (
+                    active * draft_delta.pow(2).mean(dim=2, keepdim=True)
+                ).sum() / denom
+            return (
+                loss,
+                float(mask.sum().item()),
+                target_delta_rms.sqrt().detach(),
+                draft_delta_rms.sqrt().detach(),
+                float(denom.item()),
+            )
+
+        branch_logp = nn.LogSoftmax(dim=2)(branch_logits)
+        position_mask = pending["in_draft_vocab"] * position_mask
+        denom = position_mask.sum().clamp_min(1).to(branch_logp.dtype)
+        ce = -torch.sum(position_mask * pending["target_p"] * branch_logp, dim=2).sum()
+        with torch.no_grad():
+            branch_entropy = (position_mask * pending["entropy"]).sum() / denom
+            branch_mass = (position_mask * pending["invocab_mass"]).sum() / denom
+        return (
+            ce / denom,
+            float(mask.sum().item()),
+            branch_entropy.detach(),
+            branch_mass.detach(),
+            float(denom.item()),
+        )
+
     def draft_model_training_time_test(
         self,
         input_ids,
@@ -356,6 +810,7 @@ class Eagle3Trainer(Trainer, ABC):
         target_logits,
         loss_mask,
         log_prefix="",
+        gist_embeddings=None,
     ):
         _, seq_length, _ = hidden_states.shape
 
@@ -365,7 +820,41 @@ class Eagle3Trainer(Trainer, ABC):
         draft = self.draft_model  # unwrapped — mode flags / _aux_inject live here
         use_draft_feedback = bool(
             getattr(draft, "progressive_staged", False) or getattr(draft, "hawk", False)
+        ) and not bool(getattr(draft, "disable_progressive_feedback", False))
+        use_bridge_training = (
+            log_prefix == "train"
+            and use_draft_feedback
+            and bool(getattr(draft, "early_exit_bridges", False))
+            and getattr(draft, "bridges", None) is not None
         )
+        # Exit simulation also drives the per-depth staleness fallback, which
+        # needs no bridge modules and no distillation loss.
+        use_exit_sim = (
+            log_prefix == "train"
+            and use_draft_feedback
+            and (
+                use_bridge_training
+                or bool(getattr(draft, "stale_depth_fallback", False))
+            )
+        )
+        bridge_losses: List[torch.Tensor] = []
+        branch_losses: List[torch.Tensor] = []
+        branch_denoms: List[float] = []
+        plosses_active: List[torch.Tensor] = []
+        active_counts: List[float] = []
+        total_counts: List[float] = []
+        branch_aux_metric1: List[torch.Tensor] = []
+        branch_aux_metric2: List[torch.Tensor] = []
+        branch_hits = 0.0
+        branch_candidates = 0.0
+        branch_survivors = 0.0
+        branch_ratio_weighted_sum = 0.0
+        branch_ratio_medians: List[float] = []
+        branch_synthetic = 0.0
+        pending_branch = None
+        branch_weight = self.branch_weight_now() if log_prefix == "train" else 0.0
+        # Zero weight means skip the fork entirely -- it costs a teacher forward.
+        use_branch_distill = branch_weight > 0.0
         feedback_applied = 0
         target_shift_applied = 0
         # Snapshot target aux tape (h_target per draft layer) before feedback
@@ -383,6 +872,7 @@ class Eagle3Trainer(Trainer, ABC):
         # progressive eagle → progressive GT; hawk / real_hawk → hawk GT.
         target_hs_warmup = (
             log_prefix == "train"
+            and not bool(getattr(draft, "disable_progressive_feedback", False))
             and (
                 getattr(draft, "progressive_staged", False)
                 or getattr(draft, "hawk", False)
@@ -409,7 +899,31 @@ class Eagle3Trainer(Trainer, ABC):
             cache_hidden = [[], []]
 
         # Step 7: Iterative speculative decoding training loop
+        _probe_on = os.environ.get("EAGLE3_RMS_PROBE") == "1"
+        probe_step_rms: List[float] = []
         for idx in range(self.length):
+            if _probe_on:
+                with torch.no_grad():
+                    probe_step_rms.append(
+                        hidden_states.detach().float().pow(2).mean().sqrt().item()
+                    )
+            # Step 7.0b: Save the branch step decided one step ago. The fork
+            # is scored after normal logits exist, but it must use the exact
+            # pre-normal rollout state.
+            branch_request = None
+            if pending_branch is not None:
+                branch_request = (
+                    pending_branch,
+                    input_ids,
+                    hidden_states,
+                    self._fork_cache(cache_hidden),
+                    attention_mask,
+                    position_ids,
+                    loss_mask,
+                    gist_embeddings,
+                )
+                pending_branch = None
+
             # Step 7.1: Get input embeddings with gradient tracking
             inputs_embeds = draft.embed_input_ids(input_ids)
             if not inputs_embeds.requires_grad:
@@ -425,6 +939,7 @@ class Eagle3Trainer(Trainer, ABC):
                     attention_mask,
                     position_ids,
                     True,
+                    gist_embeddings,
                     use_reentrant=False,
                 )
             else:
@@ -435,6 +950,7 @@ class Eagle3Trainer(Trainer, ABC):
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     use_cache=True,
+                    gist_embeddings=gist_embeddings,
                 )
 
             # Step 7.2b: Smooth-L1(draft h_i, target aux_i) on tokens 1..3.
@@ -456,8 +972,61 @@ class Eagle3Trainer(Trainer, ABC):
                         ).item()
                         sl1_layer_count[li] += 1
 
+            # Step 7.2c: Bridge distillation — ||h_{i+1} - bridge_i(h_i)||²
+            # Runs every step (all layers always computed), accumulates outside loop.
+            if use_bridge_training:
+                layer_outs_bd = getattr(draft, "_last_layer_outs", None)
+                if layer_outs_bd and len(layer_outs_bd) >= 2:
+                    approx_h = layer_outs_bd[0]
+                    bridge_terms = []
+                    for bridge_i, bridge in enumerate(draft.bridges):
+                        target_h = layer_outs_bd[bridge_i + 1].detach()
+                        approx_h = bridge(approx_h)
+                        bridge_terms.append(
+                            torch.nn.functional.mse_loss(approx_h, target_h)
+                        )
+                    if bridge_terms:
+                        bridge_losses.append(
+                            torch.stack(bridge_terms).mean()
+                        )
+
             # Step 7.3: Compute logits from hidden states
             logits = draft.compute_logits(hidden_states)
+
+            if branch_request is not None:
+                (
+                    pending,
+                    branch_input_ids,
+                    branch_hidden_states,
+                    branch_cache_hidden,
+                    branch_attention_mask,
+                    branch_position_ids,
+                    branch_loss_mask,
+                    branch_gist_embeddings,
+                ) = branch_request
+                (
+                    branch_term,
+                    branch_n,
+                    branch_metric1,
+                    branch_metric2,
+                    branch_denom,
+                ) = self._branch_loss(
+                    pending,
+                    draft,
+                    branch_input_ids,
+                    branch_hidden_states,
+                    branch_cache_hidden,
+                    branch_attention_mask,
+                    branch_position_ids,
+                    branch_loss_mask,
+                    branch_gist_embeddings,
+                    logits,
+                )
+                branch_losses.append(branch_term)
+                branch_denoms.append(branch_denom)
+                branch_aux_metric1.append(branch_metric1)
+                branch_aux_metric2.append(branch_metric2)
+                branch_hits += branch_n
 
             # Step 7.4: Compute target distribution and position mask
             with torch.no_grad():
@@ -468,9 +1037,47 @@ class Eagle3Trainer(Trainer, ABC):
                 target_head = target_logits[..., draft.t2d].float()
                 target_p = nn.Softmax(dim=2)(target_head).detach()
 
-            # Step 7.5: Compute loss
+            # Step 7.5: Compute loss (final layer CE, weighted by last depth weight)
             out_logp = nn.LogSoftmax(dim=2)(logits)
             loss = -torch.sum(position_mask * target_p * out_logp, dim=2).mean()
+            # Diagnostic only -- does not touch `loss` or the optimization.
+            # `loss` above divides by ALL B*S positions (masked ones contribute
+            # 0); branch_loss divides by its own ACTIVE count. So the two are on
+            # different scales and ploss_i vs branch_loss is not a valid
+            # comparison. Renormalize the same base CE over active positions to
+            # get a directly comparable number.
+            with torch.no_grad():
+                _act = position_mask.sum()
+                _tot = position_mask.shape[0] * position_mask.shape[1]
+                plosses_active.append(
+                    (
+                        -torch.sum(
+                            position_mask * target_p * out_logp, dim=2
+                        ).sum()
+                        / _act.clamp_min(1)
+                    ).detach()
+                )
+                active_counts.append(float(_act.item()))
+                total_counts.append(float(_tot))
+            # Multi-depth CE: shared lm_head applied to each intermediate layer out.
+            if self.multi_depth_ce_weights:
+                layer_outs_ce = getattr(draft, "_last_layer_outs", None)
+                if layer_outs_ce:
+                    loss = loss * self.multi_depth_ce_weights[-1]
+                    n_shallow = min(
+                        len(layer_outs_ce) - 1, len(self.multi_depth_ce_weights) - 1
+                    )
+                    for depth_i in range(n_shallow):
+                        w_i = self.multi_depth_ce_weights[depth_i]
+                        if w_i == 0.0:
+                            continue
+                        logits_i = draft.compute_logits(layer_outs_ce[depth_i])
+                        out_logp_i = nn.LogSoftmax(dim=2)(logits_i)
+                        loss = loss + w_i * (
+                            -torch.sum(
+                                position_mask * target_p * out_logp_i, dim=2
+                            ).mean()
+                        )
 
             if log_prefix == "train" and self.skew_kl_loss_weight > 0.0:
                 stage_weight = self._stage_weight(
@@ -513,6 +1120,28 @@ class Eagle3Trainer(Trainer, ABC):
                 correct = (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
                 accuracy = correct.sum().item() / (loss_mask.sum().item() + 1e-6)
 
+            # Step 7.6b: Decide this step's branches and re-ask the teacher.
+            # Consumed at the top of the next step; the last step has no next.
+            if use_branch_distill and idx < min(
+                self.branch_distill_steps, self.length - 1
+            ):
+                pending_branch = self._branch_decide(
+                    idx, draft, logits, target_logits, loss_mask
+                )
+                branch_stats = getattr(self, "_branch_last_stats", None)
+                if branch_stats is not None:
+                    _survivors = branch_stats.get("survivors", 0.0)
+                    branch_candidates += branch_stats.get("candidates", 0.0)
+                    branch_survivors += _survivors
+                    branch_synthetic += branch_stats.get("synthetic", 0.0)
+                    branch_ratio_weighted_sum += (
+                        branch_stats.get("ratio_mean", 0.0) * _survivors
+                    )
+                    if _survivors > 0.0:
+                        branch_ratio_medians.append(
+                            branch_stats.get("ratio_median", 0.0)
+                        )
+
             # Step 7.7: Store loss and accuracy
             plosses.append(loss)
             acces.append(accuracy)
@@ -522,6 +1151,10 @@ class Eagle3Trainer(Trainer, ABC):
                 input_ids = padding(input_ids, left=False)
                 target_logits = padding(target_logits, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                if gist_embeddings is not None:
+                    # Refresh position advances with the draft rollout. The same
+                    # cached vector is reused inside each refresh window.
+                    gist_embeddings = padding(gist_embeddings, left=False)
                 # Keep target aux tape aligned with the shifted sequence so
                 # tokens 2/3 still compare h_i vs the matching target HS.
                 if target_aux_tape is not None and idx + 1 < sl1_token_budget:
@@ -555,10 +1188,29 @@ class Eagle3Trainer(Trainer, ABC):
                             f"(got {n_outs}, expected {len(draft.layers)}). "
                             "Draft-HS feedback cannot run — check model unwrap / mode flags."
                         )
+                    # Sample simulated exit depth (bridge training only).
+                    sim_exit_depth = None
+                    if use_exit_sim and self.exit_prob_max:
+                        step_now = getattr(self.state, "global_step", 0)
+                        ramp = (
+                            min(1.0, step_now / self.exit_prob_ramp_steps)
+                            if self.exit_prob_ramp_steps > 0
+                            else 1.0
+                        )
+                        import random as _random
+                        u = _random.random()
+                        cumprob = 0.0
+                        for exit_i, p_max in enumerate(self.exit_prob_max):
+                            cumprob += p_max * ramp
+                            if u < cumprob:
+                                sim_exit_depth = exit_i
+                                break
                     prev_inject0 = (
                         draft._aux_inject[0] if draft._aux_inject is not None else None
                     )
-                    seed = draft.take_progressive_draft_feedback()
+                    seed = draft.take_progressive_draft_feedback(
+                        sim_exit_depth=sim_exit_depth
+                    )
                     if seed is None:
                         raise RuntimeError(
                             "take_progressive_draft_feedback returned None after encode"
@@ -569,10 +1221,13 @@ class Eagle3Trainer(Trainer, ABC):
                         raise RuntimeError(
                             "draft-HS feedback did not replace _aux_inject with layer outs"
                         )
-                    if draft._aux_inject[0] is not draft._last_layer_outs[0]:
-                        raise RuntimeError(
-                            "draft-HS feedback inject[0] is not encode layer-out h0"
-                        )
+                    # When progressive_fc_draft_feedback is enabled, injects are FC-projected;
+                    # otherwise they should be raw layer outputs.
+                    if not getattr(draft, "progressive_fc_draft_feedback", False):
+                        if draft._aux_inject[0] is not draft._last_layer_outs[0]:
+                            raise RuntimeError(
+                                "draft-HS feedback inject[0] is not encode layer-out h0"
+                            )
                     hidden_states = seed
                     feedback_applied += 1
                     if not getattr(self, "_logged_draft_hs_feedback", False):
@@ -632,25 +1287,120 @@ class Eagle3Trainer(Trainer, ABC):
             else 0.0
         )
         ploss = ploss + skew_kl_add_weight * skew_kl_loss
+        # Bridge distillation loss: mean across all steps, added to total.
+        bridge_loss = (
+            torch.stack(bridge_losses).mean()
+            if bridge_losses
+            else ploss.new_zeros(())
+        )
+        if self.bridge_loss_weight > 0.0 and bridge_losses:
+            ploss = ploss + self.bridge_loss_weight * bridge_loss
+        # Branch distillation: mean over branched steps, added to total.
+        branch_loss = (
+            torch.stack(branch_losses).mean()
+            if branch_losses
+            else ploss.new_zeros(())
+        )
+        if branch_losses:
+            ploss = ploss + branch_weight * branch_loss
 
         if (
             log_prefix == "train"
             and not self._logged_aux_losses
-            and self.skew_kl_loss_weight > 0.0
+            and (
+                self.skew_kl_loss_weight > 0.0
+                or use_bridge_training
+                or use_branch_distill
+            )
         ):
             logger.info(
-                "Eagle3 aux losses: skew_kl(w=%s,a=%s,dir=%s,mode=%s)",
+                "Eagle3 aux losses: skew_kl(w=%s,a=%s,dir=%s,mode=%s) "
+                "bridge(w=%s,multi_ce=%s,exit_probs=%s,ramp=%d)",
                 self.skew_kl_loss_weight,
                 self.skew_kl_alpha,
                 self.skew_kl_direction,
                 self.skew_kl_loss_mode,
+                self.bridge_loss_weight,
+                self.multi_depth_ce_weights,
+                self.exit_prob_max,
+                self.exit_prob_ramp_steps,
             )
             self._logged_aux_losses = True
+        if use_branch_distill and not self._logged_branch_distill:
+            logger.info(
+                "Eagle3 branch distillation: objective=%s, w=%s, draft top-1 vs "
+                "teacher top-%d, prob_ratio_threshold=%s, first %d step(s), "
+                "one extra teacher forward per branched step.",
+                self.branch_distill_objective,
+                self.branch_distill_loss_weight,
+                self.branch_distill_target_top_k,
+                self.branch_distill_prob_ratio_threshold,
+                min(self.branch_distill_steps, max(self.length - 1, 0)),
+            )
+            self._logged_branch_distill = True
 
         log = {f"{log_prefix}/acc_{i}": acces[i] for i in range(len(acces))}
         log.update({f"{log_prefix}/ploss_{i}": plosses[i].item() for i in range(len(plosses))})
         if log_prefix == "train" and skew_kl_losses:
             log[f"{log_prefix}/skew_kl_loss"] = skew_kl_loss.item()
+        if log_prefix == "train" and bridge_losses:
+            log[f"{log_prefix}/bridge_loss"] = bridge_loss.item()
+        if log_prefix == "train" and plosses_active:
+            # Main CE per ACTIVE position -- the like-for-like counterpart to
+            # branch_loss. Compare these two, never ploss_i vs branch_loss.
+            for i in range(len(plosses_active)):
+                log[f"{log_prefix}/ploss_active_{i}"] = plosses_active[i].item()
+            log[f"{log_prefix}/active_density"] = (
+                active_counts[0] / max(total_counts[0], 1.0)
+            )
+        if use_branch_distill:
+            log[f"{log_prefix}/branch_loss"] = branch_loss.item()
+            log[f"{log_prefix}/branch_weight"] = branch_weight
+            if branch_denoms and total_counts:
+                # Per-position gradient scale. Main CE spreads 1/(B*S) over every
+                # position; the branch term spreads w/denom over its active ones.
+                # So the nominal w=0.1 is NOT the effective relative weight --
+                # this ratio is. >1 means branch gradients dominate per position.
+                log[f"{log_prefix}/branch_grad_ratio"] = (
+                    branch_weight
+                    * total_counts[0]
+                    / max(branch_denoms[0], 1.0)
+                )
+            if branch_aux_metric1:
+                if self.branch_distill_objective == "change":
+                    log[f"{log_prefix}/branch_target_delta_rms"] = (
+                        torch.stack(branch_aux_metric1).mean().item()
+                    )
+                    log[f"{log_prefix}/branch_draft_delta_rms"] = (
+                        torch.stack(branch_aux_metric2).mean().item()
+                    )
+                else:
+                    _ent = torch.stack(branch_aux_metric1).mean().item()
+                    log[f"{log_prefix}/branch_target_entropy"] = _ent
+                    log[f"{log_prefix}/branch_kl"] = branch_loss.item() - _ent
+                    log[f"{log_prefix}/branch_invocab_mass"] = (
+                        torch.stack(branch_aux_metric2).mean().item()
+                    )
+            if branch_survivors > 0.0 and self.branch_distill_synthetic:
+                log[f"{log_prefix}/branch_synthetic_share"] = (
+                    branch_synthetic / branch_survivors
+                )
+            if branch_candidates > 0.0:
+                log[f"{log_prefix}/branch_ratio_survival"] = (
+                    branch_survivors / branch_candidates
+                )
+            if branch_survivors > 0.0:
+                log[f"{log_prefix}/branch_ratio_mean"] = (
+                    branch_ratio_weighted_sum / branch_survivors
+                )
+            if branch_ratio_medians:
+                log[f"{log_prefix}/branch_ratio_median"] = float(
+                    torch.tensor(branch_ratio_medians).median().item()
+                )
+            # Branch positions per step, as a share of supervised tokens.
+            log[f"{log_prefix}/branch_rate"] = branch_hits / (
+                max(len(branch_losses), 1) * max(loss_mask.sum().item(), 1.0)
+            )
         # 1.0 => draft-HS feedback ran every speculative step after 0; 0 => off/stock.
         log[f"{log_prefix}/draft_hs_feedback"] = (
             float(feedback_applied) / float(max(self.length - 1, 1))
@@ -666,6 +1416,11 @@ class Eagle3Trainer(Trainer, ABC):
         for li, (s, c) in enumerate(zip(sl1_layer_sum, sl1_layer_count)):
             if c > 0:
                 log[f"{log_prefix}/aux_vs_draft_sl1_h{li}"] = s / float(c)
+        if _probe_on:
+            for i, v in enumerate(probe_step_rms):
+                log[f"{log_prefix}/rms_step{i}"] = v
+            for i, v in enumerate(getattr(self, "_probe_aux_rms", []) or []):
+                log[f"{log_prefix}/rms_aux{i}"] = v
         # Route into the appropriate accumulator.
         if log_prefix == "eval":
             for k, v in log.items():
@@ -702,6 +1457,25 @@ class Eagle3Trainer(Trainer, ABC):
         else:
             # Fall back to parent class save_model
             super().save_model(output_dir, _internal_call)
+            self._save_banded_aux_mix_weights(output_dir)
+
+    def _save_banded_aux_mix_weights(self, output_dir: str) -> None:
+        """Log and persist learned band weights alongside each checkpoint."""
+        if not self.args.should_save or not self.accelerator.is_main_process:
+            return
+        getter = getattr(self.draft_model, "get_banded_aux_mix_weights", None)
+        if getter is None:
+            return
+        weights = getter()
+        if not weights:
+            return
+        logger.info("Progressive banded aux mix weights: %s", weights)
+        os.makedirs(output_dir, exist_ok=True)
+        with open(
+            os.path.join(output_dir, "banded_aux_mix_weights.json"), "w"
+        ) as output_file:
+            json.dump(weights, output_file, indent=2, sort_keys=True)
+            output_file.write("\n")
 
     def _save_zero3_model(self, output_dir: str, _internal_call: bool = False):
         """
@@ -717,6 +1491,9 @@ class Eagle3Trainer(Trainer, ABC):
         # All processes must participate in parameter gathering to avoid deadlock
         with deepspeed.zero.GatheredParameters(self.model.parameters()):
             state_dict = self.model.state_dict()
+            # The scalar logits may be ZeRO-partitioned, so inspect them while
+            # all parameters are gathered.
+            self._save_banded_aux_mix_weights(output_dir)
 
         # Only main process saves the model
         if self.args.should_save and self.accelerator.is_main_process:
@@ -754,9 +1531,10 @@ class Eagle3Trainer(Trainer, ABC):
         target_logits = data_for_draft_model["target_logits"]
         loss_mask = data_for_draft_model["loss_mask"]
         hidden_states = data_for_draft_model["hidden_states"]
+        gist_embeddings = data_for_draft_model.get("gist_embeddings")
 
         with torch.no_grad():
-            hidden_states = self.down_project_hidden_states(hidden_states)
+            hidden_states = self.down_project_hidden_states(hidden_states, gist_embeddings)
             attention_mask, position_ids = self.prepare_attention_mask_and_position_ids(
                 hidden_states, attention_mask, position_ids
             )
@@ -768,5 +1546,6 @@ class Eagle3Trainer(Trainer, ABC):
                 target_logits,
                 loss_mask,
                 log_prefix="eval",
+                gist_embeddings=gist_embeddings,
             )
         return (loss, None, None)

@@ -46,6 +46,10 @@ from ..data_utils import (
     build_image_processor_kwargs,
     stable_hf_map_cache_files,
 )
+try:
+    from ..gist_embedding import GistEmbeddingEncoder
+except ModuleNotFoundError:
+    GistEmbeddingEncoder = None
 from .base_dataset_builder import OnlineDatasetBuilder
 from .dataset_builder_factory import DatasetBuilderFactory
 
@@ -769,6 +773,21 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
             chat_template_type,
             display,
         )
+        # Gist embeddings are computed live at collate time (see
+        # gist_embedding.GistEmbeddingEncoder), not here -- this builder's
+        # ds.map() pass stays identical to a non-gist config regardless of
+        # gist_conditioning, so it always hits an already-warm .map_cache.
+        self.gist_conditioning = bool(kwargs.get("gist_conditioning", False))
+        self.gist_encoder_model_name_or_path = kwargs.get(
+            "gist_encoder_model_name_or_path", "Qwen/Qwen3-Embedding-0.6B"
+        )
+        self.gist_refresh_every = max(1, int(kwargs.get("gist_refresh_every", 4)))
+        # "remaining" = suffix re-encoded every gist_refresh_every tokens;
+        # "whole" = one vector per example (see gist_embedding.GistEmbeddingEncoder).
+        self.gist_mode = kwargs.get("gist_mode", "remaining")
+        self.gist_encoder_device = kwargs.get("gist_encoder_device", "cuda:0")
+        self.gist_batch_size = max(1, int(kwargs.get("gist_batch_size", 32)))
+        self.gist_embedding_dim = int(kwargs.get("gist_embedding_dim", 0) or 0)
 
     def build_dataset(
         self,
@@ -816,6 +835,12 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
             # Pin cache under <data_dir>/.map_cache/ so restarts actually hit
             # (default HF fingerprints bound methods and miss every run).
             # Collator still rebuilds pixel_* each step from image_paths.
+            # Gist embeddings are NOT computed here (see gist_embedding.py),
+            # so this pass is identical to a non-gist config regardless of
+            # gist_conditioning -- cache_version stays "v1" so this hits the
+            # same pinned cache file a non-gist run of the same data already
+            # built.
+            cache_version = "v1"
             cache_files = stable_hf_map_cache_files(
                 datapath,
                 builder_tag=type(self).__name__,
@@ -824,6 +849,7 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                 shuffle_seed=self.shuffle_seed,
                 sample_num=sample_num,
                 min_loss_tokens=min_loss_tokens,
+                cache_version=cache_version,
             )
             if load_from_cache_file:
                 rank0_print(
@@ -866,7 +892,24 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
             raise RuntimeError(f"Dataset building failed for {datapath}") from e
 
     def get_data_collator(self) -> Any:
-        return VLMSmolVLMDataCollatorWithPadding(processor=self.tokenizer)
+        gist_encoder = None
+        if self.gist_conditioning:
+            if GistEmbeddingEncoder is None:
+                raise RuntimeError(
+                    "gist conditioning is not available on clean main; use the oracle gist feature branch"
+                )
+            gist_encoder = GistEmbeddingEncoder(
+                tokenizer=self.tokenizer,
+                model_name_or_path=self.gist_encoder_model_name_or_path,
+                refresh_every=self.gist_refresh_every,
+                device=self.gist_encoder_device,
+                batch_size=self.gist_batch_size,
+                embedding_dim=self.gist_embedding_dim,
+                mode=self.gist_mode,
+            )
+        return VLMSmolVLMDataCollatorWithPadding(
+            processor=self.tokenizer, gist_encoder=gist_encoder
+        )
 
     def _preprocess_function(self, examples: Dict[str, List]) -> Dict[str, List]:
         new_examples = {
@@ -1102,12 +1145,13 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                     raise e
                 self.display_count += 1
 
-            return {
+            result = {
                 "input_ids": input_ids.view(1, -1),
                 "attention_mask": attention_mask.view(1, -1),
                 "loss_mask": loss_mask.view(1, -1),
                 "image_paths": json.dumps(image_paths),
             }
+            return result
         except Exception as e:
             rank0_print(f"Error processing conversation: {e}")
             return None

@@ -96,6 +96,10 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 # OUTPUT_LEN — max new tokens to generate per prompt. Typical: 32 (smoke) | 256|1024
 OUTPUT_LEN="${OUTPUT_LEN:-1024}"
 
+# PROMPT_STYLE — raw (default, dataset question verbatim) | verbose (append the
+#   EAGLE-3 VLM papers' task prompts so the target answers at length).
+PROMPT_STYLE="${PROMPT_STYLE:-raw}"
+
 # TEMP — sampling temperature. Use 0 for greedy / miracle. Typical: 0 | 0.7
 TEMP="${TEMP:-0}"
 
@@ -104,6 +108,13 @@ TP="${TP:-1}"
 
 # GPU_MEMORY_UTILIZATION — vLLM GPU mem fraction. Typical: 0.7|0.9
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+
+# ALLOW_CUDA_GRAPHS - 1 lets vLLM use torch.compile/CUDA graphs.
+#   Default keeps historical behavior: eager execution.
+ALLOW_CUDA_GRAPHS="${ALLOW_CUDA_GRAPHS:-0}"
+
+# MAX_CUDAGRAPH_CAPTURE_SIZE - explicit capture bound for small bs1 graph tests.
+MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-24}"
 
 # CUDA_VISIBLE_DEVICES — which GPU(s) this eval sees. Example: 0 | 0,1
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -135,6 +146,30 @@ esac
 if [[ "${_MIRACLE_ON}" == "1" ]]; then
   MIRACLE_MODE=1
   MAX_NUM_SEQS=1
+fi
+
+# GIST_REF — oracle gist conditioning for a draft trained with
+#   gist_conditioning + gist_injection=fc + gist_mode=whole. Point it at a
+#   results.jsonl from a PRIOR eval on the SAME dataset in the SAME prompt
+#   order: row `id` N supplies the oracle for request N. The gist summarizes
+#   the answer before it is generated, so acceptance measured this way is an
+#   ORACLE UPPER BOUND, never a deployable speedup.
+#   Example:
+#     GIST_REF=output/<other-draft>/eval/MMStar/results.jsonl
+GIST_REF="${GIST_REF:-}"
+# GIST_ENCODER — sentence encoder for the reference outputs. Must match the
+#   gist_encoder_model_name_or_path the draft was trained with.
+GIST_ENCODER="${GIST_ENCODER:-Qwen/Qwen3-Embedding-0.6B}"
+if [[ -n "${GIST_REF}" ]]; then
+  if [[ ! -f "${GIST_REF}" ]]; then
+    echo "ERROR: GIST_REF=${GIST_REF} is not a file" >&2
+    exit 1
+  fi
+  export VLLM_EAGLE_GIST_MODE=1
+  export VLLM_EAGLE_GIST_REF="${GIST_REF}"
+  export VLLM_EAGLE_GIST_ENCODER="${GIST_ENCODER}"
+  echo "Oracle gist conditioning ON: ref=${GIST_REF} encoder=${GIST_ENCODER}" >&2
+  echo "  NOTE: acceptance from this run is an ORACLE UPPER BOUND." >&2
 fi
 
 # Trainer often leaves only checkpoint-*/config.json under OUTPUT_DIR.
@@ -195,6 +230,14 @@ if [[ "${USE_EAGLE}" == "1" ]]; then
   if [[ "${MIRACLE_MODE}" == "1" ]]; then
     PREPARE_ARGS+=(--eagle_miracle_mode)
   fi
+  EARLY_EXIT_THRESHOLD="${EARLY_EXIT_THRESHOLD:--1}"
+  PREPARE_ARGS+=(--early_exit_threshold "${EARLY_EXIT_THRESHOLD}")
+  if [[ "${EARLY_EXIT_THRESHOLD}" != "-1" && "${EARLY_EXIT_THRESHOLD}" != "-1.0" ]]; then
+    EARLY_EXIT_MIN_LAYER="${EARLY_EXIT_MIN_LAYER:-0}"
+    PREPARE_ARGS+=(--early_exit_min_layer "${EARLY_EXIT_MIN_LAYER}")
+    EARLY_EXIT_MAX_LAYER="${EARLY_EXIT_MAX_LAYER:--1}"
+    PREPARE_ARGS+=(--early_exit_max_layer "${EARLY_EXIT_MAX_LAYER}")
+  fi
   python3 scripts/speculative/smolvlm/prepare_draft_config_for_vllm_eval.py \
     "${PREPARE_ARGS[@]}"
 
@@ -243,10 +286,15 @@ CMD=(
   --max_model_len "${MAX_MODEL_LEN}"
   --gpu_memory_utilization "${GPU_MEMORY_UTILIZATION}"
   --output_len "${OUTPUT_LEN}"
+  --prompt_style "${PROMPT_STYLE}"
   --tp "${TP}"
+  --max_cudagraph_capture_size "${MAX_CUDAGRAPH_CAPTURE_SIZE}"
   --output_file "${OUTPUT_FILE}"
 )
 CMD+=("${EXTRA[@]}")
+if [[ "${ALLOW_CUDA_GRAPHS}" != "1" ]]; then
+  CMD+=(--enforce_eager)
+fi
 if [[ ${#DEBUG_ARGS[@]} -gt 0 ]]; then
   CMD+=("${DEBUG_ARGS[@]}")
 fi
