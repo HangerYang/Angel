@@ -13,11 +13,11 @@ states from target layers.
 Let:
 
 - `H` be hidden size, `V_d` be draft vocab size.
-- `h^T_{t,l} in R^H` be the target hidden state at token position `t` and
+- $h^T_{t,l} \in \mathbb{R}^H$ be the target hidden state at token position `t` and
   target layer `l`.
-- `e_t in R^H` be the draft token embedding.
-- `z^D_t in R^{V_d}` be the draft logits.
-- `P_T(. | x_{\le t}) = softmax(z^T_t / tau)` be the teacher distribution,
+- $e_t \in \mathbb{R}^H$ be the draft token embedding.
+- $z^D_t \in \mathbb{R}^{V_d}$ be the draft logits.
+- $P_T(\cdot \mid x_{\le t}) = \operatorname{softmax}(z^T_t / \tau)$ be the teacher distribution,
   sliced to the draft vocab during training.
 
 The draft is trained by the usual Eagle-style autoregressive distillation loss:
@@ -26,10 +26,12 @@ The draft is trained by the usual Eagle-style autoregressive distillation loss:
 L_{CE}
 = - \sum_{t \in M}
     \sum_{v \in V_d}
-    P_T(v | x_{\le t}) \log P_D(v | x_{\le t}),
+    P_T(v \mid x_{\le t}) \log P_D(v \mid x_{\le t}),
 ```
 
 where `M` is the assistant/loss mask.
+
+Markdown form: `L_CE = - sum_{t in M} sum_{v in V_d} P_T(v | x_<=t) log P_D(v | x_<=t)`.
 
 ## 1. Band Mixing
 
@@ -75,7 +77,7 @@ B_3 = [26, 28]
 ### Formula
 
 For band `b`, with target layer set `B_b`, learn logits
-`alpha_b in R^{|B_b|}` and convert them to simplex weights:
+$\alpha_b \in \mathbb{R}^{|B_b|}$ and convert them to simplex weights:
 
 ```math
 w_{b,i}
@@ -90,30 +92,32 @@ m_{t,b}
 = \sum_{i \in B_b} w_{b,i} h^T_{t,i}.
 ```
 
+Markdown form: `m_{t,b} = sum_{i in B_b} w_{b,i} h^T_{t,i}`.
+
 For `banded_mix_fc`, the three mixed streams are concatenated and sent through
 the stock Eagle3.1 fusion path:
 
 ```math
-u_t = [m_{t,1}; m_{t,2}; m_{t,3}] \in R^{3H},
+u_t = [m_{t,1}; m_{t,2}; m_{t,3}] \in \mathbb{R}^{3H},
 ```
 
 with optional per-stream RMSNorm:
 
 ```math
 \tilde{u}_t
-= [RMSNorm(m_{t,1}); RMSNorm(m_{t,2}); RMSNorm(m_{t,3})],
+= [\operatorname{RMSNorm}(m_{t,1}); \operatorname{RMSNorm}(m_{t,2}); \operatorname{RMSNorm}(m_{t,3})],
 ```
 
 then a learned fusion projection:
 
 ```math
-s_t = W_f \tilde{u}_t \in R^H.
+s_t = W_f \tilde{u}_t \in \mathbb{R}^H.
 ```
 
 Layer 0 of the draft receives both the token embedding and fused target stream:
 
 ```math
-y_t^{(0)} = DraftLayer_0([RMSNorm(e_t); RMSNorm(s_t)]).
+y_t^{(0)} = \operatorname{DraftLayer}_0([\operatorname{RMSNorm}(e_t); \operatorname{RMSNorm}(s_t)]).
 ```
 
 ### Why It Helps
@@ -171,18 +175,18 @@ a_t = \arg\max_v z^D_t(v),
 b_t = \arg\max_v z^T_t(v),
 ```
 
-and let `TopK_T(t)` be the teacher's top-k token set. A natural branch is active
+and let $\operatorname{TopK}_T(t)$ be the teacher's top-k token set. A natural branch is active
 when:
 
 ```math
 c_t =
-1[
+\mathbf{1}\{
   a_t \ne b_t
   \land
-  a_t \in TopK_T(t)
+  a_t \in \operatorname{TopK}_T(t)
   \land
   t \in M
-].
+\}.
 ```
 
 The adopted config uses:
@@ -205,20 +209,20 @@ change caused by the branch:
 
 ```math
 \Delta z^T_t
-= center(z^T_t(x^{br})) - center(z^T_t(x)),
+= \operatorname{center}(z^T_t(x^{br})) - \operatorname{center}(z^T_t(x)),
 ```
 
 where:
 
 ```math
-center(z) = z - mean_v(z_v).
+\operatorname{center}(z) = z - \operatorname{mean}_v(z_v).
 ```
 
 The draft runs the same one-step fork and predicts:
 
 ```math
 \Delta z^D_t
-= center(z^D_t(x^{br})) - center(z^D_t(x)).
+= \operatorname{center}(z^D_t(x^{br})) - \operatorname{center}(z^D_t(x)).
 ```
 
 The branch loss is masked MSE:
@@ -241,6 +245,8 @@ L = L_{CE} + \lambda_{branch} L_{branch},
 \qquad
 \lambda_{branch}=0.1.
 ```
+
+Markdown form: `L = L_CE + lambda_branch L_branch`.
 
 ### Why Centered Delta
 
@@ -353,7 +359,7 @@ The routing weights are:
 
 ```math
 A_{b,t,p,j}
-= softmax_j
+= \operatorname{softmax}_j
   \left(
     \frac{\hat{q}_{t,p}^{\top}\hat{r}_{b,t,j}}
          {\sqrt{d_k}}
@@ -368,10 +374,11 @@ C_{b,t,p,s}
 ```
 
 No value projection is used. Each compressed row is a convex combination of real
-target hidden states:
+target hidden states. Markdown form: `C = sum_j A_j H_j`.
+
 
 ```math
-C_{b,t,p,s} \in conv\{H_{b,t,1,s}, ..., H_{b,t,64,s}\}.
+C_{b,t,p,s} \in \operatorname{conv}\{H_{b,t,1,s}, \ldots, H_{b,t,64,s}\}.
 ```
 
 ### Slot Convention
@@ -448,7 +455,7 @@ the target attention distribution is:
 
 ```math
 A^T_{l,h,t,j}
-= softmax_j
+= \operatorname{softmax}_j
   \left(
     \frac{
       (q^T_{l,h,t})^\top k^T_{l,h,j}
@@ -475,7 +482,7 @@ If matching the compressor routing directly:
 
 ```math
 A^C_{t,p,j}
-= softmax_j
+= \operatorname{softmax}_j
   \left(
     \frac{\hat{q}_{t,p}^{\top}\hat{r}_{t,j}}{\sqrt{d_k}}
   \right).
@@ -487,7 +494,7 @@ For `k > 1`, aggregate the `k` routing rows:
 \bar{A}^C_{t,j}
 = \sum_{p=1}^{k} \eta_p A^C_{t,p,j},
 \qquad
-\eta_p = 1/k
+\eta_p = \frac{1}{k}
 ```
 
 unless a learned summary weighting is desired.
@@ -549,29 +556,31 @@ actually attends to.
 ## Compact Formula Summary
 
 ```math
-m_{t,b} = \sum_{i \in B_b} softmax(\alpha_b)_i h^T_{t,i}
+m_{t,b} = \sum_{i \in B_b} \operatorname{softmax}(\alpha_b)_i h^T_{t,i}
 ```
 
 ```math
-s_t = W_f [RMSNorm(m_{t,1}); RMSNorm(m_{t,2}); RMSNorm(m_{t,3})]
+s_t = W_f [\operatorname{RMSNorm}(m_{t,1}); \operatorname{RMSNorm}(m_{t,2}); \operatorname{RMSNorm}(m_{t,3})]
 ```
 
 ```math
 L_{branch}
 =
 \frac{\sum_t c_t
-  \|center(z^D_t(x^{br}))-center(z^D_t(x))
-   -center(z^T_t(x^{br}))+center(z^T_t(x))\|_2^2}
+  \|\operatorname{center}(z^D_t(x^{br}))-\operatorname{center}(z^D_t(x))
+   -\operatorname{center}(z^T_t(x^{br}))+\operatorname{center}(z^T_t(x))\|_2^2}
 {\sum_t c_t + \epsilon}
 ```
 
 ```math
 C_{b,t,p,s} =
 \sum_{j=1}^{64}
-softmax_j((W_k(q_p+g_t))^\top W_k r_{b,t,j}/\sqrt{d_k})
+\operatorname{softmax}_j\left(
+  \frac{(W_k(q_p + g_t))^\top W_k r_{b,t,j}}{\sqrt{d_k}}
+\right)
 H_{b,t,j,s}
 ```
 
 ```math
-L = L_{CE} + \lambda_{branch}L_{branch} + \lambda_{attn}L_{attn}
+L = L_{CE} + \lambda_{branch} L_{branch} + \lambda_{attn} L_{attn}
 ```
