@@ -1,0 +1,931 @@
+# Band-mix aux fusion + QK-norm draft attention for the EAGLE-3 drafter.
+# Applies on top of 20-vllm-v0.25.0-eagle3-vistoken.patch.
+#
+# Covers three features that interleave in llama_eagle3.py and can no longer be
+# split into independent patches:
+#   * banded_mix_fc   -- learned softmax band mix in front of the stock fused_fc
+#                        EAGLE-3.1 path; loads band{i}_mix_logits, allows unequal
+#                        bands, sizes fc / fc_norm by the band count. Distinct
+#                        from the `aux_band_mix` timing-study stub (equal bands,
+#                        hard-coded uniform weights, no learned parameters).
+#   * banded_mix_wide -- no fusion FC at all: layer 0 takes
+#                        [embed | band_0 .. band_{B-1}] = (1+B)H.
+#   * qk_norm         -- per-head RMSNorm on Q/K pre-RoPE in the draft attention
+#                        (`qk_norm: true`), loading self_attn.q_norm/k_norm.weight.
+diff --git a/vllm/model_executor/models/llama_eagle3.py b/vllm/model_executor/models/llama_eagle3.py
+index 4ddaecb..01526c7 100644
+--- a/vllm/model_executor/models/llama_eagle3.py
++++ b/vllm/model_executor/models/llama_eagle3.py
+@@ -22,7 +22,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
+-from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaForCausalLM
++from vllm.model_executor.models.llama import (
++    LlamaAttention,
++    LlamaDecoderLayer,
++    LlamaForCausalLM,
++)
+ from vllm.multimodal.inputs import NestedTensors
+ 
+ from . import eagle_miracle
+@@ -59,6 +63,41 @@ class EarlyExitBridge(nn.Module):
+         return h + self.w2(self.act_fn(self.w1(self.norm(h))))
+ 
+ 
++def _num_aux_bands(config) -> int:
++    bands = getattr(config, "eagle_aux_layer_bands", None)
++    return len(bands) if bands else 0
++
++
++class LlamaAttentionQKNorm(LlamaAttention):
++    """LlamaAttention + per-head RMSNorm on Q and K before RoPE.
++
++    Mirrors the training-side draft attention (`qk_norm: true` in the draft
++    config); the extra weights load as `self_attn.q_norm/k_norm.weight`.
++    """
++
++    def __init__(self, config: LlamaConfig, *args, **kwargs) -> None:
++        super().__init__(config, *args, **kwargs)
++        eps = getattr(config, "rms_norm_eps", 1e-6)
++        self.q_norm = RMSNorm(self.head_dim, eps=eps)
++        self.k_norm = RMSNorm(self.head_dim, eps=eps)
++
++    def forward(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor:
++        qkv, _ = self.qkv_proj(hidden_states)
++        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
++        q = self.q_norm(q_by_head).view(q.shape)
++        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
++        k = self.k_norm(k_by_head).view(k.shape)
++        q, k = self.rotary_emb(positions, q, k)
++        attn_output = self.attn(q, k, v)
++        output, _ = self.o_proj(attn_output)
++        return output
++
++
+ class LlamaDecoderLayer(LlamaDecoderLayer):
+     def __init__(
+         self,
+@@ -67,7 +106,17 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+         config: LlamaConfig | None = None,
+         layer_idx: int = 0,
+     ) -> None:
+-        super().__init__(vllm_config, prefix=prefix, config=config)
++        cfg = config or vllm_config.model_config.hf_config
++        super().__init__(
++            vllm_config,
++            prefix=prefix,
++            config=config,
++            attn_layer_type=(
++                LlamaAttentionQKNorm
++                if getattr(cfg, "qk_norm", False)
++                else LlamaAttention
++            ),
++        )
+ 
+         config = config or vllm_config.model_config.hf_config
+         quant_config = self.get_quant_config(vllm_config)
+@@ -76,9 +125,14 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+         self.progressive_staged = mode in PROGRESSIVE_MODES
+         self.per_layer_weighted_sum = mode == "per_layer_weighted_sum"
+         self.hawk = mode == "hawk"
+-        # Hawk: always H. Progressive: 2H on every layer. Stock: 2H only on L0.
++        # banded_mix_wide: no fusion FC upstream, so layer 0 takes
++        # [embed | band_0 | ... | band_{B-1}] = (1+B)H.
++        self.banded_mix_wide = mode == "banded_mix_wide"
++        self.n_aux_bands = _num_aux_bands(config)
+         qkv_input_size = (
+-            self.hidden_size
++            (1 + self.n_aux_bands) * self.hidden_size
++            if (self.banded_mix_wide and layer_idx == 0)
++            else self.hidden_size
+             if self.hawk
+             else (
+                 2 * self.hidden_size
+@@ -107,6 +161,17 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+ 
+         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+         self.layer_idx = layer_idx
++        # One norm per band stream (there is no fc_norm upstream in wide mode).
++        self.aux_stream_norms = (
++            nn.ModuleList(
++                [
++                    RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++                    for _ in range(self.n_aux_bands)
++                ]
++            )
++            if (self.banded_mix_wide and layer_idx == 0)
++            else None
++        )
+ 
+         if getattr(config, "norm_before_residual", False):
+             self._residual_norm = self._norm_before_residual
+@@ -147,6 +212,27 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+                 hidden_states = self.input_layernorm(hidden_states)
+             else:
+                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        elif self.layer_idx == 0 and self.aux_stream_norms is not None:
++            # banded_mix_wide: [emb | frozen bands | current seed].
++            # `inject` holds the B-1 frozen (early/middle) band streams, which
++            # were mixed from target HS at the last verify and stay fixed for
++            # every drafting step of the round. `hidden_states` is the LAST band
++            # at step 0 and the draft's own output at steps 1+, and is also the
++            # H residual stream.
++            if inject is None:
++                raise ValueError("banded_mix_wide layer 0 requires frozen bands")
++            frozen = inject.split(self.hidden_size, dim=-1)
++            norms = self.aux_stream_norms
++            if len(frozen) != len(norms) - 1:
++                raise ValueError(
++                    f"banded_mix_wide expects {len(norms) - 1} frozen band "
++                    f"streams, got {len(frozen)}"
++                )
++            residual = hidden_states
++            parts = [self.input_layernorm(embeds)]
++            parts += [n(c) for n, c in zip(norms[:-1], frozen)]
++            parts.append(norms[-1](hidden_states))
++            hidden_states = torch.cat(parts, dim=-1)
+         elif self.layer_idx == 0:
+             # First layer: concatenate embeds with hidden_states
+             embeds = self.input_layernorm(embeds)
+@@ -204,6 +290,8 @@ def _should_compile_eagle3_draft(vllm_config: VllmConfig) -> bool:
+     return mode not in {
+         "progressive_staged",
+         "progressive_banded_mix",
++        "banded_mix_fc",
++        "banded_mix_wide",
+         "hawk",
+         "per_layer_weighted_sum",
+     }
+@@ -245,14 +333,22 @@ class LlamaModel(nn.Module):
+         )
+         mode = getattr(self.config, "eagle_aux_injection_mode", "fused_fc")
+         self.progressive_banded_mix = mode == "progressive_banded_mix"
++        # banded_mix_fc: band mix in front of the STOCK fused_fc path (1 draft
++        # layer, nH->H fc, fc_norm/norm_output). Not progressive -- the bands are
++        # fc input streams, not per-layer injects, so their count is free of
++        # num_hidden_layers and they may be unequal in size.
++        self.banded_mix_fc = mode == "banded_mix_fc"
++        # banded_mix_wide: bands stay 3H into a 4H layer 0; no fusion FC at all.
++        self.banded_mix_wide = mode == "banded_mix_wide"
++        self._banded_wide_frozen: torch.Tensor | None = None
+         self.progressive_staged = mode in PROGRESSIVE_MODES
+         self.progressive_per_layer_fc = bool(
+             getattr(self.config, "progressive_per_layer_fc", False)
+         )
+-        if self.progressive_per_layer_fc and mode != "progressive_staged":
++        if self.progressive_per_layer_fc and mode not in PROGRESSIVE_MODES:
+             raise ValueError(
+-                "progressive_per_layer_fc requires "
+-                "eagle_aux_injection_mode='progressive_staged'"
++                "progressive_per_layer_fc requires a progressive "
++                "eagle_aux_injection_mode"
+             )
+         self.disable_progressive_feedback = bool(
+             getattr(self.config, "disable_progressive_feedback", False)
+@@ -293,13 +389,52 @@ class LlamaModel(nn.Module):
+             )
+         # Per-layer inject buffers set by combine_hidden_states / set_aux_inject.
+         self._aux_inject: list[torch.Tensor] | None = None
++        # Deferred [N, n*H] tape awaiting the per-layer FC projection.
++        self._pending_tape: list[torch.Tensor] | None = None
++        self._progressive_fc_stacked: torch.Tensor | None = None
+         self._last_layer_outs: list[torch.Tensor] | None = None
+         self._early_exit_threshold = float(
+             getattr(self.config, "early_exit_threshold", -1.0)
+         )
+         self._early_exit_min_layer = int(getattr(self.config, "early_exit_min_layer", 0))
++        # Highest layer index at which the confidence check runs. Each check
++        # costs a GPU->CPU sync, so checking a layer that rarely exits is a
++        # net loss. -1 keeps the legacy behaviour (every non-final layer).
++        self._early_exit_max_layer = int(
++            getattr(self.config, "early_exit_max_layer", -1)
++        )
++        # Per-check confidence histogram is diagnostic only and appends to a
++        # Python list in the hot path; off unless explicitly requested.
++        self._ee_profile = os.environ.get("EAGLE3_EE_PROFILE") == "1"
+         # Callback set by Eagle3LlamaForCausalLM after it creates lm_head.
+         self._early_exit_compute_logits = None
++        # Match training: on an early exit, skipped depths keep the previous
++        # step's inject at that depth rather than repeating the exiting layer.
++        self.stale_depth_fallback = bool(
++            getattr(self.config, "stale_depth_fallback", False)
++        )
++        self._early_exit_depth: int | None = None
++        self._fc_norm_stacked_w: torch.Tensor | None = None
++        # Decide the exit from the previous step's confidence, so the
++        # GPU->CPU read is of already-retired work instead of a mid-forward stall.
++        self.stale_exit_confidence = (
++            os.environ.get("EAGLE3_STALE_EXIT_CONF") == "1"
++        )
++        self._ee_pending_conf: dict[int, torch.Tensor] = {}
++        # Unconditional early exit at a fixed depth: skips the confidence
++        # check entirely (no lm_head, no sync). -1 disables.
++        self._force_exit_layer = int(
++            os.environ.get("EAGLE3_FORCE_EXIT_LAYER", "-1")
++        )
++        # EAGLE3_EXIT_PROBS="0.5,0.25,0.25": sample the exit depth from this
++        # distribution instead of thresholding, while STILL running the full
++        # confidence-check path (norm + lm_head + conf reduce) at every layer up
++        # to the chosen depth -- so the measured cost includes the check.
++        _ep = os.environ.get("EAGLE3_EXIT_PROBS", "").strip()
++        self._exit_probs = (
++            [float(x) for x in _ep.split(",") if x != ""] if _ep else None
++        )
++        self._sampled_exit_depth: int | None = None
+         self._l0_compact_prefill: tuple[torch.Tensor, torch.Tensor, object] | None = (
+             None
+         )
+@@ -365,6 +500,41 @@ class LlamaModel(nn.Module):
+             )
+             self.target_hidden_size = int(target_hidden_size)
+             self.fc_input_size = target_hidden_size * self.num_aux_hidden_states
++            # aux_band_mix: the N aux streams are reduced to N/aux_band_mix streams by
++            # a per-band weighted sum in combine_hidden_states, so the FC sees the
++            # POST-mix width, not the raw aux width.
++            _abm = int(getattr(self.config, "aux_band_mix", 0) or 0)
++            if _abm > 1 and self.num_aux_hidden_states % _abm == 0:
++                self.fc_input_size = target_hidden_size * (self.num_aux_hidden_states // _abm)
++            # banded_mix_fc collapses each band of raw aux streams into one
++            # stream via a LEARNED softmax, so the FC sees the band count. This
++            # is distinct from `aux_band_mix` above, which is the timing-study
++            # stub: equal-size bands and hard-coded uniform weights.
++            self.aux_layer_bands: tuple[tuple[int, ...], ...] = ()
++            if self.banded_mix_fc or self.banded_mix_wide:
++                raw_bands = getattr(self.config, "eagle_aux_layer_bands", None)
++                if not raw_bands:
++                    raise ValueError(f"{mode} requires eagle_aux_layer_bands")
++                self.aux_layer_bands = tuple(
++                    tuple(int(i) for i in band) for band in raw_bands
++                )
++                if any(not band for band in self.aux_layer_bands):
++                    raise ValueError(
++                        f"banded_mix_fc bands must be non-empty; got {self.aux_layer_bands}"
++                    )
++                flat = [i for band in self.aux_layer_bands for i in band]
++                if len(flat) != self.num_aux_hidden_states:
++                    raise ValueError(
++                        "banded_mix_fc: bands hold "
++                        f"{len(flat)} aux streams, config expects "
++                        f"{self.num_aux_hidden_states}"
++                    )
++                for bi, band in enumerate(self.aux_layer_bands):
++                    self.register_parameter(
++                        f"band{bi}_mix_logits",
++                        nn.Parameter(torch.zeros(len(band), dtype=torch.float32)),
++                    )
++                self.fc_input_size = target_hidden_size * len(self.aux_layer_bands)
+ 
+             if self.per_layer_aux:
+                 # No early 3H→H fusion; aux streams are injected per draft layer.
+@@ -456,20 +626,32 @@ class LlamaModel(nn.Module):
+                         self.register_parameter(
+                             f"band{band_idx}_mix_logits", nn.Parameter(logits)
+                         )
+-                    self.aux_mix_norms = nn.ModuleList(
+-                        [
+-                            RMSNorm(
+-                                self.config.hidden_size,
+-                                eps=self.config.rms_norm_eps,
+-                            )
+-                            for _ in self.aux_layer_bands
+-                        ]
+-                    )
++                    if self.progressive_per_layer_fc and bool(
++                        getattr(self.config, "fc_norm", False)
++                    ):
++                        # fc_norm normalises the mixed streams (and the draft
++                        # outs at step 1+); a second RMSNorm here is redundant.
++                        self.aux_mix_norms = None
++                    else:
++                        self.aux_mix_norms = nn.ModuleList(
++                            [
++                                RMSNorm(
++                                    self.config.hidden_size,
++                                    eps=self.config.rms_norm_eps,
++                                )
++                                for _ in self.aux_layer_bands
++                            ]
++                        )
++                self.num_fusion_streams = (
++                    len(self.aux_layer_bands)
++                    if self.progressive_banded_mix
++                    else self.num_aux_hidden_states
++                )
+                 if self.progressive_per_layer_fc:
+                     self.progressive_fc = nn.ModuleList(
+                         [
+                             ReplicatedLinear(
+-                                input_size=self.fc_input_size,
++                                input_size=self.target_hidden_size * self.num_fusion_streams,
+                                 output_size=self.config.hidden_size,
+                                 bias=False,
+                                 params_dtype=vllm_config.model_config.dtype,
+@@ -487,7 +669,7 @@ class LlamaModel(nn.Module):
+                                     self.target_hidden_size,
+                                     eps=self.config.rms_norm_eps,
+                                 )
+-                                for _ in range(self.num_aux_hidden_states)
++                                for _ in range(self.num_fusion_streams)
+                             ]
+                         )
+                 # Early-exit bridges: residual MLPs for approximating deeper layers
+@@ -555,6 +737,22 @@ class LlamaModel(nn.Module):
+                         prefix=maybe_prefix(prefix, "fuse_w2"),
+                         return_bias=False,
+                     )
++            elif self.banded_mix_wide:
++                # Per-stream norms live on layer 0 (aux_stream_norms).
++                self.input_norm = None
++                self.fc_norm = None
++                self.fc = None
++                self.aux_proj = None
++                # Training normalises each mixed band right after the softmax
++                # mix (there is no fusion FC here to do it), so the checkpoint
++                # carries aux_mix_norms.* -- build them or the mix is unnormed
++                # and the weights fail to load.
++                self.aux_mix_norms = nn.ModuleList(
++                    [
++                        RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
++                        for _ in self.aux_layer_bands
++                    ]
++                )
+             else:
+                 if self.norm_before_fc:
+                     self.input_norm = RMSNorm(
+@@ -566,10 +764,18 @@ class LlamaModel(nn.Module):
+ 
+                 use_fc_norm = getattr(self.config, "fc_norm", False)
+                 if use_fc_norm:
++                    # One norm per FC input stream: the band count under
++                    # banded_mix_fc (fc_norm normalises the MIXED streams),
++                    # otherwise one per raw aux stream.
++                    _n_streams = (
++                        len(self.aux_layer_bands)
++                        if self.banded_mix_fc
++                        else self.num_aux_hidden_states
++                    )
+                     self.fc_norm = nn.ModuleList(
+                         [
+                             RMSNorm(target_hidden_size, eps=self.config.rms_norm_eps)
+-                            for _ in range(self.num_aux_hidden_states)
++                            for _ in range(_n_streams)
+                         ]
+                     )
+                 else:
+@@ -594,8 +800,44 @@ class LlamaModel(nn.Module):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
++    def materialize_aux_inject(self) -> None:
++        """Run the deferred per-layer FC projection, if one is pending.
++
++        On a layer-0 early exit nothing ever reads ``_aux_inject`` -- only
++        layers 1+ do -- so the projection is pure dead work. Defer it to the
++        first actual read; identical math, just skipped when unused.
++        """
++        tape = self._pending_tape
++        if tape is None:
++            return
++        self._pending_tape = None
++        fc_norm = self.fc_norm
++        if fc_norm is not None:
++            stacked = torch.stack(tape, dim=0)
++            f = stacked.float()
++            f = f * torch.rsqrt(
++                f.pow(2).mean(-1, keepdim=True) + fc_norm[0].variance_epsilon
++            )
++            w = self._fc_norm_stacked_w
++            if w is None:
++                w = torch.stack([n.weight for n in fc_norm], dim=0)
++                self._fc_norm_stacked_w = w
++            draft_all = (
++                (w.unsqueeze(1) * f.to(stacked.dtype))
++                .permute(1, 0, 2)
++                .reshape(stacked.shape[1], -1)
++            )
++        else:
++            draft_all = torch.cat(tape, dim=-1)
++        self._aux_inject = list(
++            torch.nn.functional.linear(draft_all, self._progressive_fc_stacked).split(
++                self.config.hidden_size, dim=-1
++            )
++        )
++
+     def set_aux_inject(self, aux_inject: list[torch.Tensor] | None) -> None:
+         """Store per-layer inject HS for progressive_staged / hawk (target or draft)."""
++        self._pending_tape = None
+         self._aux_inject = aux_inject
+ 
+     def set_l0_compact_prefill(
+@@ -625,13 +867,58 @@ class LlamaModel(nn.Module):
+ 
+         residual = None
+         layer_outs: list[torch.Tensor] = []
++        exited_early = False
++        self._early_exit_logits = None
++        self._early_exit_depth = None
++        if self._exit_probs:
++            import random as _rnd
++            _r, _c = _rnd.random(), 0.0
++            self._sampled_exit_depth = len(self._exit_probs) - 1
++            for _i, _p in enumerate(self._exit_probs):
++                _c += _p
++                if _r <= _c:
++                    self._sampled_exit_depth = _i
++                    break
+         start_layer_idx = 0
+ 
++        # ---- HiViS ALL-LAYERS ------------------------------------------------
++        # VLLM_EAGLE_HIVIS_ALL=1: run the ENTIRE draft stack on the image-free
++        # token subset (all layers, all hidden states), not just L0. The compact
++        # rows carry their own positions/KV timeline; the final hidden is
++        # scattered back to full width so downstream shapes are unchanged.
++        _hivis_all = os.environ.get("VLLM_EAGLE_HIVIS_ALL", "0").strip().lower() in (
++            "1", "true", "yes", "on"
++        )
++        _hv_ctx = None
++        _hv_idx = None
++        _hv_full = None
++        if _hivis_all and self._l0_compact_prefill is not None:
++            _ti, _cpos, _cctx = self._l0_compact_prefill
++            # PROMPT ONLY. During decode every row is a drafted text token, so
++            # there is nothing to compact -- applying it there dropped a row
++            # (rows went 5 -> 4) and cost time for no benefit.
++            if input_ids.numel() > 1 and 0 < _ti.numel() < input_ids.numel():
++                _hv_idx = _ti
++                _hv_full = input_embeds.shape[0]
++                if not getattr(self, "_hv_logged", False) and _hv_full > 100:
++                    self._hv_logged = True
++                    print(f"[HIVIS_ALL] ENGAGED: {_hv_full} rows -> {_ti.numel()} rows", flush=True)
++                input_embeds = input_embeds.index_select(0, _ti)
++                hidden_states = hidden_states.index_select(0, _ti)
++                positions = _cpos
++                _hv_ctx = _cctx
++                if self._aux_inject is not None:
++                    self._aux_inject = [
++                        c.index_select(0, _ti) for c in self._aux_inject
++                    ]
++
+         compact_l0 = self._l0_compact_prefill
++        if _hv_idx is not None:
++            compact_l0 = None            # all-layers mode supersedes the L0-only path
+         if (
+             compact_l0 is not None
+             and self.progressive_staged
+-            and self._aux_inject is not None
++            and (self.materialize_aux_inject() or self._aux_inject is not None)
+         ):
+             token_indices, compact_positions, compact_context = compact_l0
+             if token_indices.numel() > 0 and token_indices.numel() <= input_ids.numel():
+@@ -662,12 +949,18 @@ class LlamaModel(nn.Module):
+                 layer_outs.append(layer_h0)
+                 start_layer_idx = 1
+ 
+-        for layer_idx, layer in enumerate(
++        import contextlib as _ctxlib
++        _hv_stack = _ctxlib.ExitStack()
++        if _hv_ctx is not None:
++            _hv_stack.enter_context(override_forward_context(_hv_ctx))
++        with _hv_stack:
++         for layer_idx, layer in enumerate(
+             self.layers[start_layer_idx:], start_layer_idx
+         ):
+             if self.hawk:
+                 if self.fuse_w1 is None or self.fuse_w2 is None:
+                     raise RuntimeError("hawk mode missing fuse_w1 / fuse_w2")
++                self.materialize_aux_inject()
+                 if self._aux_inject is None or layer_idx >= len(self._aux_inject):
+                     raise ValueError(
+                         f"hawk forward missing aux inject for layer {layer_idx}"
+@@ -688,9 +981,20 @@ class LlamaModel(nn.Module):
+                 )
+             else:
+                 inject = None
+-                if (
++                if self.banded_mix_wide and layer_idx == 0:
++                    inject = self._banded_wide_frozen
++                    if inject is None:
++                        raise ValueError(
++                            "banded_mix_wide forward missing frozen band streams; "
++                            "combine_hidden_states must run after each verify"
++                        )
++                    if inject.shape[0] != hidden_states.shape[0]:
++                        # Draft rows can shrink between steps (rejected tokens).
++                        inject = inject[: hidden_states.shape[0]]
++                elif (
+                     self.progressive_staged or self.per_layer_weighted_sum
+                 ) and layer_idx > 0:
++                    self.materialize_aux_inject()
+                     if self._aux_inject is None or layer_idx >= len(self._aux_inject):
+                         mode_name = (
+                             "per_layer_weighted_sum"
+@@ -708,6 +1012,7 @@ class LlamaModel(nn.Module):
+                     progressive=bool(self.progressive_staged),
+                     has_inject=bool(inject is not None),
+                     num_tokens=int(input_ids.numel()),
++                    rows=int(hidden_states.shape[0]),
+                 ):
+                     hidden_states, residual = layer(
+                         positions=positions,
+@@ -724,7 +1029,7 @@ class LlamaModel(nn.Module):
+                 if (
+                     self.drop_image_l0_replace
+                     and layer_idx == 0
+-                    and self._aux_inject is not None
++                    and (self.materialize_aux_inject() or self._aux_inject is not None)
+                     and len(self._aux_inject) > 0
+                 ):
+                     image_mask = input_ids.eq(self.image_token_id)
+@@ -734,33 +1039,69 @@ class LlamaModel(nn.Module):
+                         hidden_states = h_complete
+                         residual = None
+                 layer_outs.append(h_complete)
++                if (
++                    self._force_exit_layer >= 0
++                    and layer_idx >= self._force_exit_layer
++                    and layer_idx < len(self.layers) - 1
++                ):
++                    # Unconditional exit: no confidence logits, no GPU->CPU sync.
++                    exited_early = True
++                    self._early_exit_depth = layer_idx
++                    break
+                 if (
+                     self._early_exit_threshold > 0
+                     and self._early_exit_compute_logits is not None
+                     and self.per_layer_aux
+                     and layer_idx >= self._early_exit_min_layer
+                     and layer_idx < len(self.layers) - 1
++                    and (
++                        self._early_exit_max_layer < 0
++                        or layer_idx <= self._early_exit_max_layer
++                    )
+                 ):
+                     _norm_out = self.norm(h_complete)
+                     h_norm = _norm_out[0] if isinstance(_norm_out, tuple) else _norm_out
+                     logits = self._early_exit_compute_logits(h_norm)
++                    self._early_exit_logits = logits
+                     if logits is not None:
+                         conf = logits.float().softmax(-1).amax(-1)
+-                        _conf_val = conf.min().item()
++                        if self.stale_exit_confidence:
++                            # Decide from the PREVIOUS step's confidence at this
++                            # depth and queue this step's value for the next one.
++                            # The read then happens after that work has already
++                            # retired, so the CPU never stalls mid-forward.
++                            pending = self._ee_pending_conf.get(layer_idx)
++                            self._ee_pending_conf[layer_idx] = conf.min()
++                            if pending is None:
++                                continue
++                            _conf_val = pending.item()
++                        else:
++                            _conf_val = conf.min().item()
+                         # Track confidence distribution and exit events.
+                         if not hasattr(self, "_ee_conf_hist"):
+                             self._ee_conf_hist = {}
+                             self._ee_exit_counts = {}
+                             self._ee_total = 0
+-                        self._ee_conf_hist.setdefault(layer_idx, []).append(_conf_val)
++                        if self._ee_profile:
++                            self._ee_conf_hist.setdefault(layer_idx, []).append(
++                                _conf_val
++                            )
+                         self._ee_total += 1
++                        if self._exit_probs is not None:
++                            # check cost already paid above; decision is the sample
++                            if layer_idx >= (self._sampled_exit_depth or 0):
++                                self._early_exit_depth = layer_idx
++                                exited_early = True
++                                break
++                            continue
+                         if _conf_val >= self._early_exit_threshold:
+                             self._ee_exit_counts[layer_idx] = (
+                                 self._ee_exit_counts.get(layer_idx, 0) + 1
+                             )
++                            exited_early = True
++                            self._early_exit_depth = layer_idx
+                             break
+-                        if self._ee_total % 5000 == 0:
+-                            import numpy as np
++                        if self._ee_total % 2000 == 0:
+                             total = self._ee_total
+                             exits = sum(self._ee_exit_counts.values())
+                             print(
+@@ -768,6 +1109,7 @@ class LlamaModel(nn.Module):
+                                 f"({exits/total*100:.1f}%) by_layer={self._ee_exit_counts}",
+                                 flush=True,
+                             )
++                            import numpy as np
+                             for li, vals in sorted(self._ee_conf_hist.items()):
+                                 v = np.array(vals[-5000:])
+                                 print(
+@@ -779,12 +1121,33 @@ class LlamaModel(nn.Module):
+                                 )
+         # Pad layer_outs to full depth when exited early so
+         # take_progressive_draft_feedback always has one inject per layer.
+-        if self.per_layer_aux and layer_outs and len(layer_outs) < len(self.layers):
++        if (
++            self.per_layer_aux
++            and layer_outs
++            and len(layer_outs) < len(self.layers)
++            and not self.stale_depth_fallback
++        ):
+             last_h = layer_outs[-1]
+             while len(layer_outs) < len(self.layers):
+                 layer_outs.append(last_h)
+         self._last_layer_outs = layer_outs if self.per_layer_aux else None
+ 
++        if not exited_early:
++            # Ran to full depth: the last layer is never checked, so there are
++            # no reusable logits.
++            self._early_exit_logits = None
++
++        if _hv_idx is not None and _hv_full is not None and _hv_full != hidden_states.shape[0]:
++            # Scatter the compact rows back to full width (image rows stay zero;
++            # only the final row is consumed to seed drafting).
++            _full = hidden_states.new_zeros((_hv_full, hidden_states.shape[-1]))
++            _full.index_copy_(0, _hv_idx, hidden_states)
++            hidden_states = _full
++            if residual is not None:
++                _fr = residual.new_zeros((_hv_full, residual.shape[-1]))
++                _fr.index_copy_(0, _hv_idx, residual)
++                residual = _fr
++
+         hidden_states, hidden_prenorm = self.norm(hidden_states, residual)
+ 
+         # norm_output variant uses the post-norm hidden states.
+@@ -841,7 +1204,7 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+             self.config.draft_vocab_size, scale=logit_scale
+         )
+         # Give LlamaModel access to logit computation for early-exit confidence.
+-        self.model._early_exit_compute_logits = self.compute_logits
++        self.model._early_exit_compute_logits = self.compute_draft_logits
+         self.draft_id_to_target_id = nn.Parameter(
+             torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+             requires_grad=False,
+@@ -873,11 +1236,31 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         return self.model(input_ids, positions, hidden_states, inputs_embeds)
+ 
++    def compute_draft_logits(
++        self,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor | None:
++        """Draft-vocab logits without the target-vocab scatter.
++
++        The early-exit confidence only needs max softmax probability, and the
++        scattered slots are ``-inf`` (zero probability), so the max over the
++        draft vocab is identical -- without allocating and filling an
++        ``[N, vocab_size]`` tensor on every check.
++        """
++        return self.logits_processor(self.lm_head, hidden_states)
++
+     def compute_logits(
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
+-        logits = self.logits_processor(self.lm_head, hidden_states)
++        # On an early exit the final hidden state IS the exiting layer's output,
++        # which the confidence check already ran lm_head over. Reuse it.
++        cached = getattr(self.model, "_early_exit_logits", None)
++        if cached is not None and cached.shape[0] == hidden_states.shape[0]:
++            self.model._early_exit_logits = None
++            logits = cached
++        else:
++            logits = self.logits_processor(self.lm_head, hidden_states)
+         if self.draft_id_to_target_id is None:
+             assert logits.shape[1] == self.config.vocab_size, (
+                 "Expected logits to have shape "
+@@ -936,12 +1319,13 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+             raw_chunks = list(hidden_states.split(chunk_h, dim=-1))
+             eagle_miracle.set_last_raw_chunks(raw_chunks)
+             if self.model.progressive_banded_mix:
+-                if self.model.aux_mix_norms is None:
+-                    raise RuntimeError("progressive_banded_mix missing aux_mix_norms")
+                 mixed_chunks: list[torch.Tensor] = []
+                 offset = 0
++                _mix_norms = self.model.aux_mix_norms or [None] * len(
++                    self.model.aux_layer_bands
++                )
+                 for band_idx, (band, norm) in enumerate(
+-                    zip(self.model.aux_layer_bands, self.model.aux_mix_norms)
++                    zip(self.model.aux_layer_bands, _mix_norms)
+                 ):
+                     band_chunks = raw_chunks[offset : offset + len(band)]
+                     band_stack = torch.stack(band_chunks, dim=-1)
+@@ -949,10 +1333,15 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+                     weights = torch.softmax(logits.float(), dim=0).to(
+                         device=band_stack.device, dtype=band_stack.dtype
+                     )
+-                    mixed_chunks.append(norm(torch.matmul(band_stack, weights)))
++                    _mixed = torch.matmul(band_stack, weights)
++                    mixed_chunks.append(norm(_mixed) if norm is not None else _mixed)
+                     offset += len(band)
+-                self.model.set_aux_inject(mixed_chunks)
+-                return mixed_chunks[0]
++                if not self.model.progressive_per_layer_fc:
++                    self.model.set_aux_inject(mixed_chunks)
++                    return mixed_chunks[0]
++                # Band mix is the front end: hand the mixed streams to the
++                # per-layer FC path below so step 0 matches steps 1+.
++                raw_chunks = mixed_chunks
+             if self.model.progressive_per_layer_fc:
+                 if self.model.progressive_fc is None:
+                     raise RuntimeError(
+@@ -1004,13 +1393,95 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+         if n and hidden_states.shape[-1] == n * h:
+             eagle_miracle.set_last_raw_chunks(list(hidden_states.split(h, dim=-1)))
+ 
++        # Band mix (AngelSlim draft-speed study): the N aux streams arriving here are
++        # grouped into `aux_band_mix`-sized bands and each band is reduced to ONE
++        # stream by a weighted sum, before the FC. 9 target layers -> 3 bands of 3 ->
++        # 3 streams -> concat 3H -> fc -> H, with a single draft layer.
++        _bm = int(getattr(self.config, "aux_band_mix", 0) or 0)
++        if _bm > 1:
++            _H = self.config.hidden_size
++            _tot = hidden_states.shape[-1] // _H
++            if _tot % _bm == 0:
++                _bands = _tot // _bm
++                with angelslim_time_block(
++                    "aux_band_mix",
++                    num_tokens=int(hidden_states.shape[0]),
++                    bands=_bands,
++                    per_band=_bm,
++                ):
++                    _w = getattr(self.model, "_band_w", None)
++                    if _w is None or _w.shape != (_bands, _bm):
++                        _w = torch.full(
++                            (_bands, _bm), 1.0 / _bm,
++                            device=hidden_states.device, dtype=hidden_states.dtype)
++                        self.model._band_w = _w
++                    _x = hidden_states.view(-1, _bands, _bm, _H)
++                    hidden_states = (_x * _w[None, :, :, None]).sum(2).reshape(-1, _bands * _H)
++
++        if getattr(self.model, "banded_mix_wide", False):
++            _H = self.model.target_hidden_size
++            _bands = self.model.aux_layer_bands
++            _expect = _H * self.model.num_aux_hidden_states
++            if hidden_states.shape[-1] != _expect:
++                raise ValueError(
++                    f"banded_mix_wide expects concat aux HS of size {_expect}, "
++                    f"got {hidden_states.shape[-1]}"
++                )
++            with angelslim_time_block(
++                "aux_band_mix",
++                num_tokens=int(hidden_states.shape[0]),
++                bands=len(_bands),
++            ):
++                _chunks = hidden_states.split(_H, dim=-1)
++                _mix_norms = self.model.aux_mix_norms or [None] * len(_bands)
++                _mixed, _off = [], 0
++                for _bi, _band in enumerate(_bands):
++                    _stack = torch.stack(_chunks[_off : _off + len(_band)], dim=-1)
++                    _w = torch.softmax(
++                        getattr(self.model, f"band{_bi}_mix_logits").float(), dim=0
++                    ).to(device=_stack.device, dtype=_stack.dtype)
++                    _m = torch.matmul(_stack, _w)
++                    _norm = _mix_norms[_bi]
++                    _mixed.append(_norm(_m) if _norm is not None else _m)
++                    _off += len(_band)
++            # Early/middle bands freeze here and are reused for every drafting
++            # step until the next verify recomputes target aux. The late band is
++            # returned as the seed and is what the draft output replaces.
++            self.model._banded_wide_frozen = torch.cat(_mixed[:-1], dim=-1)
++            return _mixed[-1]
++
++        if getattr(self.model, "banded_mix_fc", False):
++            _H = self.model.target_hidden_size
++            _bands = self.model.aux_layer_bands
++            _expect = _H * self.model.num_aux_hidden_states
++            if hidden_states.shape[-1] != _expect:
++                raise ValueError(
++                    f"banded_mix_fc expects concat aux HS of size {_expect}, "
++                    f"got {hidden_states.shape[-1]}"
++                )
++            with angelslim_time_block(
++                "aux_band_mix",
++                num_tokens=int(hidden_states.shape[0]),
++                bands=len(_bands),
++            ):
++                _chunks = hidden_states.split(_H, dim=-1)
++                _mixed, _off = [], 0
++                for _bi, _band in enumerate(_bands):
++                    _stack = torch.stack(_chunks[_off : _off + len(_band)], dim=-1)
++                    _w = torch.softmax(
++                        getattr(self.model, f"band{_bi}_mix_logits").float(), dim=0
++                    ).to(device=_stack.device, dtype=_stack.dtype)
++                    _mixed.append(torch.matmul(_stack, _w))
++                    _off += len(_band)
++                hidden_states = torch.cat(_mixed, dim=-1)
++
+         if self.model.norm_before_fc:
+             hidden_states = self.model.input_norm(hidden_states)
+ 
+         # `norm_before_fc` adds a single RMSNorm before the FC layer, whereas `fc_norm`
+         # applies separate RMSNorms to each chunk of the hidden states.
+         if self.model.fc_norm is not None:
+-            chunks = hidden_states.chunk(self.model.num_aux_hidden_states, dim=-1)
++            chunks = hidden_states.chunk(len(self.model.fc_norm), dim=-1)
+             hidden_states = torch.cat(
+                 [norm(chunk) for norm, chunk in zip(self.model.fc_norm, chunks)],
+                 dim=-1,
+@@ -1024,6 +1495,7 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+ 
+     def compact_aux_inject(self, indices: torch.Tensor) -> None:
+         """Keep only selected rows of per-layer aux (HiViS compact draft)."""
++        self.model.materialize_aux_inject()
+         if self.model._aux_inject is None:
+             return
+         self.model._aux_inject = [
+@@ -1078,6 +1550,35 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+                 else:
+                     gathered.append(h)
+ 
++            # Per-depth staleness fallback (matches training's sim_exit_depth path):
++            # on an early exit the skipped depths keep the PREVIOUS step's inject
++            # at that same depth, instead of repeating the exiting layer's output.
++            n_layers = len(self.model.layers)
++            # With an unconditional exit at layer 0, layers 1+ never run, so the
++            # injects are provably never read. Skip the tape entirely -- the
++            # stale fill below would otherwise force materialization each step.
++            if self.model._force_exit_layer == 0:
++                self.model.set_aux_inject(None)
++                if self.model.norm_output:
++                    return self.model.norm(gathered[-1])
++                return gathered[0]
++            if (
++                getattr(self.model, "stale_depth_fallback", False)
++                and len(gathered) < n_layers
++            ):
++                self.model.materialize_aux_inject()
++                prev = self.model._aux_inject
++                exit_h = gathered[-1]
++                for i in range(len(gathered), n_layers):
++                    if (
++                        prev is not None
++                        and i < len(prev)
++                        and prev[i].shape == exit_h.shape
++                    ):
++                        gathered.append(prev[i])
++                    else:
++                        gathered.append(exit_h)
++
+             # Bridge-based approximation: if bridges available and gathered is shallow,
+             # use bridges to approximate missing layers
+             if (
+@@ -1104,12 +1605,26 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+                             f"({len(fc_norm)}) must equal number of draft "
+                             f"layer outputs ({len(gathered)})"
+                         )
+-                    normed = [norm(h) for norm, h in zip(fc_norm, gathered)]
+-                else:
+-                    normed = gathered
+-                draft_all = torch.cat(normed, dim=-1)
+-                fused = [fc(draft_all) for fc in self.model.progressive_fc]
+-                self.model.set_aux_inject(fused)
++                    pass  # norms are applied lazily in materialize_aux_inject
++                # One stacked [n*H, n*H] matmul instead of n separate n*H->H
++                # projections: same math, one kernel launch instead of n.
++                w = getattr(self.model, "_progressive_fc_stacked", None)
++                if w is None:
++                    w = torch.cat(
++                        [fc.weight for fc in self.model.progressive_fc], dim=0
++                    ).contiguous()
++                    self.model._progressive_fc_stacked = w
++                # Defer the ENTIRE tape build -- fc_norms, stack and projection.
++                # On a layer-0 exit nothing reads the injects, so none of it is
++                # needed. materialize_aux_inject() runs it on the first real read.
++                w = self.model._progressive_fc_stacked
++                if w is None:
++                    w = torch.cat(
++                        [fc.weight for fc in self.model.progressive_fc], dim=0
++                    ).contiguous()
++                    self.model._progressive_fc_stacked = w
++                self.model._aux_inject = None
++                self.model._pending_tape = list(gathered)
+             else:
+                 # Run B: raw per-layer feedback
+                 self.model.set_aux_inject(gathered)
+@@ -1199,12 +1714,15 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
+         if self.model.progressive_banded_mix:
+             for band_idx in range(len(self.model.aux_layer_bands)):
+                 required_fusion_weights.add(f"model.band{band_idx}_mix_logits")
+-                required_fusion_weights.add(f"model.aux_mix_norms.{band_idx}.weight")
++                if self.model.aux_mix_norms is not None:
++                    required_fusion_weights.add(
++                        f"model.aux_mix_norms.{band_idx}.weight"
++                    )
+         if self.model.progressive_per_layer_fc:
+             for layer_idx in range(len(self.model.layers)):
+                 required_fusion_weights.add(f"model.progressive_fc.{layer_idx}.weight")
+             if self.model.fc_norm is not None:
+-                for stream_idx in range(self.model.num_aux_hidden_states):
++                for stream_idx in range(self.model.num_fusion_streams):
+                     required_fusion_weights.add(f"model.fc_norm.{stream_idx}.weight")
+         missing_fusion_weights = required_fusion_weights.difference(model_weights)
+         if missing_fusion_weights:

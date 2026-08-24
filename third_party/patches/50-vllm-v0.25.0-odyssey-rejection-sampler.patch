@@ -1,3 +1,9 @@
+# Odyssey: env-gated pure-torch resync branches in the rejection sampler.
+# Applies on top of 40-vllm-v0.25.0-angelslim-latency.patch.
+#
+# Inert unless ODYSSEY_BRANCH names a python branch (odyssey.sampler_hook is
+# imported lazily from ODYSSEY_ROOT), so the default path -- including
+# rejection_sample_method="block" -- stays on the stock Triton kernels.
 diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 index c56252d..9ca4ba2 100644
 --- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
