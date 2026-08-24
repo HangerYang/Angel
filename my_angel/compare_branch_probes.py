@@ -17,7 +17,9 @@ other draft architectures.
 import json, os, sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LO, HI = 33233, 38233
+LO = 33233
+HI = int(os.environ.get("HI", 0)) or None   # default: deepest step every arm reached
+BAND = int(os.environ.get("BAND", 0)) or None  # default: ~5 bands across the window
 FIT_A, FIT_B = 3.8242, -2.0743
 
 # label -> run dir under my_angel/eagle
@@ -59,7 +61,13 @@ if missing:
     print(f"not yet trained, skipped: {', '.join(missing)}\n", file=sys.stderr)
 
 base_lab, base_run, base_h = H[0]
+
+# Compare only where EVERY arm has data, so the bands stay paired.
+probe_max = [max(s for s in h) for lab, run, h in H[1:]] or [max(base_h)]
+HI = HI or min(min(probe_max), max(base_h))
 steps = sorted(s for s in base_h if LO < s <= HI)
+span = HI - LO
+BAND = BAND or max(1000, round(span / 5 / 1000) * 1000)
 
 
 def window(h, lo, hi):
@@ -69,10 +77,13 @@ def window(h, lo, hi):
     return sum(ce(h[s]) for s in ss) / len(ss), len(ss)
 
 
-bands = [(LO + i * 1000, min(LO + (i + 1) * 1000, HI)) for i in range(5)]
+nb = max(1, -(-span // BAND))
+bands = [(LO + i * BAND, min(LO + (i + 1) * BAND, HI)) for i in range(nb)]
+bands = [(lo, hi) for lo, hi in bands if hi > lo]
 w = max(len(l) for l, _, _ in H) + 1
 
-print(f"absolute train CE, mean(ploss_0..6), per 1k steps from {LO}\n")
+print(f"absolute train CE, mean(ploss_0..6), {BAND//1000}k bands, "
+      f"{LO} -> {HI} ({span} branch-on steps)\n")
 print(" " * w + "".join(f"{f'{lo//1000}-{hi//1000}k':>10}" for lo, hi in bands) + f"{'ALL':>10}")
 for lab, run, h in H:
     row = "".join((f"{window(h,lo,hi)[0]:>10.4f}" if window(h, lo, hi)[0] else f"{'-':>10}")
@@ -97,4 +108,6 @@ for lab, run, h in H[1:]:
         print(f"{lab:<{w}}{cells}{'-':>10}{'-':>10}")
 
 print("\ntau_pred = projected acceptance-length gain at this CE gap, from the n=8 fit.")
-print("It reads the 5k window only; the full-run gap was still widening at 66k.")
+print(f"It reads {LO}-{HI} only. The paired gap is not stationary -- on top2-curr-r33k")
+print("it ran -0.0058 over 33k-38k and -0.0277 over 63k-66k -- so a window short of")
+print("66466 understates where the arm would land. Compare arms, not absolutes.")
