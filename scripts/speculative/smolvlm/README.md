@@ -279,7 +279,7 @@ DRAFT_MODEL=output/smolvlm_256m_eagle3_progressive/checkpoint-* \
 ```
 
 Requires the local vLLM progressive patch
-(`third_party/patches/vllm-v0.25.0-eagle3-progressive-staged.patch`).
+(`third_party/patches/10-vllm-v0.25.0-eagle3-progressive-staged.patch`).
 
 **After every `git pull`**, refresh local vLLM from tracked patches (universal):
 
@@ -600,7 +600,7 @@ When Eagle3 eval breaks or you need to change behavior, these are the touch poin
 | **SmolVLM eval launcher** (defaults, dataset, draft path) | `scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh` | Env vars → CLI for the batch tool |
 | **Draft config sync** (1-/multi-layer, aux ids) | `scripts/speculative/smolvlm/prepare_draft_config_for_vllm_eval.py` | Ensures `config.json` has `num_hidden_layers` + `eagle_aux_hidden_state_layer_ids` |
 | **Shared offline batch / metrics** | `tools/vllm_offline_eagle3_vlm_batch.py` | `LLM(..., speculative_config=...)`, acceptance metrics, datasets |
-| **Portable Eagle3 enablement (edit this, not a dirty vllm tree)** | `third_party/patches/vllm-v0.25.0-smolvlm-eagle3.patch` | Applied by `apply_vllm_patches.sh` / `link_local_vllm.sh` |
+| **Portable Eagle3 enablement (edit this, not a dirty vllm tree)** | `third_party/patches/10-vllm-v0.25.0-eagle3-progressive-staged.patch` | Applied by `apply_vllm_patches.sh` / `link_local_vllm.sh` |
 | **Target: advertise Eagle3 + set aux layers** *(after patch)* | `third_party/vllm/.../idefics3.py` | `SupportsEagle3`; `set_aux_hidden_state_layers` → `model.text_model` |
 | **SmolVLM class** (inherits Idefics3) | `third_party/vllm/.../smolvlm.py` | Thin subclass; Eagle3 hooks live on Idefics3 |
 | **Wire target embed/HS into draft** *(after patch)* | `third_party/vllm/.../eagle/utils.py` | `load_eagle_model`: `text_model` is LlamaModel directly |
