@@ -190,7 +190,7 @@ def prepare_draft_config(
             # only after merge; leave mode as-is here and let export rewrite.
         print(
             "  hawk fuse: vLLM loads fuse_w1/fuse_w2; needs progressive patch "
-            "(third_party/patches/vllm-v0.25.0-eagle3-progressive-staged.patch)."
+            "(third_party/patches/10-vllm-v0.25.0-eagle3-progressive-staged.patch)."
         )
 
     for key in (
