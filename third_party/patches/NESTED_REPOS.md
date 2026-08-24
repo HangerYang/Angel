@@ -14,5 +14,5 @@ This file records local nested repositories seen while creating the mess branch.
 - Path: third_party/HiViS/
 - Remote: https://github.com/lnn-ops/HiViS.git
 - Commit: 40c85840c37b5dda4300ba892e2c510a26e80774
-- Local SmolVLM changes preserved in: third_party/patches/hivis-local-smolvlm.patch
+- Local SmolVLM changes preserved in: third_party/patches/hivis/hivis-local-smolvlm.patch
 - Untracked local TextVQA images under third_party/HiViS/eval_data/textvqa_images/ are treated as local data artifacts.

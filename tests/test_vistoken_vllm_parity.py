@@ -1,6 +1,6 @@
 """Training splice vs the vLLM path must keep the same rows with the same values.
 
-The vLLM side (third_party/patches/vllm-v0.25.0-eagle3-vistoken.patch) writes
+The vLLM side (third_party/patches/20-vllm-v0.25.0-eagle3-vistoken.patch) writes
 each tile's summaries into fixed slots of the raw aux concat and hands the
 compact pass a keep mask. This reproduces that arithmetic and checks it lands
 on the training splice, row for row.

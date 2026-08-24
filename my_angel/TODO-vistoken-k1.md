@@ -124,7 +124,7 @@ Configs already written: `smolvlm-256m-eagle3-vistoken-k{1,4,16}.json`.
 
 ## vLLM support (done)
 
-`third_party/patches/vllm-v0.25.0-eagle3-vistoken.patch`, on top of the
+`third_party/patches/20-vllm-v0.25.0-eagle3-vistoken.patch`, on top of the
 progressive-staged patch. One file, `speculator.py`. It auto-arms whenever the
 draft config carries `vistoken_compress`; `VLLM_EAGLE_VISTOKEN=0` disables.
 
