@@ -3,8 +3,13 @@
 
 This computes the temperature-0 rejection-sampling acceptance prefix length on
 real SmolVLM target logits along the dataset target trajectory. It is intended
-for quick baseline-vs-oracle draft comparisons, including oracle remaining-gist
-conditioning produced by the online SmolVLM dataset builder.
+for quick baseline-vs-oracle draft comparisons, including oracle gist
+conditioning produced by the online SmolVLM dataset builder (both
+``gist_mode='remaining'`` and ``gist_mode='whole'``).
+
+The gist mode is read from the draft config so the oracle supplied at eval
+time matches the one the draft was trained on; ``--gist_mode`` overrides it
+only for deliberate mismatch ablations.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from angelslim.compressor.speculative.train.models import (
     create_target_model,
 )
 from angelslim.compressor.speculative.utils import padding
+from angelslim.compressor.vistoken.splice import compress_image_rows
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,7 +49,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None)
     p.add_argument("--chat_template_type", default="smolvlm")
     p.add_argument("--target_backend", default="hf")
-    p.add_argument("--gist_cache_dir", default=None)
+    p.add_argument(
+        "--gist_mode",
+        default=None,
+        choices=["remaining", "whole"],
+        help=(
+            "Override the oracle gist mode. Default: take it from the draft "
+            "config, which is what keeps eval consistent with training. Set "
+            "explicitly only to measure a deliberate train/eval mismatch."
+        ),
+    )
     return p.parse_args()
 
 
@@ -90,7 +105,7 @@ def make_dataset(args: argparse.Namespace, target_model: Any, cfg: DraftModelCon
         gist_encoder_device=getattr(cfg, "gist_encoder_device", "cuda:0"),
         gist_batch_size=getattr(cfg, "gist_batch_size", 32),
         gist_embedding_dim=getattr(cfg, "gist_embedding_dim", 0),
-        gist_cache_dir=args.gist_cache_dir or getattr(cfg, "gist_cache_dir", None),
+        gist_mode=args.gist_mode or getattr(cfg, "gist_mode", "remaining"),
     )
     manager = DatasetManager(
         data_args,
@@ -105,7 +120,12 @@ def make_dataset(args: argparse.Namespace, target_model: Any, cfg: DraftModelCon
     return eval_ds, collator
 
 
-def prepare_batch_for_draft(batch: dict[str, torch.Tensor], target_model: Any, cfg: DraftModelConfig):
+def prepare_batch_for_draft(
+    batch: dict[str, torch.Tensor],
+    target_model: Any,
+    cfg: DraftModelConfig,
+    draft: torch.nn.Module | None = None,
+):
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
     loss_mask = batch["loss_mask"]
@@ -121,6 +141,33 @@ def prepare_batch_for_draft(batch: dict[str, torch.Tensor], target_model: Any, c
         aux_hidden_states_layer_ids=getattr(cfg, "aux_hidden_states_layer_ids", None),
         **kwargs,
     )
+    # Row compression, exactly where training does it: after the target
+    # forward, before the left shift, while every tensor is still aligned 1:1
+    # on absolute positions.
+    compressor = getattr(draft, "vistoken", None) if draft is not None else None
+    if compressor is not None:
+        spliced = compress_image_rows(
+            compressor,
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            target_logits=target_logits,
+            position_ids=position_ids,
+            image_token_id=draft.vistoken_image_token_id,
+        )
+        hidden_states = spliced["hidden_states"]
+        input_ids = spliced["input_ids"]
+        target_logits = spliced["target_logits"]
+        loss_mask = spliced["loss_mask"]
+        attention_mask = spliced["attention_mask"]
+        position_ids = spliced["position_ids"]
+        if gist_embeddings is not None:
+            raise NotImplementedError(
+                "gist conditioning and row compression both rewrite the draft "
+                "sequence; they have not been reconciled"
+            )
+
     result = {
         "input_ids": padding(input_ids, left=False),
         "target_logits": padding(target_logits, left=False).to(input_ids.device),
@@ -142,7 +189,7 @@ def accepted_lengths_for_batch(
     cfg: DraftModelConfig,
     num_spec_tokens: int,
 ):
-    data = prepare_batch_for_draft(batch, target_model, cfg)
+    data = prepare_batch_for_draft(batch, target_model, cfg, draft)
     input_ids = data["input_ids"]
     target_logits = data["target_logits"]
     loss_mask = data["loss_mask"]
@@ -219,6 +266,22 @@ def main() -> None:
     draft.to(device=device, dtype=next(target_model_obj.parameters()).dtype)
     draft.freeze_embed_weights()
 
+    gist_on = bool(getattr(cfg, "gist_conditioning", False))
+    gist_mode = (args.gist_mode or getattr(cfg, "gist_mode", "remaining")) if gist_on else None
+    if gist_on:
+        detail = (
+            f" refresh_every={getattr(cfg, 'gist_refresh_every', 4)}"
+            if gist_mode == "remaining"
+            else " (one vector per example)"
+        )
+        print(f"Oracle gist conditioning: mode={gist_mode}{detail}")
+        if args.gist_mode and args.gist_mode != getattr(cfg, "gist_mode", "remaining"):
+            print(
+                f"WARNING deliberate train/eval gist mismatch: config says "
+                f"{getattr(cfg, 'gist_mode', 'remaining')!r}, evaluating with "
+                f"{args.gist_mode!r}"
+            )
+
     ds, collator = make_dataset(args, target, cfg)
     loader = DataLoader(ds, batch_size=1, shuffle=False, collate_fn=collator)
 
@@ -245,9 +308,15 @@ def main() -> None:
         "mean_accepted_length": float(lengths.mean().item()),
         "median_accepted_length": float(lengths.median().item()),
         "accept_histogram": hist.tolist(),
-        "gist_conditioning": bool(getattr(cfg, "gist_conditioning", False)),
+        "gist_conditioning": gist_on,
         "gist_encoder_model_name_or_path": getattr(cfg, "gist_encoder_model_name_or_path", None),
-        "gist_refresh_every": getattr(cfg, "gist_refresh_every", None),
+        "gist_mode": gist_mode,
+        # Effective value, not the raw config key: in "remaining" mode a config
+        # without gist_refresh_every still runs at the builder default (4), and
+        # recording null there would misreport what was actually evaluated.
+        "gist_refresh_every": (
+            int(getattr(cfg, "gist_refresh_every", 4)) if gist_mode == "remaining" else None
+        ),
     }
     text = json.dumps(result, indent=2)
     print(text)

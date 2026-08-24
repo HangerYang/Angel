@@ -37,11 +37,6 @@
     15,
     27
   ],
-  "draft_layer_init_from_target": [
-    2,
-    15,
-    27
-  ],
   "transformers_version": "4.57.1",
   "acceptance_threshold_loss_weight": 0.1,
   "acceptance_threshold": 0.4,

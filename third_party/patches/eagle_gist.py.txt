@@ -1,0 +1,250 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""AngelSlim oracle gist conditioning for EAGLE-3 drafts at decode time.
+
+The draft was trained with a "gist" vector summarizing the target's answer,
+projected and fused as a 4th FC stream (``gist_injection="fc"``). That vector
+is an *oracle*: at decode time the answer does not exist yet, so it cannot be
+computed honestly. This module supplies it from a reference file of previously
+generated outputs, which makes the resulting acceptance an upper bound, not a
+deployable speedup. Nothing here is meant to run in production.
+
+Only ``gist_mode="whole"`` drafts are supportable: that mode uses ONE vector
+per example, held constant for the whole response, so it can be encoded once
+per request before generation starts. ``gist_mode="remaining"`` would need the
+vector refreshed every few tokens *during* decode against text that does not
+exist yet, which is not implementable here.
+
+Enable with:
+  VLLM_EAGLE_GIST_MODE=1
+  VLLM_EAGLE_GIST_REF=/path/to/results.jsonl   # prior eval output (see below)
+  VLLM_EAGLE_GIST_ENCODER=Qwen/Qwen3-Embedding-0.6B
+  VLLM_EAGLE_GIST_DEVICE=cuda:0                # optional
+
+The reference file is the results file written by eval_eagle3_vlm_batch.sh:
+a JSON object with ``results: [{"id": int, "generated_text": str}, ...]``.
+Request index -> reference row is by ``id``; a request with no reference gets a
+zero vector (the draft still runs, just unconditioned for that request).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from pathlib import Path
+
+import torch
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+_ENABLED = False
+_TABLE: torch.Tensor | None = None  # [num_refs, dim] on CPU, float32
+_DIM = 0
+_REQ_TO_IDX: dict[str, int] = {}
+_CURRENT: torch.Tensor | None = None  # [num_tokens, dim], verify/prefill shape
+_PER_REQ: torch.Tensor | None = None  # [num_reqs, dim], one row per request
+_LOGGED_FIRST_ARM = False
+# Offline LLM.chat / generate request ids look like "{prompt_index}-{hex}".
+_REQ_IDX_RE = re.compile(r"^(\d+)[-_]")
+
+
+def _truthy(val: str | None) -> bool:
+    return (val or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_enabled() -> bool:
+    return _ENABLED and _TABLE is not None
+
+
+def embedding_dim() -> int:
+    return _DIM
+
+
+def _load_reference_texts(path: Path) -> dict[int, str]:
+    """Read {id: generated_text} from an eval results file.
+
+    Accepts the pretty-printed ``{"metrics":..., "results":[...]}`` object the
+    batch eval writes, or a true one-object-per-line JSONL.
+    """
+    raw = path.read_text(encoding="utf-8")
+    rows: list[dict] = []
+    try:
+        obj = json.loads(raw)
+        rows = obj.get("results", obj) if isinstance(obj, dict) else obj
+    except json.JSONDecodeError:
+        rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    texts: dict[int, str] = {}
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        idx = row.get("id", i)
+        text = row.get("generated_text") or row.get("output") or row.get("text") or ""
+        texts[int(idx)] = str(text)
+    return texts
+
+
+def init_from_env() -> None:
+    """Call once from draft model __init__."""
+    global _ENABLED, _TABLE, _DIM, _REQ_TO_IDX, _CURRENT
+    _REQ_TO_IDX = {}
+    _CURRENT = None
+    if not _truthy(os.environ.get("VLLM_EAGLE_GIST_MODE")):
+        _ENABLED = False
+        return
+    ref = os.environ.get("VLLM_EAGLE_GIST_REF", "").strip()
+    if not ref:
+        logger.warning("Oracle gist enabled but VLLM_EAGLE_GIST_REF is empty")
+        _ENABLED = False
+        return
+    ref_path = Path(ref)
+    if not ref_path.is_file():
+        logger.warning("Oracle gist reference file not found: %s", ref_path)
+        _ENABLED = False
+        return
+    texts = _load_reference_texts(ref_path)
+    if not texts:
+        logger.warning("Oracle gist reference %s has no usable rows", ref_path)
+        _ENABLED = False
+        return
+
+    model_name = os.environ.get(
+        "VLLM_EAGLE_GIST_ENCODER", "Qwen/Qwen3-Embedding-0.6B"
+    ).strip()
+    device = os.environ.get("VLLM_EAGLE_GIST_DEVICE", "cuda:0").strip() or "cuda:0"
+    from sentence_transformers import SentenceTransformer
+
+    logger.info(
+        "Oracle gist: encoding %d reference outputs from %s with %s",
+        len(texts),
+        ref_path,
+        model_name,
+    )
+    encoder = SentenceTransformer(model_name, device=device, trust_remote_code=True)
+    order = sorted(texts)
+    vecs = encoder.encode(
+        [texts[i] for i in order],
+        batch_size=32,
+        convert_to_tensor=True,
+        normalize_embeddings=False,
+        show_progress_bar=False,
+    ).detach().cpu().float()
+    # Free the encoder: it is only needed once, before generation starts.
+    del encoder
+    torch.cuda.empty_cache()
+
+    _DIM = int(vecs.shape[-1])
+    table = torch.zeros((max(order) + 1, _DIM), dtype=torch.float32)
+    for row, idx in enumerate(order):
+        table[idx] = vecs[row]
+    _TABLE = table
+    _ENABLED = True
+    logger.info(
+        "Oracle gist armed: %d reference vectors, dim=%d "
+        "(ACCEPTANCE IS AN ORACLE UPPER BOUND, NOT A DEPLOYABLE SPEEDUP)",
+        len(order),
+        _DIM,
+    )
+
+
+def bind_req(req_id: str) -> int | None:
+    """Map engine req_id -> reference row index (same scheme as miracle mode)."""
+    if not is_enabled():
+        return None
+    if req_id in _REQ_TO_IDX:
+        return _REQ_TO_IDX[req_id]
+    m = _REQ_IDX_RE.match(str(req_id))
+    if m is None:
+        return None
+    idx = int(m.group(1))
+    assert _TABLE is not None
+    if idx < 0 or idx >= _TABLE.shape[0]:
+        return None
+    _REQ_TO_IDX[req_id] = idx
+    return idx
+
+
+def arm(
+    req_ids: list[str],
+    query_start_loc_cpu: torch.Tensor | None,
+    num_tokens: int,
+    num_reqs: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Build the per-token gist stream for this forward pass.
+
+    ``query_start_loc_cpu`` is the [num_reqs+1] token offsets of each request in
+    the flattened batch; when absent (pure decode, one token per request) the
+    token order is assumed to match ``req_ids``.
+    """
+    global _CURRENT, _PER_REQ, _LOGGED_FIRST_ARM
+    _CURRENT = None
+    _PER_REQ = None
+    if not is_enabled() or num_tokens <= 0 or not req_ids:
+        return
+    assert _TABLE is not None
+    out = torch.zeros((num_tokens, _DIM), dtype=torch.float32)
+    # One row per request as well: the draft's decode steps run with one token
+    # per request, a different shape from this verify/prefill batch, and layer-0
+    # ("qkv") injection needs the gist at *every* one of those steps.
+    per_req = torch.zeros((max(num_reqs, 1), _DIM), dtype=torch.float32)
+    hit = False
+    for r, req_id in enumerate(req_ids[:num_reqs]):
+        idx = bind_req(req_id)
+        if idx is None:
+            continue
+        if query_start_loc_cpu is not None and query_start_loc_cpu.numel() > r + 1:
+            lo = int(query_start_loc_cpu[r])
+            hi = int(query_start_loc_cpu[r + 1])
+        else:
+            lo, hi = r, r + 1
+        lo = max(0, min(lo, num_tokens))
+        hi = max(lo, min(hi, num_tokens))
+        if r < per_req.shape[0]:
+            per_req[r] = _TABLE[idx]
+        if hi > lo:
+            out[lo:hi] = _TABLE[idx]
+            hit = True
+    if hit:
+        _CURRENT = out.to(device=device, dtype=dtype)
+        _PER_REQ = per_req.to(device=device, dtype=dtype)
+    # One-shot: makes a silent all-zeros fallback (req ids that never match the
+    # reference rows) visible instead of looking like a working oracle. Skip
+    # kernel-warmup arms ("_warmup_0_" etc.), which never carry a real index and
+    # would otherwise report a bogus 0/N before generation has begun.
+    real = [r for r in req_ids[:num_reqs] if _REQ_IDX_RE.match(str(r))]
+    if not _LOGGED_FIRST_ARM and real:
+        _LOGGED_FIRST_ARM = True
+        matched = sum(1 for r in real if bind_req(r) is not None)
+        logger.info(
+            "Oracle gist first arm: %d/%d requests matched a reference row "
+            "(%s); req_ids=%s", matched, len(real),
+            "LIVE" if hit else "NO MATCH -> zero gist, draft runs unconditioned",
+            real[:4],
+        )
+
+
+def current(num_tokens: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+    """Gist rows for ``num_tokens`` rows of the active forward, or None.
+
+    Resolves by shape, because the same armed oracle is consumed at two
+    different granularities: the verify/prefill batch (``num_tokens`` tokens,
+    laid out by query_start_loc) and each draft decode step (one token per
+    request). A per-request constant is correct for both -- only the row
+    expansion differs.
+    """
+    if _CURRENT is None:
+        return None
+    src = _CURRENT
+    if _PER_REQ is not None and num_tokens != _CURRENT.shape[0]:
+        # Decode-shaped (or padded) step: one row per request.
+        src = _PER_REQ
+    if src.shape[0] < num_tokens:
+        pad = torch.zeros(
+            (num_tokens - src.shape[0], src.shape[1]), device=src.device, dtype=src.dtype
+        )
+        src = torch.cat((src, pad), dim=0)
+    return src[:num_tokens].to(device=device, dtype=dtype)

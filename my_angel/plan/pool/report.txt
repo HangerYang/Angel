@@ -1,0 +1,163 @@
+Draft-speed report  |  OmniDocBench  |  20 examples  |  32 rounds x K=4 = 128 drafted tokens per example
+Acceptance is not measured and does not affect anything: every variant runs the SAME number of rounds.
+'ms' columns are clean CUDA-event timings. Component shares come from a second hooked pass (absolute ms inflated by per-module sync).
+
+==============================================================================
+1  plain eagle3 (3 layers, 3H)
+==============================================================================
+averaged over 20 examples x 32 rounds x K=4   draft KV = 887 tokens
+
+stage                         ms   components (share of that stage)
+------------------------------------------------------------------------------
+prefill                   0.5504   
+token 1                   1.9664   
+token 2                   1.9931   
+token 3                   2.0200   
+token 4                   2.0409   
+------------------------------------------------------------------------------
+ROUND total               8.0203   (2.0051 ms per drafted token)
+128 drafted tokens      257.2007   (prefill 0.550 + 32 rounds)
+
+==============================================================================
+3  HiViS: text-only draft prefill
+==============================================================================
+averaged over 20 examples x 32 rounds x K=4   draft KV = 55 tokens
+
+stage                         ms   components (share of that stage)
+------------------------------------------------------------------------------
+prefill                   0.6441   
+token 1                   1.9576   
+token 2                   1.9866   
+token 3                   2.0065   
+token 4                   2.0315   
+------------------------------------------------------------------------------
+ROUND total               7.9822   (1.9956 ms per drafted token)
+128 drafted tokens      256.0747   (prefill 0.644 + 32 rounds)
+
+==============================================================================
+4  QFormer 4x  (832 -> 208 img)
+==============================================================================
+averaged over 20 examples x 32 rounds x K=4   draft KV = 263 tokens
+
+stage                         ms   components (share of that stage)
+------------------------------------------------------------------------------
+prefill                   0.9412   
+token 1                   1.9574   
+token 2                   1.9838   
+token 3                   2.0062   
+token 4                   2.0279   
+------------------------------------------------------------------------------
+ROUND total               7.9754   (1.9938 ms per drafted token)
+128 drafted tokens      256.1528   (prefill 0.941 + 32 rounds)
+
+==============================================================================
+4  QFormer 16x (832 ->  52 img)
+==============================================================================
+averaged over 20 examples x 32 rounds x K=4   draft KV = 107 tokens
+
+stage                         ms   components (share of that stage)
+------------------------------------------------------------------------------
+prefill                   0.9494   
+token 1                   1.9692   
+token 2                   1.9978   
+token 3                   2.0193   
+token 4                   2.0422   
+------------------------------------------------------------------------------
+ROUND total               8.0285   (2.0071 ms per drafted token)
+128 drafted tokens      257.8604   (prefill 0.949 + 32 rounds)
+
+==============================================================================
+P  pool N=208 (3L)
+==============================================================================
+averaged over 20 examples x 32 rounds x K=4   draft KV = 263 tokens
+
+stage                         ms   components (share of that stage)
+------------------------------------------------------------------------------
+prefill                   0.7622   
+token 1                   1.9699   
+token 2                   1.9947   
+token 3                   2.0189   
+token 4                   2.0401   
+------------------------------------------------------------------------------
+ROUND total               8.0235   (2.0059 ms per drafted token)
+128 drafted tokens      257.5150   (prefill 0.762 + 32 rounds)
+
+==============================================================================
+P  pool N=52  (3L)
+==============================================================================
+averaged over 20 examples x 32 rounds x K=4   draft KV = 107 tokens
+
+stage                         ms   components (share of that stage)
+------------------------------------------------------------------------------
+prefill                   0.7626   
+token 1                   1.9663   
+token 2                   1.9912   
+token 3                   2.0147   
+token 4                   2.0378   
+------------------------------------------------------------------------------
+ROUND total               8.0100   (2.0025 ms per drafted token)
+128 drafted tokens      257.0829   (prefill 0.763 + 32 rounds)
+
+==============================================================================
+P  pool N=16  (3L)
+==============================================================================
+averaged over 20 examples x 32 rounds x K=4   draft KV = 71 tokens
+
+stage                         ms   components (share of that stage)
+------------------------------------------------------------------------------
+prefill                   0.7529   
+token 1                   1.9602   
+token 2                   1.9901   
+token 3                   2.0089   
+token 4                   2.0338   
+------------------------------------------------------------------------------
+ROUND total               7.9930   (1.9983 ms per drafted token)
+128 drafted tokens      256.5291   (prefill 0.753 + 32 rounds)
+
+==============================================================================
+P  pool N=4   (3L)
+==============================================================================
+averaged over 20 examples x 32 rounds x K=4   draft KV = 59 tokens
+
+stage                         ms   components (share of that stage)
+------------------------------------------------------------------------------
+prefill                   0.7530   
+token 1                   1.9653   
+token 2                   1.9935   
+token 3                   2.0133   
+token 4                   2.0368   
+------------------------------------------------------------------------------
+ROUND total               8.0089   (2.0022 ms per drafted token)
+128 drafted tokens      257.0389   (prefill 0.753 + 32 rounds)
+
+==============================================================================
+P  pool N=16  (9L -> 3 bands)
+==============================================================================
+averaged over 20 examples x 32 rounds x K=4   draft KV = 71 tokens
+
+stage                         ms   components (share of that stage)
+------------------------------------------------------------------------------
+prefill                   0.7932   
+token 1                   1.9635   
+token 2                   1.9931   
+token 3                   2.0155   
+token 4                   2.0372   
+------------------------------------------------------------------------------
+ROUND total               8.0094   (2.0023 ms per drafted token)
+128 drafted tokens      257.0930   (prefill 0.793 + 32 rounds)
+
+
+==============================================================================
+SUMMARY vs plain eagle3
+==============================================================================
+variant                                      kv   prefill     round     /tok    128tok    vs #1
+------------------------------------------------------------------------------------------
+1  plain eagle3 (3 layers, 3H)              887    0.5504    8.0203   2.0051   257.201   1.000x
+3  HiViS: text-only draft prefill            55    0.6441    7.9822   1.9956   256.075   0.996x
+4  QFormer 4x  (832 -> 208 img)             263    0.9412    7.9754   1.9938   256.153   0.996x
+4  QFormer 16x (832 ->  52 img)             107    0.9494    8.0285   2.0071   257.860   1.003x
+P  pool N=208 (3L)                          263    0.7622    8.0235   2.0059   257.515   1.001x
+P  pool N=52  (3L)                          107    0.7626    8.0100   2.0025   257.083   1.000x
+P  pool N=16  (3L)                           71    0.7529    7.9930   1.9983   256.529   0.997x
+P  pool N=4   (3L)                           59    0.7530    8.0089   2.0022   257.039   0.999x
+P  pool N=16  (9L -> 3 bands)                71    0.7932    8.0094   2.0023   257.093   1.000x

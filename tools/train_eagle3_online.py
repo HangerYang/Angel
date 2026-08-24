@@ -364,7 +364,7 @@ def train():
         "gist_encoder_device",
         "gist_batch_size",
         "gist_embedding_dim",
-        "gist_cache_dir",
+        "gist_mode",
     ):
         if hasattr(draft_model_config, name):
             setattr(args, name, getattr(draft_model_config, name))
@@ -381,6 +381,13 @@ def train():
     )
     rank0_print("Target model loaded successfully")
 
+    # Auto-detect embed_weight_key if not explicitly set
+    if args.embed_weight_key == "model.embed_tokens.weight":
+        # Check if this is a VLM model with text_model prefix
+        if args.modal_type == "VLM" or target_model_type == "smolvlm":
+            args.embed_weight_key = "model.text_model.embed_tokens.weight"
+            rank0_print(f"Auto-detected VLM model, using embed_weight_key: {args.embed_weight_key}")
+
     # Create draft model
     rank0_print("Loading draft model...")
     rank0_print(f"draft_model_config: {draft_model_config}")
@@ -388,6 +395,14 @@ def train():
     draft_model.load_embed_weights(args.target_model_name_or_path, args.embed_weight_key)
     draft_model.freeze_embed_weights()
     init_from_target = getattr(draft_model_config, "draft_layer_init_from_target", None)
+    if init_from_target and getattr(
+        draft_model_config, "eagle_aux_injection_mode", "fused_fc"
+    ) in ("progressive_staged", "progressive_banded_mix"):
+        raise ValueError(
+            "draft_layer_init_from_target is not supported for progressive eagle "
+            "modes (progressive_staged / progressive_banded_mix) — these train "
+            "from random init. Remove the key from the draft config."
+        )
     if init_from_target:
         draft_model.load_layer_weights_from_target(
             args.target_model_name_or_path,

@@ -78,6 +78,8 @@ TARGET_MODEL_NAME_OR_PATH=${TARGET_MODEL_NAME_OR_PATH:-HuggingFaceTB/SmolVLM-256
 #   Options under $CONFIG_DIR:
 #     smolvlm-256m-eagle3.json                 — stock Eagle3 fused_fc, 1 draft layer
 #     smolvlm-256m-eagle3-3.1.json             — stock + EAGLE 3.1 (fc_norm + norm_output)
+#     smolvlm-256m-eagle3-banded-mix-fc-3.1.json — EAGLE 3.1 shape, each of the 3 FC
+#                                                input streams a learned mix over an aux band
 #     smolvlm-256m-eagle3-progressive.json     — progressive_staged, 3 layers, init from target
 #     smolvlm-256m-eagle3-progressive-layers-1-15-23-3.1.json — progressive + norm_output
 #     smolvlm-256m-eagle3-progressive-uninit.json — progressive, no layer init
@@ -172,6 +174,10 @@ EVAL_STRATEGY=${EVAL_STRATEGY:-no}
 # EVAL_STEPS — eval interval when EVAL_STRATEGY=steps.
 EVAL_STEPS=${EVAL_STEPS:-5000}
 
+# LEARNING_RATE — drafter LR. A vistoken row compressor takes its own LR from
+# vistoken_compress.lr in the draft config, in a separate param group.
+LEARNING_RATE=${LEARNING_RATE:-1e-4}
+
 # LAUNCH / DIST_BACKEND / NPROC / CUDA_VISIBLE_DEVICES — may already be set by TRAIN_MODE case.
 LAUNCH=${LAUNCH:-torchrun}
 DIST_BACKEND=${DIST_BACKEND:-nccl}
@@ -215,7 +221,7 @@ ARGS=(
   --save_strategy "${SAVE_STRATEGY}"
   --eval_strategy "${EVAL_STRATEGY}"
   --eval_steps "${EVAL_STEPS}"
-  --learning_rate 1e-4                          # fixed LR; override in this script if needed
+  --learning_rate "${LEARNING_RATE}"             # drafter LR; the vistoken compressor gets its own from the draft config
   --weight_decay 0.0
   --warmup_ratio 0.05                           # LR warmup fraction of total steps (not HS warmup)
   --lr_scheduler_type "constant"

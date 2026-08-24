@@ -126,6 +126,85 @@ def _norm_dataset_name(dataset: str) -> str:
     return dataset.rstrip("/").lower()
 
 
+# --prompt_style verbose: the generation prompts used by the EAGLE-3 VLM
+# papers, which elicit long answers. Without them most VQA benchmarks emit a
+# bare word or two (MMStar averages 8.8 output tokens), leaving speculative
+# decoding nothing to amortise prefill against. Keyed by task type.
+_VQA_SUFFIX = "Please answer with an explanation."
+_OCR_PROMPT = (
+    "Perform an OCR task on the provided image. Extract the text accurately "
+    "and provide a detailed explanation of the process. Ensure the response "
+    "is comprehensive and well-structured."
+)
+_CAPTION_PROMPT = "Provide a detailed description of the given image."
+
+# dataset -> (mode, text); "suffix" appends, "replace" swaps the whole prompt.
+VERBOSE_PROMPTS = {
+    "lin-chen/mmstar": ("suffix", _VQA_SUFFIX),
+    "mmmu/mmmu": ("suffix", _VQA_SUFFIX),
+    "lmms-lab/textvqa": ("suffix", _VQA_SUFFIX),
+    "lmms-lab/chartqa": ("suffix", _VQA_SUFFIX),
+    "ai4math/mathvista": ("suffix", _VQA_SUFFIX),
+    "lmms-lab/vqav2": ("suffix", _VQA_SUFFIX),
+    "lmms-lab/gqa": ("suffix", _VQA_SUFFIX),
+    "lmms-lab/scienceqa": ("suffix", _VQA_SUFFIX),
+    "lmms-lab/mme": ("suffix", _VQA_SUFFIX),
+    "lmms-lab/seed-bench": ("suffix", _VQA_SUFFIX),
+    "lmms-lab/mmvet": ("suffix", _VQA_SUFFIX),
+    "lmms-lab-encoder/mmvet": ("suffix", _VQA_SUFFIX),
+    "lmms-lab/mmbench": ("suffix", _VQA_SUFFIX),
+    "lmms-lab-encoder/mmbench": ("suffix", _VQA_SUFFIX),
+    "opendatalab/omnidocbench": ("replace", _OCR_PROMPT),
+    "lmms-lab/coco-caption": ("replace", _CAPTION_PROMPT),
+    # HuggingFaceH4/MATH-500 deliberately absent: text-only, already long, and
+    # the papers define no prompt for it.
+}
+
+# SmolVLM-256M ignores an appended "Please answer with an explanation." on VQA
+# (measured: textvqa 10.3 -> 5.2 output tokens), so these variants restructure
+# the whole prompt instead of tacking a sentence on the end. `{q}` is the
+# dataset question. Applied only to the datasets whose VERBOSE_PROMPTS rule is
+# a "suffix" -- i.e. the VQA benchmarks; OCR/caption already have whole-prompt
+# rules that do work, and MATH-500 stays untouched as the control.
+PROMPT_VARIANTS = {
+    "detail_prefix": "Answer the following question in detail, explaining your reasoning: {q}",
+    "cot": "{q}\nLet's think step by step and explain the reasoning before giving the answer.",
+    "describe_first": "Describe what you see in the image in detail, then answer this question: {q}",
+    "min_words": "{q} Please answer with at least 100 words.",
+    # describe_first lengthens output but lets the description displace the
+    # answer (textvqa kept the answer in only 4/10 samples). This forces the
+    # answer out first -- so it stays scoreable and comparable to raw -- and
+    # puts the description after it, where it only adds tokens.
+    "answer_then_describe": (
+        "Answer this question: {q} Then describe the image in detail to "
+        "justify your answer."
+    ),
+}
+
+# Set once from --prompt_style so the per-dataset prompt branches stay simple.
+_PROMPT_STYLE = "raw"
+
+
+def style_prompt(dataset: str, text: str) -> str:
+    """Apply the --prompt_style prompt for `dataset`, if any."""
+    if _PROMPT_STYLE == "raw":
+        return text
+    rule = VERBOSE_PROMPTS.get(_norm_dataset_name(dataset))
+    if rule is None:
+        return text
+    mode, extra = rule
+    if _PROMPT_STYLE in PROMPT_VARIANTS:
+        # Variants restructure question-style prompts; datasets whose rule is a
+        # whole-prompt replacement (OCR, caption) keep that replacement.
+        if mode == "replace":
+            return extra
+        return PROMPT_VARIANTS[_PROMPT_STYLE].format(q=(text or "").rstrip())
+    if mode == "replace":
+        return extra
+    text = (text or "").rstrip()
+    return f"{text} {extra}" if text else extra
+
+
 def _load_hf_dataset_with_fallback(dataset: str):
     spec = GENERIC_VLM_DATASETS[_norm_dataset_name(dataset)]
     paths = spec.get("paths", (dataset,))
@@ -253,8 +332,8 @@ def _extract_image(item):
     return None
 
 
-def _generic_vlm_prompt(item):
-    text = _generic_question_text(item)
+def _generic_vlm_prompt(item, dataset: str = ""):
+    text = style_prompt(dataset, _generic_question_text(item))
     image = _extract_image(item)
     if image is None:
         return [{"role": "user", "content": text}]
@@ -381,6 +460,17 @@ def parse_args():
         type=str,
         default="lmms-lab/textvqa",
         help="Dataset to use: HuggingFace dataset name or local JSONL file path",
+    )
+    parser.add_argument(
+        "--prompt_style",
+        type=str,
+        default="raw",
+        choices=("raw", "verbose") + tuple(PROMPT_VARIANTS),
+        help=(
+            "raw (default): the dataset question verbatim. verbose: append the "
+            "EAGLE-3 VLM papers' task prompts (VQA explanation / OCR / caption) "
+            "so the target emits long answers. See VERBOSE_PROMPTS."
+        ),
     )
     parser.add_argument(
         "--use_eagle",
@@ -567,6 +657,20 @@ def main():
     args = parse_args()
     _setup_debug(args)
 
+    global _PROMPT_STYLE
+    _PROMPT_STYLE = args.prompt_style
+    if _PROMPT_STYLE == "verbose":
+        rule = VERBOSE_PROMPTS.get(_norm_dataset_name(args.dataset))
+        print(
+            f"prompt_style=verbose -> {args.dataset}: "
+            + (f"{rule[0]} {rule[1]!r}" if rule else "no rule, prompts unchanged")
+        )
+    elif _PROMPT_STYLE in PROMPT_VARIANTS:
+        print(
+            f"prompt_style={_PROMPT_STYLE} -> {args.dataset}: "
+            + repr(style_prompt(args.dataset, "{q}"))
+        )
+
     # Load dataset
     is_local_dataset = os.path.exists(args.dataset)
     if is_local_dataset:
@@ -631,7 +735,7 @@ def main():
                         "role": "user",
                         "content": [
                             {"type": "image_url", "image_url": {"url": image_url}},
-                            {"type": "text", "text": item["question"]},
+                            {"type": "text", "text": style_prompt(args.dataset, item["question"])},
                         ],
                     }
                 ]
@@ -640,7 +744,7 @@ def main():
         for item in ds:
             # Convert PIL image to base64
             image_url = pil_to_base64(item["image_1"])
-            question = item["question"].replace("<image 1>", "")
+            question = style_prompt(args.dataset, item["question"].replace("<image 1>", ""))
             prompts.append(
                 [
                     {
@@ -656,7 +760,7 @@ def main():
         for item in ds:
             # Convert PIL image to base64
             image_url = pil_to_base64(item["image"])
-            question = item["question"].replace("<image>", "")
+            question = style_prompt(args.dataset, item["question"].replace("<image>", ""))
             prompts.append(
                 [
                     {
@@ -680,14 +784,19 @@ def main():
                         "role": "user",
                         "content": [
                             {"type": "image_url", "image_url": {"url": image_url}},
-                            {"type": "text", "text": "提取并识别图片中的文本。"},
+                            {
+                                "type": "text",
+                                "text": style_prompt(
+                                    args.dataset, "提取并识别图片中的文本。"
+                                ),
+                            },
                         ],
                     }
                 ]
             )
     elif _norm_dataset_name(args.dataset) in GENERIC_VLM_DATASETS:
         for item in ds:
-            prompts.append(_generic_vlm_prompt(item))
+            prompts.append(_generic_vlm_prompt(item, args.dataset))
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
@@ -699,6 +808,15 @@ def main():
                 "model": args.draft_model,
                 "num_speculative_tokens": args.num_spec_tokens,
             }
+            # Odyssey: select vLLM's own verification method. "block" runs the
+            # joint-suffix test in _compute_cumulative_log_p_kernel; the python
+            # resync branches use ODYSSEY_BRANCH instead and leave this unset.
+            _odyssey_method = os.environ.get("ODYSSEY_REJECTION_METHOD", "").strip()
+            if _odyssey_method:
+                speculative_config["rejection_sample_method"] = _odyssey_method
+                print(f"ODYSSEY: rejection_sample_method={_odyssey_method}")
+            if os.environ.get("ODYSSEY_BRANCH", "").strip():
+                print(f"ODYSSEY: branch={os.environ['ODYSSEY_BRANCH']}")
         else:
             print(
                 "Warning: use_eagle is set but no draft_model provided. "
@@ -779,7 +897,14 @@ def main():
             enable_prefix_caching=False,
         )
 
-    sampling_params = SamplingParams(temperature=args.temp, max_tokens=args.output_len)
+    # IGNORE_EOS=1 forces every request to emit exactly output_len tokens, so two
+    # runs do equal work and wall time is comparable without normalisation.
+    _ignore_eos = os.environ.get("IGNORE_EOS") == "1"
+    sampling_params = SamplingParams(
+        temperature=args.temp, max_tokens=args.output_len, ignore_eos=_ignore_eos
+    )
+    if _ignore_eos:
+        print(f"IGNORE_EOS=1: every request emits exactly {args.output_len} tokens")
 
     if args.breakpoint_before_generate:
         print("[debug] breakpoint before generate — continue in debugger")

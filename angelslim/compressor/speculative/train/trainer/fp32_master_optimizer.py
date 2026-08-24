@@ -140,15 +140,27 @@ class FP32MasterWeightOptimizer(torch.optim.Optimizer):
         inner_optimizer: torch.optim.Optimizer,
         max_grad_norm: float = 1.0,
     ):
-        self._bf16_params = bf16_params
+        # bf16_params is either a flat list (one group) or a list of lists,
+        # one per inner param group -- used for an LR split (e.g. the row
+        # compressor at its own LR alongside the drafter).
+        if bf16_params and isinstance(bf16_params[0], (list, tuple)):
+            groups = [list(g) for g in bf16_params]
+        else:
+            groups = [list(bf16_params)]
+        if len(groups) != len(inner_optimizer.param_groups):
+            raise ValueError(
+                f"got {len(groups)} bf16 param groups but "
+                f"{len(inner_optimizer.param_groups)} inner optimizer groups"
+            )
+        self._bf16_params = [p for group in groups for p in group]
         self._fp32_params: List[torch.Tensor] = [
-            p.detach().clone().to(torch.float32).requires_grad_(True) for p in bf16_params
+            p.detach().clone().to(torch.float32).requires_grad_(True)
+            for p in self._bf16_params
         ]
-        assert len(inner_optimizer.param_groups) == 1, (
-            "FP32MasterWeightOptimizer expects a single param group; "
-            "extend if/when multiple groups (e.g. LoRA, lr split) are needed."
-        )
-        inner_optimizer.param_groups[0]["params"] = self._fp32_params
+        offset = 0
+        for group, inner_group in zip(groups, inner_optimizer.param_groups):
+            inner_group["params"] = self._fp32_params[offset : offset + len(group)]
+            offset += len(group)
         inner_optimizer.state = defaultdict(dict)
 
         self._inner = inner_optimizer

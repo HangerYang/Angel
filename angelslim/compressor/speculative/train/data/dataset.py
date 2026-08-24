@@ -94,7 +94,7 @@ class DatasetManager:
                 gist_encoder_device=getattr(data_args, "gist_encoder_device", "cuda:0"),
                 gist_batch_size=getattr(data_args, "gist_batch_size", 32),
                 gist_embedding_dim=getattr(data_args, "gist_embedding_dim", 0),
-                gist_cache_dir=getattr(data_args, "gist_cache_dir", None),
+                gist_mode=getattr(data_args, "gist_mode", "remaining"),
             )
         if data_args.training_mode == "offline":
             self.offline_dataset_builder = DatasetBuilderFactory.create(

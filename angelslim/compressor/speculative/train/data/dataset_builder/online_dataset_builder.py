@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 import json
 import os
 from functools import partial
@@ -47,16 +46,9 @@ from ..data_utils import (
     build_image_processor_kwargs,
     stable_hf_map_cache_files,
 )
+from ..gist_embedding import GistEmbeddingEncoder
 from .base_dataset_builder import OnlineDatasetBuilder
 from .dataset_builder_factory import DatasetBuilderFactory
-
-
-class GistEncoderUnavailableInWorkerError(RuntimeError):
-    """Raised when a ds.map(num_proc>1) worker hits a gist cache miss.
-
-    Deliberately NOT caught by _process_single_conversation's broad
-    except-and-drop-the-row handling -- see _get_gist_encoder for why.
-    """
 
 
 @DatasetBuilderFactory.register("online", "LLM")
@@ -778,31 +770,21 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
             chat_template_type,
             display,
         )
+        # Gist embeddings are computed live at collate time (see
+        # gist_embedding.GistEmbeddingEncoder), not here -- this builder's
+        # ds.map() pass stays identical to a non-gist config regardless of
+        # gist_conditioning, so it always hits an already-warm .map_cache.
         self.gist_conditioning = bool(kwargs.get("gist_conditioning", False))
         self.gist_encoder_model_name_or_path = kwargs.get(
             "gist_encoder_model_name_or_path", "Qwen/Qwen3-Embedding-0.6B"
         )
         self.gist_refresh_every = max(1, int(kwargs.get("gist_refresh_every", 4)))
+        # "remaining" = suffix re-encoded every gist_refresh_every tokens;
+        # "whole" = one vector per example (see gist_embedding.GistEmbeddingEncoder).
+        self.gist_mode = kwargs.get("gist_mode", "remaining")
         self.gist_encoder_device = kwargs.get("gist_encoder_device", "cuda:0")
         self.gist_batch_size = max(1, int(kwargs.get("gist_batch_size", 32)))
-        self.gist_cache_dir = kwargs.get("gist_cache_dir")
         self.gist_embedding_dim = int(kwargs.get("gist_embedding_dim", 0) or 0)
-        # Escape hatch, off by default: gist_conditioning normally forces
-        # num_proc=None because the SentenceTransformer encoder can't safely
-        # fork across worker processes. When the on-disk gist cache is known
-        # to already cover every text this run will touch, no worker will
-        # ever need the encoder, and forcing single-process wastes the CPU
-        # tokenizer.decode()+hash lookup work that dominates when the cache
-        # is warm. Only meant to be set by a caller that has verified the
-        # cache is warm (e.g. tools/warm_map_cache.py) -- never wired to the
-        # real training CLI, so default online-training behavior is
-        # unchanged.
-        self.gist_allow_multiproc = bool(kwargs.get("gist_allow_multiproc", False))
-        self._gist_main_pid = os.getpid()
-        self._gist_encoder = None
-        self._gist_cache = None
-        self._gist_cache_path = None
-        self._gist_cache_dirty = False
 
     def build_dataset(
         self,
@@ -850,21 +832,12 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
             # Pin cache under <data_dir>/.map_cache/ so restarts actually hit
             # (default HF fingerprints bound methods and miss every run).
             # Collator still rebuilds pixel_* each step from image_paths.
-            if self.gist_conditioning and not self.gist_allow_multiproc:
-                if num_proc is not None:
-                    rank0_print(
-                        "Oracle gist preprocessing uses an in-process encoder/cache; "
-                        "forcing num_proc=None."
-                    )
-                num_proc = None
-            if self.gist_conditioning:
-                self._prepare_gist_cache(datapath)
+            # Gist embeddings are NOT computed here (see gist_embedding.py),
+            # so this pass is identical to a non-gist config regardless of
+            # gist_conditioning -- cache_version stays "v1" so this hits the
+            # same pinned cache file a non-gist run of the same data already
+            # built.
             cache_version = "v1"
-            if self.gist_conditioning:
-                cache_version = (
-                    f"v2-gist-{self._gist_model_cache_name()}-"
-                    f"r{self.gist_refresh_every}"
-                )
             cache_files = stable_hf_map_cache_files(
                 datapath,
                 builder_tag=type(self).__name__,
@@ -914,13 +887,22 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
             return processed_ds
         except Exception as e:
             raise RuntimeError(f"Dataset building failed for {datapath}") from e
-        finally:
-            if self.gist_conditioning:
-                self._save_gist_cache()
-                self._unload_gist_encoder()
 
     def get_data_collator(self) -> Any:
-        return VLMSmolVLMDataCollatorWithPadding(processor=self.tokenizer)
+        gist_encoder = None
+        if self.gist_conditioning:
+            gist_encoder = GistEmbeddingEncoder(
+                tokenizer=self.tokenizer,
+                model_name_or_path=self.gist_encoder_model_name_or_path,
+                refresh_every=self.gist_refresh_every,
+                device=self.gist_encoder_device,
+                batch_size=self.gist_batch_size,
+                embedding_dim=self.gist_embedding_dim,
+                mode=self.gist_mode,
+            )
+        return VLMSmolVLMDataCollatorWithPadding(
+            processor=self.tokenizer, gist_encoder=gist_encoder
+        )
 
     def _preprocess_function(self, examples: Dict[str, List]) -> Dict[str, List]:
         new_examples = {
@@ -929,8 +911,6 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
             "loss_mask": [],
             "image_paths": [],
         }
-        if self.gist_conditioning:
-            new_examples["gist_embeddings"] = []
         ids = examples.get("id", list(range(len(examples["conversations"]))))
         for i in range(len(ids)):
             try:
@@ -946,11 +926,6 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                 else:
                     for key in new_examples:
                         new_examples[key].append(None)
-            except GistEncoderUnavailableInWorkerError:
-                # Not a per-row data problem -- let it abort the whole
-                # map() call instead of silently dropping every row that
-                # needed it.
-                raise
             except Exception as e:
                 rank0_print(f"Error processing example: {e}")
                 for key in new_examples:
@@ -1102,177 +1077,6 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
             return None
         return sanitized
 
-    def _gist_model_cache_name(self) -> str:
-        name = self.gist_encoder_model_name_or_path.rstrip("/").split("/")[-1]
-        return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
-
-    def _prepare_gist_cache(self, datapath: str) -> None:
-        if self.gist_cache_dir:
-            cache_dir = Path(self.gist_cache_dir).expanduser()
-        else:
-            cache_path = datapath[0] if isinstance(datapath, list) else datapath
-            cache_dir = Path(cache_path).resolve().parent / ".gist_cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        self._gist_cache_path = (
-            cache_dir
-            / f"{self._gist_model_cache_name()}_r{self.gist_refresh_every}.pt"
-        )
-        if self._gist_cache is not None:
-            return
-        if self._gist_cache_path.exists():
-            self._gist_cache = torch.load(self._gist_cache_path, map_location="cpu")
-            rank0_print(
-                f"Loaded oracle gist cache: {self._gist_cache_path} "
-                f"({len(self._gist_cache)} entries)"
-            )
-        else:
-            self._gist_cache = {}
-            rank0_print(f"Creating oracle gist cache: {self._gist_cache_path}")
-
-    def _save_gist_cache(self) -> None:
-        if not self._gist_cache_dirty or self._gist_cache_path is None:
-            return
-        torch.save(self._gist_cache, self._gist_cache_path)
-        rank0_print(
-            f"Saved oracle gist cache: {self._gist_cache_path} "
-            f"({len(self._gist_cache)} entries)"
-        )
-        self._gist_cache_dirty = False
-
-    def _get_gist_encoder(self):
-        if self._gist_encoder is None:
-            if self.gist_allow_multiproc and os.getpid() != self._gist_main_pid:
-                # A worker process (forked by ds.map(num_proc>1)) hit a gist
-                # cache miss and needs to load the encoder itself. CUDA
-                # cannot be reinitialized in a forked subprocess (PyTorch
-                # requires 'spawn'), so this would otherwise crash inside
-                # SentenceTransformer(...) with an opaque error, and the
-                # caller's broad except-and-drop-the-row handling would
-                # silently discard every row that needed it -- not a
-                # per-row data problem, a systemic one. Fail loudly instead
-                # so the whole map() aborts and the gap gets prewarmed
-                # properly (e.g. scripts/speculative/smolvlm/prewarm_gist_cache.sh)
-                # rather than silently producing an incomplete dataset.
-                raise GistEncoderUnavailableInWorkerError(
-                    "Oracle gist cache miss inside a ds.map(num_proc>1) worker "
-                    f"process (pid={os.getpid()}, main={self._gist_main_pid}). "
-                    "gist_allow_multiproc=True assumes the on-disk cache is "
-                    "already complete; it is not. Re-run the prewarm script to "
-                    "close the gap, then retry -- do not ignore this."
-                )
-            from sentence_transformers import SentenceTransformer
-
-            rank0_print(
-                "Loading oracle gist encoder "
-                f"{self.gist_encoder_model_name_or_path} on {self.gist_encoder_device}"
-            )
-            try:
-                self._gist_encoder = SentenceTransformer(
-                    self.gist_encoder_model_name_or_path,
-                    device=self.gist_encoder_device,
-                    trust_remote_code=True,
-                )
-            except Exception as e:
-                if e.__class__.__name__ == "GatedRepoError" or "GatedRepoError" in repr(e):
-                    raise RuntimeError(
-                        "Cannot load oracle gist encoder "
-                        f"{self.gist_encoder_model_name_or_path!r}: the Hugging Face "
-                        "repo is gated for the current credentials. Accept the model "
-                        "license and run `huggingface-cli login` for this user, or set "
-                        "HF_TOKEN before starting oracle-gist training."
-                    ) from e
-                raise
-            dim = int(self._gist_encoder.get_sentence_embedding_dimension())
-            if self.gist_embedding_dim and self.gist_embedding_dim != dim:
-                raise ValueError(
-                    f"gist_embedding_dim={self.gist_embedding_dim} but encoder returns {dim}"
-                )
-            self.gist_embedding_dim = dim
-        return self._gist_encoder
-
-    def _unload_gist_encoder(self) -> None:
-        if self._gist_encoder is None:
-            return
-        self._gist_encoder = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    def _gist_cache_key(self, text: str) -> str:
-        raw = (
-            f"{self.gist_encoder_model_name_or_path}|r{self.gist_refresh_every}|{text}"
-        ).encode("utf-8")
-        return hashlib.sha1(raw).hexdigest()
-
-    def _encode_gist_texts(self, texts: List[str]) -> List[torch.Tensor]:
-        if not texts:
-            return []
-        if self._gist_cache is None:
-            self._gist_cache = {}
-        result: List[Optional[torch.Tensor]] = [None] * len(texts)
-        missing_texts: List[str] = []
-        missing_slots: List[int] = []
-        missing_keys: List[str] = []
-        for i, text in enumerate(texts):
-            key = self._gist_cache_key(text)
-            cached = self._gist_cache.get(key)
-            if cached is None:
-                missing_texts.append(text)
-                missing_slots.append(i)
-                missing_keys.append(key)
-            else:
-                result[i] = cached.float()
-        if missing_texts:
-            encoder = self._get_gist_encoder()
-            encoded = encoder.encode(
-                missing_texts,
-                batch_size=self.gist_batch_size,
-                convert_to_tensor=True,
-                normalize_embeddings=False,
-                show_progress_bar=False,
-            ).detach().cpu().float()
-            for slot, key, vec in zip(missing_slots, missing_keys, encoded):
-                self._gist_cache[key] = vec.clone()
-                result[slot] = vec
-            self._gist_cache_dirty = True
-        if any(vec is None for vec in result):
-            raise RuntimeError("Internal oracle gist cache error: missing encoded vectors")
-        return [vec for vec in result if vec is not None]
-
-    def _build_remaining_gist_embeddings(
-        self, input_ids: torch.Tensor, loss_mask: torch.Tensor
-    ) -> torch.Tensor:
-        if not self.gist_conditioning:
-            raise RuntimeError("gist conditioning is disabled")
-        ids = input_ids.detach().cpu().long().view(-1)
-        mask = loss_mask.detach().cpu().long().view(-1)
-        if self.gist_embedding_dim <= 0:
-            self._get_gist_encoder()
-        gist = torch.zeros((ids.numel(), self.gist_embedding_dim), dtype=torch.float32)
-        spans = []
-        i = 0
-        while i < mask.numel():
-            if int(mask[i].item()) == 0:
-                i += 1
-                continue
-            start = i
-            while i < mask.numel() and int(mask[i].item()) == 1:
-                i += 1
-            spans.append((start, i))
-        for start, end in spans:
-            refresh_offsets = list(range(0, end - start, self.gist_refresh_every))
-            suffix_texts = []
-            for offset in refresh_offsets:
-                suffix_ids = ids[start + offset : end].tolist()
-                text = self.tokenizer.decode(suffix_ids, skip_special_tokens=True).strip()
-                suffix_texts.append(text)
-            suffix_vecs = self._encode_gist_texts(suffix_texts)
-            for offset, vec in zip(refresh_offsets, suffix_vecs):
-                left = start + offset
-                right = min(end, left + self.gist_refresh_every)
-                # Reuse exactly the same refreshed vector inside the window.
-                gist[left:right] = vec
-        return gist.unsqueeze(0)
-
     def _process_single_conversation(self, conversation_data: List[Dict]) -> Optional[Dict]:
         if not conversation_data or not isinstance(conversation_data, list):
             return None
@@ -1340,15 +1144,7 @@ class OnlineSmolVLMDatasetBuilder(OnlineDatasetBuilder):
                 "loss_mask": loss_mask.view(1, -1),
                 "image_paths": json.dumps(image_paths),
             }
-            if self.gist_conditioning:
-                result["gist_embeddings"] = self._build_remaining_gist_embeddings(
-                    input_ids, loss_mask
-                )
             return result
-        except GistEncoderUnavailableInWorkerError:
-            # Not a per-row data problem -- let it abort the whole map() call
-            # instead of silently dropping every row that needed it.
-            raise
         except Exception as e:
             rank0_print(f"Error processing conversation: {e}")
             return None

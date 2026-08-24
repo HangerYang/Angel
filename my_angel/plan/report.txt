@@ -1,0 +1,205 @@
+==========================================================================
+RUN 1   plain eagle3 (3 aux, 3H)
+==========================================================================
+  1-layer, fused_fc, fc_in=1728
+  OmniDocBench, 20 prompts, 887 prompt tokens (832 image), K=4, vLLM eager
+  932 cycles observed -> normalised to 32 rounds (acceptance does not affect any number here)
+
+  PER PROMPT — draft prefill (887-token KV)
+    draft_layer_forward        0.3451 ms
+    fused_fc_aux_combine       0.0546 ms
+    PREFILL TOTAL              0.3997 ms
+
+  PER ROUND (K=4 drafted tokens)
+    draft_layer_forward      tokens 2-4            x3.07   0.7281 ms  ( 236.9 us/call)
+    draft_layer_forward      token 1 (seed+draft)  x1.00   0.2552 ms  ( 255.2 us/call)
+    fused_fc_aux_combine     token 1 (seed+draft)  x1.00   0.0388 ms  (  38.8 us/call)
+    ROUND TOTAL                                      1.0221 ms
+
+  128 DRAFTED TOKENS   prefill 0.3997 + 32 rounds 32.7064 = 33.1061 ms
+  per drafted token    0.2555 ms
+
+==========================================================================
+RUN 2   3 layers -> 3 bands (1/band)
+==========================================================================
+  aux=3, aux_band_mix=1 (no mix), fc_in=1728
+  OmniDocBench, 20 prompts, 887 prompt tokens (832 image), K=4, vLLM eager
+  932 cycles observed -> normalised to 32 rounds (acceptance does not affect any number here)
+
+  PER PROMPT — draft prefill (887-token KV)
+    draft_layer_forward        0.3564 ms
+    fused_fc_aux_combine       0.0527 ms
+    PREFILL TOTAL              0.4091 ms
+
+  PER ROUND (K=4 drafted tokens)
+    draft_layer_forward      tokens 2-4            x3.07   0.7411 ms  ( 241.1 us/call)
+    draft_layer_forward      token 1 (seed+draft)  x1.00   0.2595 ms  ( 259.5 us/call)
+    fused_fc_aux_combine     token 1 (seed+draft)  x1.00   0.0398 ms  (  39.8 us/call)
+    ROUND TOTAL                                      1.0403 ms
+
+  128 DRAFTED TOKENS   prefill 0.4091 + 32 rounds 33.2901 = 33.6992 ms
+  per drafted token    0.2601 ms
+
+==========================================================================
+RUN 2   6 layers -> 3 bands (2/band)
+==========================================================================
+  aux=6, aux_band_mix=2, fc_in=1728
+  OmniDocBench, 20 prompts, 887 prompt tokens (832 image), K=4, vLLM eager
+  944 cycles observed -> normalised to 32 rounds (acceptance does not affect any number here)
+
+  PER PROMPT — draft prefill (887-token KV)
+    draft_layer_forward        0.3370 ms
+    fused_fc_aux_combine       0.0510 ms
+    aux_band_mix               0.0450 ms
+    PREFILL TOTAL              0.4330 ms
+
+  PER ROUND (K=4 drafted tokens)
+    draft_layer_forward      tokens 2-4            x3.07   0.7362 ms  ( 239.6 us/call)
+    draft_layer_forward      token 1 (seed+draft)  x1.00   0.2597 ms  ( 259.7 us/call)
+    fused_fc_aux_combine     token 1 (seed+draft)  x1.00   0.0426 ms  (  42.6 us/call)
+    aux_band_mix             token 1 (seed+draft)  x1.00   0.0352 ms  (  35.2 us/call)
+    ROUND TOTAL                                      1.0738 ms
+
+  128 DRAFTED TOKENS   prefill 0.4330 + 32 rounds 34.3614 = 34.7944 ms
+  per drafted token    0.2684 ms
+
+==========================================================================
+RUN 2   9 layers -> 3 bands (3/band)
+==========================================================================
+  aux=9, aux_band_mix=3, fc_in=1728
+  OmniDocBench, 20 prompts, 887 prompt tokens (832 image), K=4, vLLM eager
+  958 cycles observed -> normalised to 32 rounds (acceptance does not affect any number here)
+
+  PER PROMPT — draft prefill (887-token KV)
+    draft_layer_forward        0.3382 ms
+    fused_fc_aux_combine       0.0525 ms
+    aux_band_mix               0.0495 ms
+    PREFILL TOTAL              0.4402 ms
+
+  PER ROUND (K=4 drafted tokens)
+    draft_layer_forward      tokens 2-4            x3.07   0.7230 ms  ( 235.3 us/call)
+    draft_layer_forward      token 1 (seed+draft)  x1.00   0.2571 ms  ( 257.1 us/call)
+    fused_fc_aux_combine     token 1 (seed+draft)  x1.00   0.0407 ms  (  40.7 us/call)
+    aux_band_mix             token 1 (seed+draft)  x1.00   0.0350 ms  (  35.0 us/call)
+    ROUND TOTAL                                      1.0556 ms
+
+  128 DRAFTED TOKENS   prefill 0.4402 + 32 rounds 33.7808 = 34.2209 ms
+  per drafted token    0.2639 ms
+
+==========================================================================
+RUN 2b  1 band  -> H
+==========================================================================
+  aux=1, fc_in= 576
+  OmniDocBench, 20 prompts, 887 prompt tokens (832 image), K=4, vLLM eager
+  1310 cycles observed -> normalised to 32 rounds (acceptance does not affect any number here)
+
+  PER PROMPT — draft prefill (887-token KV)
+    draft_layer_forward        0.3470 ms
+    fused_fc_aux_combine       0.0440 ms
+    PREFILL TOTAL              0.3910 ms
+
+  PER ROUND (K=4 drafted tokens)
+    draft_layer_forward      tokens 2-4            x3.05   0.7224 ms  ( 236.6 us/call)
+    draft_layer_forward      token 1 (seed+draft)  x1.00   0.2551 ms  ( 255.1 us/call)
+    fused_fc_aux_combine     token 1 (seed+draft)  x1.00   0.0390 ms  (  39.0 us/call)
+    ROUND TOTAL                                      1.0165 ms
+
+  128 DRAFTED TOKENS   prefill 0.3910 + 32 rounds 32.5279 = 32.9189 ms
+  per drafted token    0.2541 ms
+
+==========================================================================
+RUN 2b  2 bands -> 2H
+==========================================================================
+  aux=2, fc_in=1152
+  OmniDocBench, 20 prompts, 887 prompt tokens (832 image), K=4, vLLM eager
+  1231 cycles observed -> normalised to 32 rounds (acceptance does not affect any number here)
+
+  PER PROMPT — draft prefill (887-token KV)
+    draft_layer_forward        0.3311 ms
+    fused_fc_aux_combine       0.0477 ms
+    PREFILL TOTAL              0.3788 ms
+
+  PER ROUND (K=4 drafted tokens)
+    draft_layer_forward      tokens 2-4            x3.06   0.7135 ms  ( 233.5 us/call)
+    draft_layer_forward      token 1 (seed+draft)  x1.00   0.2531 ms  ( 253.1 us/call)
+    fused_fc_aux_combine     token 1 (seed+draft)  x1.00   0.0380 ms  (  38.0 us/call)
+    ROUND TOTAL                                      1.0047 ms
+
+  128 DRAFTED TOKENS   prefill 0.3788 + 32 rounds 32.1493 = 32.5281 ms
+  per drafted token    0.2512 ms
+
+==========================================================================
+RUN 2b  3 bands -> 3H (== run 1)
+==========================================================================
+  aux=3, fc_in=1728
+  OmniDocBench, 20 prompts, 887 prompt tokens (832 image), K=4, vLLM eager
+  932 cycles observed -> normalised to 32 rounds (acceptance does not affect any number here)
+
+  PER PROMPT — draft prefill (887-token KV)
+    draft_layer_forward        0.3442 ms
+    fused_fc_aux_combine       0.0465 ms
+    PREFILL TOTAL              0.3907 ms
+
+  PER ROUND (K=4 drafted tokens)
+    draft_layer_forward      tokens 2-4            x3.07   0.7215 ms  ( 234.7 us/call)
+    draft_layer_forward      token 1 (seed+draft)  x1.00   0.2534 ms  ( 253.4 us/call)
+    fused_fc_aux_combine     token 1 (seed+draft)  x1.00   0.0382 ms  (  38.2 us/call)
+    ROUND TOTAL                                      1.0132 ms
+
+  128 DRAFTED TOKENS   prefill 0.3907 + 32 rounds 32.4213 = 32.8120 ms
+  per drafted token    0.2533 ms
+
+==========================================================================
+RUN 3   HiViS flag (NO EFFECT - see note)
+==========================================================================
+  hivis_remove_image_tokens=true, ignored in fused_fc path
+  OmniDocBench, 20 prompts, 887 prompt tokens (832 image), K=4, vLLM eager
+  932 cycles observed -> normalised to 32 rounds (acceptance does not affect any number here)
+
+  PER PROMPT — draft prefill (887-token KV)
+    draft_layer_forward        0.3486 ms
+    fused_fc_aux_combine       0.0480 ms
+    PREFILL TOTAL              0.3966 ms
+
+  PER ROUND (K=4 drafted tokens)
+    draft_layer_forward      tokens 2-4            x3.07   0.7395 ms  ( 240.6 us/call)
+    draft_layer_forward      token 1 (seed+draft)  x1.00   0.2632 ms  ( 263.2 us/call)
+    fused_fc_aux_combine     token 1 (seed+draft)  x1.00   0.0397 ms  (  39.7 us/call)
+    ROUND TOTAL                                      1.0424 ms
+
+  128 DRAFTED TOKENS   prefill 0.3966 + 32 rounds 33.3559 = 33.7525 ms
+  per drafted token    0.2606 ms
+
+==========================================================================
+RUN 5   eagle 3.1
+==========================================================================
+  aux=3, fc_in=1728, fc_norm=ON, norm_output=ON
+  OmniDocBench, 20 prompts, 887 prompt tokens (832 image), K=4, vLLM eager
+  1297 cycles observed -> normalised to 32 rounds (acceptance does not affect any number here)
+
+  PER PROMPT — draft prefill (887-token KV)
+    draft_layer_forward        0.3220 ms
+    fused_fc_aux_combine       0.0479 ms
+    PREFILL TOTAL              0.3698 ms
+
+  PER ROUND (K=4 drafted tokens)
+    draft_layer_forward      tokens 2-4            x3.05   0.7143 ms  ( 233.9 us/call)
+    draft_layer_forward      token 1 (seed+draft)  x1.00   0.2475 ms  ( 247.5 us/call)
+    fused_fc_aux_combine     token 1 (seed+draft)  x1.00   0.0386 ms  (  38.6 us/call)
+    ROUND TOTAL                                      1.0004 ms
+
+  128 DRAFTED TOKENS   prefill 0.3698 + 32 rounds 32.0114 = 32.3812 ms
+  per drafted token    0.2501 ms
+
+
+variant                                      prefill     round     /tok    128tok   vs run1
+------------------------------------------------------------------------------------------
+RUN 1   plain eagle3 (3 aux, 3H)              0.3997    1.0221   0.2555    33.106    1.000x
+RUN 2   3 layers -> 3 bands (1/band)          0.4091    1.0403   0.2601    33.699    1.018x
+RUN 2   6 layers -> 3 bands (2/band)          0.4330    1.0738   0.2684    34.794    1.051x
+RUN 2   9 layers -> 3 bands (3/band)          0.4402    1.0556   0.2639    34.221    1.034x
+RUN 2b  1 band  -> H                          0.3910    1.0165   0.2541    32.919    0.994x
+RUN 2b  2 bands -> 2H                         0.3788    1.0047   0.2512    32.528    0.983x
+RUN 2b  3 bands -> 3H (== run 1)              0.3907    1.0132   0.2533    32.812    0.991x
+RUN 3   HiViS flag (NO EFFECT - see note)     0.3966    1.0424   0.2606    33.752    1.020x
+RUN 5   eagle 3.1                             0.3698    1.0004   0.2501    32.381    0.978x

@@ -27,16 +27,32 @@
   "modal_type": "VLM",
   "image_token_id": 49190,
   "eagle_aux_injection_mode": "progressive_staged",
-  "aux_hidden_states_layer_ids": [1, 15, 23],
-  "eagle_aux_hidden_state_layer_ids": [2, 16, 24],
-  "draft_layer_init_from_target": [2, 16, 24],
+  "aux_hidden_states_layer_ids": [
+    1,
+    15,
+    23
+  ],
+  "eagle_aux_hidden_state_layer_ids": [
+    2,
+    16,
+    24
+  ],
   "fc_norm": false,
   "norm_output": true,
   "transformers_version": "4.57.1",
   "attn_match_loss_weight": 0.1,
   "attn_match_steps": 1,
-  "attn_match_target_layers": [15, 23],
-  "attn_match_draft_layers": [1, 2],
-  "attn_match_layer_weights": [1.0, 1.0],
+  "attn_match_target_layers": [
+    15,
+    23
+  ],
+  "attn_match_draft_layers": [
+    1,
+    2
+  ],
+  "attn_match_layer_weights": [
+    1.0,
+    1.0
+  ],
   "attn_match_image_keys": true
 }

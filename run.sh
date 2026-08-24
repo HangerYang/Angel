@@ -2,17 +2,40 @@ cd /home/hyang/AngelSlim
 conda activate angel
 
 
+# banded_mix_fc -- run 1 / run 5 (smolvlm-256m-eagle3-3.1.json) topology exactly:
+# 1 draft layer, 2H L0, stock 3H->H fusion FC, fc_norm + norm_output ON. The only
+# change is the FC's three input streams: instead of raw target layers 1/14/26,
+# each stream is a learned softmax mix over an early/middle/late band
+# ([2,4,8,10] / [15,18,20] / [26,28]). fc_in stays 1728 and the draft gains 9
+# params (the mix logits), so this isolates "which layer in the region" from any
+# architecture change. Uniform init (all-zero logits). Contrast with
+# progressive-banded-mix-uninit, which bands the *progressive* 3-layer draft and
+# has no fusion FC at all.
 TRAIN_MODE=nccl \
 NPROC=4 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3-progressive-banded-mix-uninit.json \
-OUTPUT_DIR=output/smolvlm-256m-eagle3-progressive-banded-mix-uninit \
+DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3-banded-mix-fc-3.1.json \
+OUTPUT_DIR=output/smolvlm-256m-eagle3-banded-mix-fc-3.1 \
 NUM_TRAIN_EPOCHS=2 \
 SAVE_STRATEGY=epoch \
 EVAL_STRATEGY=epoch \
 LOAD_FROM_CACHE_FILE=true \
 TARGET_HS_WARMUP_STEPS=0 \
 bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
+
+
+# --- previously run ---
+# TRAIN_MODE=nccl \
+# NPROC=4 \
+# CUDA_VISIBLE_DEVICES=0,1,2,3 \
+# DRAFT_MODEL_CONFIG_PATH=angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3-progressive-banded-mix-uninit.json \
+# OUTPUT_DIR=output/smolvlm-256m-eagle3-progressive-banded-mix-uninit \
+# NUM_TRAIN_EPOCHS=2 \
+# SAVE_STRATEGY=epoch \
+# EVAL_STRATEGY=epoch \
+# LOAD_FROM_CACHE_FILE=true \
+# TARGET_HS_WARMUP_STEPS=0 \
+# bash scripts/speculative/smolvlm/train_eagle3_vlm_online.sh
 
 
 

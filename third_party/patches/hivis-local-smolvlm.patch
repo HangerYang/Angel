@@ -1,0 +1,765 @@
+diff --git a/hivis/evaluation/benchmark_data.py b/hivis/evaluation/benchmark_data.py
+index cadd374..4dcb11c 100644
+--- a/hivis/evaluation/benchmark_data.py
++++ b/hivis/evaluation/benchmark_data.py
+@@ -59,8 +59,34 @@ def _load_gqa(sample_count):
+ def _load_textvqa(sample_count):
+     with (_DATA_DIR / "TextVQA_0.5.1_test.json").open(encoding="utf-8") as file:
+         records = Dataset.from_list(json.load(file)["data"][:sample_count])
+-    image_root = Path(__file__).resolve().parents[2] / "eval_data/llava_v1_5_mix665k/images/textvqa/test_images"
+-    records = records.map(lambda row: {"image": str(image_root / f"{row['image_id']}.jpg")})
++    image_root = Path(__file__).resolve().parents[2] / "eval_data/textvqa_images"
++    image_root.mkdir(parents=True, exist_ok=True)
++
++    def _resolve_image(row):
++        dest = image_root / f"{row['image_id']}.jpg"
++        if not dest.exists() or dest.stat().st_size == 0:
++            import urllib.request
++
++            urls = [
++                row.get("flickr_300k_url"),
++                row.get("flickr_original_url"),
++            ]
++            last_error = None
++            for url in urls:
++                if not url:
++                    continue
++                try:
++                    urllib.request.urlretrieve(url, dest)
++                    break
++                except Exception as exc:  # noqa: BLE001
++                    last_error = exc
++            else:
++                raise RuntimeError(
++                    f"failed to fetch TextVQA image {row['image_id']}: {last_error}"
++                )
++        return {"image": str(dest)}
++
++    records = records.map(_resolve_image)
+     return records.cast_column("image", Image())
+ 
+ 
+diff --git a/hivis/evaluation/ge_hivis_answer.py b/hivis/evaluation/ge_hivis_answer.py
+index 68d629b..b579f7f 100644
+--- a/hivis/evaluation/ge_hivis_answer.py
++++ b/hivis/evaluation/ge_hivis_answer.py
+@@ -138,6 +138,7 @@ def get_model_answers(
+         torch_dtype=torch.float16,
+         low_cpu_mem_usage=True,
+         device_map="auto",
++        attn_implementation="eager",
+     )
+     tokenizer = model.get_tokenizer()
+     model.eval()
+diff --git a/hivis/ge_data/allocation.py b/hivis/ge_data/allocation.py
+index c4e5886..6873d94 100644
+--- a/hivis/ge_data/allocation.py
++++ b/hivis/ge_data/allocation.py
+@@ -11,7 +11,7 @@ from .model_names import DEFAULT_MODEL_PATHS, model_directory_name
+ 
+ def parse_args():
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("--model", choices=("llava", "qwen"), default="llava")
++    parser.add_argument("--model", choices=("llava", "qwen", "smolvlm"), default="llava")
+     parser.add_argument("--data-type", choices=("text", "multimodal"), required=True)
+     parser.add_argument("--gpus", type=int, nargs="+", required=True)
+     parser.add_argument("--start", type=int, default=0)
+diff --git a/hivis/ge_data/ge_data_smolvlm.py b/hivis/ge_data/ge_data_smolvlm.py
+new file mode 100644
+index 0000000..032180d
+--- /dev/null
++++ b/hivis/ge_data/ge_data_smolvlm.py
+@@ -0,0 +1,187 @@
++"""Generate SmolVLM hidden-state data for official HiViS training.
++
++This keeps the upstream HiViS .ckpt contract:
++  - input_ids: compact language-token ids
++  - target: final target hidden states aligned with input_ids
++  - loss_mask: assistant-token supervision mask
++
++The target VLM sees the full image+text prompt. For multimodal samples, visual
++image tokens are removed from the saved drafter sequence, matching HiViS.
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++from pathlib import Path
++
++DEFAULT_MODEL_PATH = "HuggingFaceTB/SmolVLM-256M-Instruct"
++DEFAULT_DATA_FILE = "/home/hyang/AngelSlim/dataset/smolvlm_256m_target_gen_mixed_70k70k/train.jsonl"
++IMAGE_TOKEN_ID = 49190
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--data-type", choices=("text", "multimodal"), required=True)
++    parser.add_argument("--start", type=int, default=0)
++    parser.add_argument("--end", type=int, default=10**12)
++    parser.add_argument("--index", type=int, default=0)
++    parser.add_argument("--gpu-index", "--gpu_index", dest="gpu_index", type=int, nargs="+", default=[0])
++    parser.add_argument("--outdir", type=Path, default=None)
++    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
++    parser.add_argument("--data-file", default=DEFAULT_DATA_FILE)
++    parser.add_argument("--image-root", type=Path, default=None, help="Accepted for allocation.py compatibility; unused for data URLs/absolute paths.")
++    parser.add_argument("--max-length", type=int, default=4096)
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument("--num-workers", type=int, default=1)
++    parser.add_argument("--fail-fast", action="store_true")
++    parser.add_argument("--min-loss-tokens", type=int, default=1)
++    args = parser.parse_args()
++    if args.start < 0 or args.end < args.start:
++        parser.error("require 0 <= --start <= --end")
++    if args.outdir is None:
++        dataset_name = "sharegpt" if args.data_type == "text" else "llava_v1_5_mix665k"
++        args.outdir = Path("eval_data/generated/smolvlm_256m") / dataset_name
++    return args
++
++
++args = parse_args()
++os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_index))
++
++# CUDA visibility must be configured before importing torch/transformers.
++import torch
++from datasets import Features, Value, load_dataset
++from torch.utils.data import DataLoader
++from tqdm import tqdm
++from transformers import AutoModelForImageTextToText, AutoProcessor
++
++from angelslim.compressor.speculative.train.data.chat_templates import ChatTemplateType
++from angelslim.compressor.speculative.train.data.dataset_builder.online_dataset_builder import (
++    OnlineSmolVLMDatasetBuilder,
++)
++
++
++def has_image(record):
++    for turn in record.get("conversations") or []:
++        content = turn.get("content")
++        if not isinstance(content, list):
++            continue
++        for item in content:
++            if not isinstance(item, dict):
++                continue
++            if item.get("type") in {"image", "image_url"}:
++                return True
++            if item.get("image") or item.get("image_url"):
++                return True
++    return False
++
++
++def load_records():
++    features = Features(
++        {
++            "id": Value("string"),
++            "conversations": [
++                {
++                    "role": Value("string"),
++                    "content": [
++                        {
++                            "type": Value("string"),
++                            "text": Value("string"),
++                            "image": Value("string"),
++                            "image_url": {"url": Value("string")},
++                        }
++                    ],
++                }
++            ],
++        }
++    )
++    ds = load_dataset("json", data_files=args.data_file, features=features, split="train")
++    ds = ds.shuffle(seed=args.seed)
++    want_images = args.data_type == "multimodal"
++    ds = ds.filter(lambda row: has_image(row) == want_images, num_proc=args.num_workers)
++    end = min(args.end, len(ds))
++    if args.start >= end:
++        return ds.select(range(0, 0))
++    return ds.select(range(args.start, end))
++
++
++@torch.no_grad()
++def generate_sample(batch):
++    input_ids = batch["input_ids"].to(model.device)
++    attention_mask = batch["attention_mask"].to(model.device)
++    forward_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask, "output_hidden_states": True}
++    if "pixel_values" in batch:
++        forward_kwargs["pixel_values"] = batch["pixel_values"].to(model.device)
++    if "pixel_attention_mask" in batch:
++        forward_kwargs["pixel_attention_mask"] = batch["pixel_attention_mask"].to(model.device)
++
++    outputs = model(**forward_kwargs)
++    target = outputs.hidden_states[-1]
++    loss_mask = batch["loss_mask"].to(model.device)
++
++    seq_len = int(attention_mask[0].long().sum().item())
++    keep = torch.zeros_like(input_ids[0], dtype=torch.bool)
++    keep[:seq_len] = True
++    if args.data_type == "multimodal":
++        keep = keep & (input_ids[0] != IMAGE_TOKEN_ID)
++
++    if int(keep.sum().item()) == 0:
++        return None
++
++    compact_loss_mask = loss_mask[0][keep].detach().cpu()
++    if int(compact_loss_mask.sum().item()) < args.min_loss_tokens:
++        return None
++
++    return {
++        "loss_mask": compact_loss_mask,
++        "input_ids": input_ids[0][keep].detach().cpu(),
++        "target": target[0][keep].detach().cpu(),
++    }
++
++
++def save_sample(output_dir: Path, sample, sample_index: int):
++    torch.save(sample, output_dir / f"data_{sample_index}.ckpt")
++
++
++processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
++model = AutoModelForImageTextToText.from_pretrained(
++    args.model_path,
++    torch_dtype=torch.bfloat16,
++    device_map="auto",
++    trust_remote_code=True,
++)
++model.eval()
++
++builder = OnlineSmolVLMDatasetBuilder(
++    tokenizer=processor,
++    max_length=args.max_length,
++    shuffle_seed=args.seed,
++    chat_template_type=ChatTemplateType.SMOLVLM,
++)
++collator = builder.get_data_collator()
++records = load_records()
++
++if args.data_type == "text":
++    output_dir = args.outdir / "non_code" / str(args.index)
++else:
++    output_dir = args.outdir / str(args.index)
++output_dir.mkdir(parents=True, exist_ok=True)
++
++loader = DataLoader(records, batch_size=1, shuffle=False, num_workers=0, collate_fn=lambda rows: rows[0])
++next_sample_index = len(list(output_dir.glob("data_*.ckpt")))
++for absolute_offset, record in enumerate(tqdm(loader, desc=f"smolvlm {args.data_type} ckpt")):
++    torch.cuda.empty_cache()
++    try:
++        processed = builder._process_single_conversation(record["conversations"])
++        if processed is None:
++            continue
++        batch = collator([processed])
++        sample = generate_sample(batch)
++        if sample is not None:
++            save_sample(output_dir, sample, next_sample_index)
++            next_sample_index += 1
++    except Exception as error:
++        absolute_index = args.start + absolute_offset
++        if args.fail_fast:
++            raise
++        tqdm.write(f"Skipping dataset index {absolute_index}: {error}")
+diff --git a/hivis/ge_data/model_names.py b/hivis/ge_data/model_names.py
+index 9d51be7..cd1156a 100644
+--- a/hivis/ge_data/model_names.py
++++ b/hivis/ge_data/model_names.py
+@@ -3,13 +3,15 @@
+ from transformers import AutoConfig
+ 
+ 
+-DEFAULT_MODEL_PATHS = {"llava": "llava-hf/llava-v1.6-vicuna-7b-hf", "qwen": "Qwen/Qwen2.5-VL-7B-Instruct"}
++DEFAULT_MODEL_PATHS = {"llava": "llava-hf/llava-v1.6-vicuna-7b-hf", "qwen": "Qwen/Qwen2.5-VL-7B-Instruct", "smolvlm": "HuggingFaceTB/SmolVLM-256M-Instruct"}
+ 
+ 
+ def _name_from_reference(model_reference):
+     name = str(model_reference).lower().replace("_", "-")
+     if "qwen2.5-vl" in name or "qwen2-5-vl" in name or "qwen25vl" in name:
+         return "qwen25vl_7b"
++    if "smolvlm" in name or "idefics3" in name:
++        return "smolvlm_256m"
+     size = "13b" if "13b" in name else "7b" if "7b" in name else None
+     if size and ("llava-v1.6" in name or "llava1.6" in name or "llava16" in name):
+         return f"llava16_{size}"
+@@ -37,6 +39,8 @@ def model_directory_name(model_reference, config=None):
+         if hidden_size != 3584:
+             raise ValueError(f"Unsupported Qwen2.5-VL hidden size: {hidden_size}")
+         return "qwen25vl_7b"
++    if model_type in {"smolvlm", "idefics3"} or hidden_size == 576:
++        return "smolvlm_256m"
+     size = {4096: "7b", 5120: "13b"}.get(hidden_size)
+     if model_type == "llava_next" and size is not None:
+         return f"llava16_{size}"
+diff --git a/hivis/model/cnets_hivis.py b/hivis/model/cnets_hivis.py
+index 46f57d3..3895063 100644
+--- a/hivis/model/cnets_hivis.py
++++ b/hivis/model/cnets_hivis.py
+@@ -277,7 +277,11 @@ class LlamaAttention(nn.Module):
+         self._init_rope()
+ 
+     def _init_rope(self):
+-        if self.config.rope_scaling is None:
++        scaling = self.config.rope_scaling
++        scaling_type = None
++        if scaling is not None:
++            scaling_type = scaling.get("type", scaling.get("rope_type"))
++        if scaling is None or scaling_type in (None, "default", "mrope"):
+             if hasattr(self.config, "rope_theta"):
+                 self.rotary_emb = LlamaRotaryEmbedding(
+                     self.head_dim,
+@@ -289,8 +293,7 @@ class LlamaAttention(nn.Module):
+                     self.head_dim, max_position_embeddings=self.max_position_embeddings
+                 )
+         else:
+-            scaling_type = self.config.rope_scaling["type"]
+-            scaling_factor = self.config.rope_scaling["factor"]
++            scaling_factor = scaling.get("factor", 1.0)
+             if scaling_type == "linear":
+                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                     self.head_dim,
+diff --git a/hivis/model/model_hivis.py b/hivis/model/model_hivis.py
+index f1f2383..a295b68 100644
+--- a/hivis/model/model_hivis.py
++++ b/hivis/model/model_hivis.py
+@@ -291,7 +291,7 @@ class EaModel(nn.Module):
+ 
+     ):
+         input_ids = inputs.input_ids.to(self.base_model.device)
+-        pixel_values = inputs.pixel_values.to(self.base_model.device).to(torch.bfloat16) if hasattr(inputs, "pixel_values") else None
++        pixel_values = inputs.pixel_values.to(self.base_model.device).to(self.embed_model.dtype) if hasattr(inputs, "pixel_values") else None
+         image_sizes = inputs.image_sizes.to(self.base_model.device) if hasattr(inputs, "image_sizes") else None
+         image_grid_thw = inputs.image_grid_thw.to(self.base_model.device) if hasattr(inputs, "image_grid_thw") else None
+         pixel_values_videos = inputs.pixel_values_videos.to(self.base_model.device).to(torch.bfloat16) if hasattr(inputs, "pixel_values_videos") else None
+@@ -573,7 +573,7 @@ class EaModel(nn.Module):
+ 
+     ):
+         input_ids = inputs.input_ids.to(self.base_model.device)
+-        pixel_values = inputs.pixel_values.to(self.base_model.device).to(torch.bfloat16) if hasattr(inputs, "pixel_values") else None
++        pixel_values = inputs.pixel_values.to(self.base_model.device).to(self.embed_model.dtype) if hasattr(inputs, "pixel_values") else None
+         image_sizes = inputs.image_sizes.to(self.base_model.device) if hasattr(inputs, "image_sizes") else None
+ 
+         if is_llama3:
+diff --git a/hivis/model/modeling_qwen2_5_kv.py b/hivis/model/modeling_qwen2_5_kv.py
+index c344ae3..e99b68f 100644
+--- a/hivis/model/modeling_qwen2_5_kv.py
++++ b/hivis/model/modeling_qwen2_5_kv.py
+@@ -38,6 +38,35 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
+ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+ from transformers.processing_utils import Unpack
+ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
++
++
++def _compute_default_rope_parameters(config, device=None, seq_len=None, **kwargs):
++    """Standard RoPE inv_freq. transformers>=5 dropped the ``default`` registry key;
++    Qwen2.5-VL ``mrope`` uses the same frequencies with 3-D position ids."""
++    base = getattr(config, "rope_theta", 10000.0)
++    head_dim = getattr(config, "head_dim", None)
++    if head_dim is None:
++        head_dim = config.hidden_size // config.num_attention_heads
++    dim = int(head_dim * getattr(config, "partial_rotary_factor", 1.0))
++    inv_freq = 1.0 / (
++        base
++        ** (
++            torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32)
++            / dim
++        )
++    )
++    return inv_freq, 1.0
++
++
++def resolve_rope_init_fn(rope_type):
++    if rope_type in ROPE_INIT_FUNCTIONS:
++        return ROPE_INIT_FUNCTIONS[rope_type]
++    return _compute_default_rope_parameters
++
++
++# transformers>=5 dropped these keys; HiViS Qwen2.5-VL still requests them.
++ROPE_INIT_FUNCTIONS.setdefault("default", _compute_default_rope_parameters)
++ROPE_INIT_FUNCTIONS.setdefault("mrope", _compute_default_rope_parameters)
+ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLTextConfig, Qwen2_5_VLVisionConfig
+ from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+ 
+@@ -150,12 +179,16 @@ class Qwen2_5_VLRotaryEmbedding(nn.Module):
+         self.original_max_seq_len = config.max_position_embeddings
+ 
+         self.config = config
+-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
++        self.rope_init_fn = resolve_rope_init_fn(self.rope_type)
+ 
+         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+         self.register_buffer("inv_freq", inv_freq, persistent=False)
+         self.original_inv_freq = self.inv_freq
+ 
++    @staticmethod
++    def compute_default_rope_parameters(config, device=None, seq_len=None, **kwargs):
++        return _compute_default_rope_parameters(config, device=device, seq_len=seq_len, **kwargs)
++
+     @torch.no_grad()
+     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+     def forward(self, x, position_ids):
+diff --git a/hivis/model/modeling_qwen2_5_vl_kv.py b/hivis/model/modeling_qwen2_5_vl_kv.py
+index 127e171..6a20006 100644
+--- a/hivis/model/modeling_qwen2_5_vl_kv.py
++++ b/hivis/model/modeling_qwen2_5_vl_kv.py
+@@ -44,6 +44,7 @@ from transformers.processing_utils import Unpack
+ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
+ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLTextConfig, Qwen2_5_VLVisionConfig
+ from .modeling_qwen2_5_kv import Qwen2_5_VLTextModel as Qwen2_5_VLTextModel_debug
++from .modeling_qwen2_5_kv import resolve_rope_init_fn
+ 
+ 
+ logger = logging.get_logger(__name__)
+@@ -524,12 +525,16 @@ class Qwen2_5_VLRotaryEmbedding(nn.Module):
+         self.original_max_seq_len = config.max_position_embeddings
+ 
+         self.config = config
+-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
++        self.rope_init_fn = resolve_rope_init_fn(self.rope_type)
+ 
+         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+         self.register_buffer("inv_freq", inv_freq, persistent=False)
+         self.original_inv_freq = self.inv_freq
+ 
++    @staticmethod
++    def compute_default_rope_parameters(config, device=None, seq_len=None, **kwargs):
++        return resolve_rope_init_fn("default")(config, device=device, seq_len=seq_len, **kwargs)
++
+     @torch.no_grad()
+     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+     def forward(self, x, position_ids):
+@@ -1809,3 +1814,27 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
+ 
+ 
+ __all__ = ["Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
++
++
++# transformers>=5 skips conversion maps for custom modeling files. Register the
++# official Qwen2-VL key rename so old `model.layers.*` / `visual.*` checkpoints
++# load into `model.language_model` / `model.visual`.
++try:
++    from transformers.conversion_mapping import (
++        WeightRenaming,
++        register_checkpoint_conversion_mapping,
++    )
++
++    register_checkpoint_conversion_mapping(
++        "Qwen2_5_VLForConditionalGeneration",
++        [
++            WeightRenaming(source_patterns=r"^visual", target_patterns="model.visual"),
++            WeightRenaming(
++                source_patterns=r"^model(?!\.(language_model|visual))",
++                target_patterns="model.language_model",
++            ),
++        ],
++        overwrite=True,
++    )
++except Exception:
++    pass
+diff --git a/hivis/model/utils_hivis.py b/hivis/model/utils_hivis.py
+index 5b8c541..034e8a9 100644
+--- a/hivis/model/utils_hivis.py
++++ b/hivis/model/utils_hivis.py
+@@ -50,6 +50,8 @@ def prune_image_tokens(
+     device = hidden_states.device
+     input_ids = input_ids.to(device)
+     embeds = embeds.to(device)
++    if text_position_ids is not None:
++        text_position_ids = text_position_ids.to(device)
+ 
+     ids_list = []
+     embeds_list = []
+@@ -485,7 +487,7 @@ def tree_decoding(
+     # print(model.base_model.config.architectures[0])
+     
+     position_ids = tree_position_ids + input_ids.shape[1]
+-    if model.base_model.config.architectures[0] == "Qwen2_5_VLForConditionalGeneration":
++    if model.is_qwen_vl:
+         position_ids = (
+             position_ids.unsqueeze(0) + model.embed_model.model.rope_deltas
+         )
+diff --git a/hivis/train/cnets_dyn_res.py b/hivis/train/cnets_dyn_res.py
+index bc00f31..2b62e5c 100644
+--- a/hivis/train/cnets_dyn_res.py
++++ b/hivis/train/cnets_dyn_res.py
+@@ -503,26 +503,23 @@ class Model(nn.Module):
+         if load_emb:
+             from safetensors import safe_open
+             import json
+-            try:
+-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+-                    index_json = json.loads(f.read())
+-                    emb_path = index_json["weight_map"]["language_model.model.embed_tokens.weight"]
+-                with safe_open(os.path.join(path, emb_path),
+-                               framework="pt",
+-                               device="cpu") as f:
+-                    tensor_slice = f.get_slice("language_model.model.embed_tokens.weight")
+-                    vocab_size, hidden_dim = tensor_slice.get_shape()
+-                    tensor = tensor_slice[:, :hidden_dim].float()
+-            except:
+-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+-                    index_json = json.loads(f.read())
+-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
+-                with safe_open(os.path.join(path, emb_path),
+-                               framework="pt",
+-                               device="cpu") as f:
+-                    tensor_slice = f.get_slice("model.embed_tokens.weight")
+-                    vocab_size, hidden_dim = tensor_slice.get_shape()
+-                    tensor = tensor_slice[:, :hidden_dim].float()
++
++            with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
++                index_json = json.loads(f.read())
++            weight_map = index_json["weight_map"]
++            candidate_keys = (
++                "language_model.model.embed_tokens.weight",
++                "model.embed_tokens.weight",
++                "model.text_model.embed_tokens.weight",
++            )
++            emb_key = next((key for key in candidate_keys if key in weight_map), None)
++            if emb_key is None:
++                raise KeyError(f"None of the expected embedding keys {candidate_keys} exists in {path}/model.safetensors.index.json")
++            emb_path = weight_map[emb_key]
++            with safe_open(os.path.join(path, emb_path), framework="pt", device="cpu") as f:
++                tensor_slice = f.get_slice(emb_key)
++                vocab_size, hidden_dim = tensor_slice.get_shape()
++                tensor = tensor_slice[:, :hidden_dim].float()
+             self.embed_tokens.weight.data = tensor
+ 
+         self.top_k = top_k
+diff --git a/hivis/train/cnets_res.py b/hivis/train/cnets_res.py
+index a1560c2..cb89242 100644
+--- a/hivis/train/cnets_res.py
++++ b/hivis/train/cnets_res.py
+@@ -563,23 +563,23 @@ class Model(nn.Module):
+         if load_emb:
+             from safetensors import safe_open
+             import json
+-            try:
+-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+-                    index_json = json.loads(f.read())
+-                    emb_path = index_json["weight_map"]["language_model.model.embed_tokens.weight"]
+-                with safe_open(os.path.join(path, emb_path), framework="pt", device="cpu") as f:
+-                    tensor_slice = f.get_slice("language_model.model.embed_tokens.weight")
+-                    vocab_size, hidden_dim = tensor_slice.get_shape()
+-                    tensor = tensor_slice[:, :hidden_dim].float()
+-            except:
+-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+-                    index_json = json.loads(f.read())
+-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
+-                with safe_open(os.path.join(path, emb_path), framework="pt", device="cpu") as f:
+-                    tensor_slice = f.get_slice("model.embed_tokens.weight")
+-                    vocab_size, hidden_dim = tensor_slice.get_shape()
+-                    tensor = tensor_slice[:, :hidden_dim].float()
+ 
++            with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
++                index_json = json.loads(f.read())
++            weight_map = index_json["weight_map"]
++            candidate_keys = (
++                "language_model.model.embed_tokens.weight",
++                "model.embed_tokens.weight",
++                "model.text_model.embed_tokens.weight",
++            )
++            emb_key = next((key for key in candidate_keys if key in weight_map), None)
++            if emb_key is None:
++                raise KeyError(f"None of the expected embedding keys {candidate_keys} exists in {path}/model.safetensors.index.json")
++            emb_path = weight_map[emb_key]
++            with safe_open(os.path.join(path, emb_path), framework="pt", device="cpu") as f:
++                tensor_slice = f.get_slice(emb_key)
++                vocab_size, hidden_dim = tensor_slice.get_shape()
++                tensor = tensor_slice[:, :hidden_dim].float()
+             self.embed_tokens.weight.data = tensor
+ 
+         self.top_k = top_k
+diff --git a/hivis/train/main_mix.py b/hivis/train/main_mix.py
+index a7fdbd6..aeb9472 100644
+--- a/hivis/train/main_mix.py
++++ b/hivis/train/main_mix.py
+@@ -30,6 +30,8 @@ parser.add_argument(
+ )
+ parser.add_argument('--outdir', type=str, default='outdir1')
+ parser.add_argument('--cpdir', type=str, default='checkpoints/stage1')
++parser.add_argument('--num-epochs', type=int, default=None)
++parser.add_argument('--max-len', type=int, default=None)
+ 
+ args = parser.parse_args()
+ 
+@@ -41,7 +43,7 @@ train_config={
+     "text_datapath": args.text_data_dir,
+     "multimodal_datapath": args.multimodal_data_dir,
+     "is_warmup":True,
+-    "num_epochs":20,
++    "num_epochs":args.num_epochs if args.num_epochs is not None else 20,
+     "num_warmup_steps":2000,
+     "total_steps":800000,
+     "p_w":0.1,
+@@ -55,7 +57,7 @@ train_config={
+     "mean":0.0,
+     "std":0.2,
+     "residual":"true,norm",
+-    "max_len":4096,
++    "max_len":args.max_len if args.max_len is not None else 4096,
+     "config_path":args.configpath,
+     "b1":0.9,
+     "b2": 0.95,
+@@ -137,26 +139,22 @@ if accelerator.is_main_process:
+     print(f"Detected {model_family} base model ({baseconfig.model_type})")
+ 
+ 
+-try:
+-    with open(os.path.join(base_model_path, "model.safetensors.index.json"), "r") as f:
+-        index_json = json.loads(f.read())
+-        head_path = index_json["weight_map"]["language_model.lm_head.weight"]
+-    with safe_open(os.path.join(base_model_path, head_path),
+-                   framework="pt",
+-                   device="cpu") as f:
+-        tensor_slice = f.get_slice("language_model.lm_head.weight")
+-        vocab_size, hidden_dim = tensor_slice.get_shape()
+-        tensor = tensor_slice[:, :hidden_dim].float()
+-except:
+-    with open(os.path.join(base_model_path, "model.safetensors.index.json"), "r") as f:
+-        index_json = json.loads(f.read())
+-        head_path = index_json["weight_map"]["lm_head.weight"]
+-    with safe_open(os.path.join(base_model_path, head_path),
+-                   framework="pt",
+-                   device="cpu") as f:
+-        tensor_slice = f.get_slice("lm_head.weight")
+-        vocab_size, hidden_dim = tensor_slice.get_shape()
+-        tensor = tensor_slice[:, :hidden_dim].float()
++with open(os.path.join(base_model_path, "model.safetensors.index.json"), "r") as f:
++    index_json = json.loads(f.read())
++    weight_map = index_json["weight_map"]
++
++head_keys = ("language_model.lm_head.weight", "lm_head.weight", "model.text_model.lm_head.weight")
++head_key = next((key for key in head_keys if key in weight_map), None)
++if head_key is None:
++    raise KeyError(f"None of the expected lm head names {head_keys} exists in {base_model_path}/model.safetensors.index.json.")
++
++head_path = weight_map[head_key]
++with safe_open(os.path.join(base_model_path, head_path),
++               framework="pt",
++               device="cpu") as f:
++    tensor_slice = f.get_slice(head_key)
++    vocab_size, hidden_dim = tensor_slice.get_shape()
++    tensor = tensor_slice[:, :hidden_dim].float()
+ 
+ head = torch.nn.Linear(tensor.shape[1], tensor.shape[0], bias=False)
+ head.weight.data = tensor
+diff --git a/hivis/train/main_mix_topk_dyn_res.py b/hivis/train/main_mix_topk_dyn_res.py
+index 4b277e7..9784325 100644
+--- a/hivis/train/main_mix_topk_dyn_res.py
++++ b/hivis/train/main_mix_topk_dyn_res.py
+@@ -35,6 +35,8 @@ parser.add_argument('--topk', type=int, default=10)
+ parser.add_argument('--topk_w', type=float, default=1.0)
+ parser.add_argument('--forward_num_total', type=int, default=3)
+ parser.add_argument('--ckpt_path', type=str, default='checkpoints/stage1')
++parser.add_argument('--num-epochs', type=int, default=None)
++parser.add_argument('--max-len', type=int, default=None)
+ 
+ 
+ args = parser.parse_args()
+@@ -49,7 +51,7 @@ train_config={
+     "text_datapath": args.text_data_dir,
+     "multimodal_datapath": args.multimodal_data_dir,
+     "is_warmup":True,
+-    "num_epochs":10,
++    "num_epochs":args.num_epochs if args.num_epochs is not None else 10,
+     "num_warmup_steps":2000,
+     "total_steps":800000,
+     "p_w":0.1,
+@@ -64,7 +66,7 @@ train_config={
+     "mean":0.0,
+     "std":0.2,
+     "residual":"true,norm",
+-    "max_len":4096,
++    "max_len":args.max_len if args.max_len is not None else 4096,
+     "config_path":args.configpath,
+     "b1":0.9,
+     "b2": 0.95,
+@@ -133,26 +135,22 @@ if accelerator.is_main_process:
+     print(f"Detected {model_family} base model ({baseconfig.model_type})")
+ 
+ 
+-try:
+-    with open(os.path.join(base_model_path, "model.safetensors.index.json"), "r") as f:
+-        index_json = json.loads(f.read())
+-        head_path = index_json["weight_map"]["language_model.lm_head.weight"]
+-    with safe_open(os.path.join(base_model_path, head_path),
+-                   framework="pt",
+-                   device="cpu") as f:
+-        tensor_slice = f.get_slice("language_model.lm_head.weight")
+-        vocab_size, hidden_dim = tensor_slice.get_shape()
+-        tensor = tensor_slice[:, :hidden_dim].float()
+-except:
+-    with open(os.path.join(base_model_path, "model.safetensors.index.json"), "r") as f:
+-        index_json = json.loads(f.read())
+-        head_path = index_json["weight_map"]["lm_head.weight"]
+-    with safe_open(os.path.join(base_model_path, head_path),
+-                   framework="pt",
+-                   device="cpu") as f:
+-        tensor_slice = f.get_slice("lm_head.weight")
+-        vocab_size, hidden_dim = tensor_slice.get_shape()
+-        tensor = tensor_slice[:, :hidden_dim].float()
++with open(os.path.join(base_model_path, "model.safetensors.index.json"), "r") as f:
++    index_json = json.loads(f.read())
++    weight_map = index_json["weight_map"]
++
++head_keys = ("language_model.lm_head.weight", "lm_head.weight", "model.text_model.lm_head.weight")
++head_key = next((key for key in head_keys if key in weight_map), None)
++if head_key is None:
++    raise KeyError(f"None of the expected lm head names {head_keys} exists in {base_model_path}/model.safetensors.index.json.")
++
++head_path = weight_map[head_key]
++with safe_open(os.path.join(base_model_path, head_path),
++               framework="pt",
++               device="cpu") as f:
++    tensor_slice = f.get_slice(head_key)
++    vocab_size, hidden_dim = tensor_slice.get_shape()
++    tensor = tensor_slice[:, :hidden_dim].float()
+ 
+ head = torch.nn.Linear(tensor.shape[1], tensor.shape[0], bias=False)
+ head.weight.data = tensor
+diff --git a/hivis/train/model_paths.py b/hivis/train/model_paths.py
+index 03c2a04..d006cf9 100644
+--- a/hivis/train/model_paths.py
++++ b/hivis/train/model_paths.py
+@@ -6,8 +6,8 @@ from pathlib import Path
+ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, cached_file
+ 
+ 
+-_LM_HEAD_KEYS = ("language_model.lm_head.weight", "lm_head.weight")
+-_EMBED_KEYS = ("language_model.model.embed_tokens.weight", "model.embed_tokens.weight")
++_LM_HEAD_KEYS = ("language_model.lm_head.weight", "lm_head.weight", "model.text_model.lm_head.weight")
++_EMBED_KEYS = ("language_model.model.embed_tokens.weight", "model.embed_tokens.weight", "model.text_model.embed_tokens.weight")
+ 
+ 
+ def is_qwen_model(config):
+diff --git a/hivis/train/smolvlm_256m_config.json b/hivis/train/smolvlm_256m_config.json
+new file mode 100644
+index 0000000..621f4bd
+--- /dev/null
++++ b/hivis/train/smolvlm_256m_config.json
+@@ -0,0 +1,28 @@
++{
++  "architectures": [
++    "Idefics3ForConditionalGeneration"
++  ],
++  "model_type": "smolvlm",
++  "dtype": "bfloat16",
++  "attention_bias": false,
++  "attention_dropout": 0.0,
++  "bos_token_id": 1,
++  "eos_token_id": 2,
++  "pad_token_id": 2,
++  "head_dim": 64,
++  "hidden_act": "silu",
++  "hidden_size": 576,
++  "initializer_range": 0.02,
++  "intermediate_size": 1536,
++  "max_position_embeddings": 8192,
++  "num_attention_heads": 9,
++  "num_hidden_layers": 1,
++  "num_key_value_heads": 3,
++  "rms_norm_eps": 1e-05,
++  "rope_theta": 100000.0,
++  "use_cache": true,
++  "vocab_size": 49280,
++  "pretraining_tp": 1,
++  "tie_word_embeddings": false,
++  "transformers_version": "4.57.1"
++}

@@ -37,11 +37,6 @@
     16,
     24
   ],
-  "draft_layer_init_from_target": [
-    2,
-    16,
-    24
-  ],
   "transformers_version": "4.57.1",
   "attn_match_loss_weight": 0.3,
   "attn_match_steps": -1,

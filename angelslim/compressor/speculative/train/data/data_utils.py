@@ -505,9 +505,13 @@ class VLMSmolVLMDataCollatorWithPadding:
     (input_ids are already image-token-expanded in the dataset builder).
     """
 
-    def __init__(self, processor=None, image_processor_kwargs=None):
+    def __init__(self, processor=None, image_processor_kwargs=None, gist_encoder=None):
         self.processor = processor
         self._resolved_image_processor_kwargs = image_processor_kwargs or {}
+        # When set, gist embeddings are computed live here (one datapoint at
+        # a time, right before it's fed to the model) instead of during
+        # dataset preprocessing -- see gist_embedding.py for why.
+        self.gist_encoder = gist_encoder
 
     @staticmethod
     def _pad_tile_batch(tensor_list, pad_value=0):
@@ -527,6 +531,12 @@ class VLMSmolVLMDataCollatorWithPadding:
         return torch.cat(padded, dim=0)
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if self.gist_encoder is not None:
+            for item in features:
+                if "gist_embeddings" not in item:
+                    item["gist_embeddings"] = self.gist_encoder.build_for_item(
+                        item["input_ids"], item["loss_mask"]
+                    )
         max_length = max(item["input_ids"].shape[1] for item in features)
         batch = {
             "input_ids": torch.cat(

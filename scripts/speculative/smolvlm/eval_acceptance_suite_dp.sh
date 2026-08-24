@@ -111,6 +111,7 @@ run_gpu_queue() {
       MAX_NUM_SEQS="${MAX_NUM_SEQS}" \
       GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}" \
       TEMP="${TEMP}" \
+      PROMPT_STYLE="${PROMPT_STYLE:-raw}" \
       OUTPUT_FILE="${out_dir}/results.json" \
       ACCEPTANCE_METRICS_FILE="${metrics_file}" \
         bash scripts/speculative/smolvlm/eval_eagle3_vlm_batch.sh

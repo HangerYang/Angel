@@ -23,5 +23,55 @@ tools/results/
 __pycache__/outputs/
 __pycache__/
 
+# Generated dataset artifacts and caches
+dataset/preprocessed/
+dataset/**/.map_cache/
+dataset/smolvlm_256m_target_gen_mixed_70k70k/
+dataset/smolvlm_256m_target_gen/train.jsonl
+dataset/smolvlm_256m_target_gen/eval.jsonl
+
 # Local editable vLLM checkout (full upstream clone + wheel .so overlays)
 third_party/vllm/
+
+# Local experiment checkpoints and logs
+my_angel/**/checkpoint-*/
+my_angel/**/ckpt_sweep/
+my_angel/**/_logs/
+my_angel/**/*.log
+my_angel/**/*.pt
+my_angel/**/*.safetensors
+
+# Generated experiment results
+results/
+runs/
+Odyssey/results/
+my_angel/**/eval_*/
+my_angel/**/rerun/
+my_angel/**/hivis_cmp/
+my_angel/**/layer_swap/
+my_angel/**/latency_profile*/
+my_angel/**/profile*/
+my_angel/**/*.jsonl
+my_angel/**/*.npy
+my_angel/**/*.tmp
+
+# More local experiment result trees
+my_angel/**/rerun_atd/
+my_angel/**/atd_temp*/
+my_angel/**/temp*/
+my_angel/**/layer_swap_ofat_vllm/
+**/__pycache__/
+
+# More generated metrics/process metadata
+.vscode/
+my_angel/**/results.json
+my_angel/**/acceptance_metrics.json
+my_angel/**/report.json
+my_angel/**/*.pid
+my_angel/**/queue.*
+my_angel/**/worker.pids
+third_party/HiViS/**/__pycache__/
+
+# Local nested repository checkouts; preserved via manifest/patches
+ViSpec/
+third_party/HiViS/

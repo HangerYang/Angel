@@ -1,0 +1,20 @@
+{
+  "draft_model": "/home/hyang/AngelSlim/outputs/smolvlm-256m-eagle3-updated-runb/checkpoint-66466",
+  "draft_model_config_path": "angelslim/compressor/speculative/train/configs/smolvlm-256m-eagle3-progressive-per-layer-fc-3.1-draft-feedback.json",
+  "target_model": "HuggingFaceTB/SmolVLM-256M-Instruct",
+  "data_path": "/home/hyang/AngelSlim/dataset/smolvlm_256m_target_gen_mixed_70k70k/eval.jsonl",
+  "num_positions": 313840,
+  "num_spec_tokens": 3,
+  "mean_accepted_length": 2.453355312347412,
+  "median_accepted_length": 3.0,
+  "accept_histogram": [
+    35410,
+    23775,
+    17779,
+    236876
+  ],
+  "gist_conditioning": false,
+  "gist_encoder_model_name_or_path": null,
+  "gist_mode": null,
+  "gist_refresh_every": null
+}

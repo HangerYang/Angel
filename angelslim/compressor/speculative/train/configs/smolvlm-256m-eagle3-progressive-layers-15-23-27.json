@@ -27,8 +27,15 @@
   "modal_type": "VLM",
   "image_token_id": 49190,
   "eagle_aux_injection_mode": "progressive_staged",
-  "aux_hidden_states_layer_ids": [15, 23, 27],
-  "eagle_aux_hidden_state_layer_ids": [16, 24, 28],
-  "draft_layer_init_from_target": [16, 24, 28],
+  "aux_hidden_states_layer_ids": [
+    15,
+    23,
+    27
+  ],
+  "eagle_aux_hidden_state_layer_ids": [
+    16,
+    24,
+    28
+  ],
   "transformers_version": "4.57.1"
 }

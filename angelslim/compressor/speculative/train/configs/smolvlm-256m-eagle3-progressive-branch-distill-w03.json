@@ -37,11 +37,6 @@
     15,
     27
   ],
-  "draft_layer_init_from_target": [
-    2,
-    15,
-    27
-  ],
   "transformers_version": "4.57.1",
   "branch_distill_loss_weight": 0.3,
   "branch_distill_top_k": 3,
