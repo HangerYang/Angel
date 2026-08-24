@@ -44,3 +44,9 @@ Do **not** hand-edit `third_party/vllm` for portable changes — edit `.patch` f
 CUDA notes: patches are **CUDA-agnostic** (Python sources). Native `.so` must
 still match the machine — choose `VLLM_CUDA=13.0` / `12.6` / `12.9` via
 `third_party/install_local_vllm.sh` (see `third_party/README.md`).
+
+
+## Oracle Gist Conditioning
+
+`feature/oracle-gist-conditioning` includes `third_party/apply_gist_patches.py`.
+Run it after `third_party/sync_vllm_latest.sh` to install the vLLM oracle-gist decode hooks from `third_party/patches/eagle_gist.py.txt`.
