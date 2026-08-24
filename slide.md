@@ -33,6 +33,29 @@ where `M` is the assistant/loss mask.
 
 ## 1. Band Mixing
 
+### Text Figure
+
+```text
+Frozen SmolVLM target layers
+
+ early band                 middle band              late band
+ [L2 L4 L8 L10]             [L15 L18 L20]            [L26 L28]
+      |                          |                       |
+      | softmax mix              | softmax mix           | softmax mix
+      v                          v                       v
+   m_early                    m_mid                   m_late
+      |                          |                       |
+      +-------------- concat: [m_early | m_mid | m_late] +
+                                  |
+                             per-stream RMSNorm
+                                  |
+                              FC: 3H -> H
+                                  |
+                     Eagle layer 0: [token emb | fused HS]
+                                  |
+                             draft logits
+```
+
 ### Motivation
 
 Stock Eagle3 uses a small set of target hidden layers, usually one early, one
@@ -101,6 +124,34 @@ most predictive" while preserving Eagle3's inference shape: 3 streams become
 acceptance length from `2.508` for the stock one-layer baseline to `2.706`.
 
 ## 2. Branch Distillation
+
+### Text Figure
+
+```text
+At a training position t:
+
+teacher top-1:  b_t
+draft top-1:    a_t
+
+branch condition:
+  a_t != b_t  and  a_t in teacher top-3
+
+                         real path
+        x_1 ... x_t ----------------------> Teacher logits z_T(real)
+              |                           Draft logits   z_D(real)
+              |
+              | substitute draft plausible token a_t
+              v
+                         branch path
+        x_1 ... a_t ----------------------> Teacher logits z_T(branch)
+                                          Draft logits   z_D(branch)
+
+match the movement, not the full distribution:
+
+  center[z_D(branch) - z_D(real)]
+          ~=
+  center[z_T(branch) - z_T(real)]
+```
 
 ### Motivation
 
@@ -206,6 +257,40 @@ one-layer sweep, branch-change improves mean temp-0 acceptance length from
 `2.706` to `2.815`, and mean speedup from `1.673x` to `1.738x`.
 
 ## 3. Visual Row Compression
+
+### Text Figure
+
+```text
+One image tile before compression
+
+  64 visual rows, each row carries all target aux streams
+
+  row 01: [h_L2 | h_L4 | ... | h_L28]
+  row 02: [h_L2 | h_L4 | ... | h_L28]
+    ...
+  row 64: [h_L2 | h_L4 | ... | h_L28]
+
+                 learned cross-attention routing
+                 shared across all 9 aux streams
+                              |
+                              v
+
+  k summary rows per tile
+
+  k = 1:
+    summary row placed at fixed slot row 32
+
+  k = 4:
+    summary rows placed at fixed slots 8, 24, 40, 56
+
+                              |
+                              v
+
+  compressed prompt for draft:
+    text rows unchanged
+    grid marker rows unchanged
+    image rows: 64*T  ->  k*T
+```
 
 ### Motivation
 
@@ -319,6 +404,35 @@ The compressor has its own parameter group, planned at LR `1e-3`, while the
 drafter remains at LR `1e-4`.
 
 ## 4. Attention Matching
+
+### Text Figure
+
+```text
+Optional routing supervision
+
+          frozen target attention
+       text/loss query -> image rows
+
+       row1 row2 row3 ... row64
+        |    |    |        |
+        v    v    v        v
+      A_T = target visual attention distribution
+
+                    compare
+                      |
+                      v
+
+      A_C = compressor/draft routing distribution
+        ^    ^    ^        ^
+        |    |    |        |
+       row1 row2 row3 ... row64
+
+Loss:
+  KL(A_T || A_C)  or  MSE(A_T, A_C)
+
+Intuition:
+  keep or emphasize the rows the teacher actually reads
+```
 
 ### Status
 
