@@ -147,10 +147,13 @@ fi
 
 python - <<'PY'
 import os
+from importlib.metadata import version
+
 import torch
 import vllm
 from vllm.model_executor.models.idefics3 import Idefics3ForConditionalGeneration as C
 from vllm.model_executor.models.interfaces import SupportsEagle3 as S
+from vllm.platforms import current_platform
 
 path = os.path.realpath(vllm.__file__)
 print(f"OK: vllm {vllm.__version__}")
@@ -160,6 +163,15 @@ if "third_party/vllm" not in path.replace("\\", "/"):
     raise SystemExit(f"import did not resolve to third_party checkout: {path}")
 if S not in C.__mro__:
     raise SystemExit("SmolVLM Eagle3 patch missing — run bash third_party/apply_vllm_patches.sh")
+meta = version("vllm")
+dev = current_platform.device_type
+print(f"    importlib.metadata version: {meta}")
+print(f"    platform device_type: {dev!r}")
+if not dev:
+    raise SystemExit(
+        "empty device_type (CUDA detection failed). "
+        "Usually means vllm-*.dist-info is missing."
+    )
 print("SmolVLM Eagle3: OK")
 PY
 

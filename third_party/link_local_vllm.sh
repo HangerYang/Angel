@@ -79,13 +79,15 @@ else
 fi
 
 # Remove env-owned package tree / editable stubs so imports use third_party only.
+# Keep vllm-*.dist-info: vLLM's CUDA plugin calls importlib.metadata.version("vllm").
+# Deleting it raises PackageNotFoundError, platform detection fails, and LLM()
+# crashes with RuntimeError: Device string must not be empty.
 if [[ -e "${INSTALLED}" || -L "${INSTALLED}" ]]; then
   echo "Removing ${INSTALLED}"
   rm -rf "${INSTALLED}"
 fi
 shopt -s nullglob
 for stale in \
-  "${SITE}"/vllm-*.dist-info \
   "${SITE}"/__editable__.vllm*.pth \
   "${SITE}"/__editable___*vllm* \
   "${SITE}"/*vllm*.egg-link
@@ -93,7 +95,20 @@ do
   echo "Removing ${stale}"
   rm -rf "${stale}"
 done
+dists=("${SITE}"/vllm-*.dist-info)
 shopt -u nullglob
+if [[ ${#dists[@]} -eq 0 ]]; then
+  DIST="${SITE}/vllm-0.25.0.dist-info"
+  mkdir -p "${DIST}"
+  cat > "${DIST}/METADATA" <<'EOF'
+Metadata-Version: 2.1
+Name: vllm
+Version: 0.25.0
+EOF
+  echo "Wrote stub ${DIST}  (importlib.metadata.version needs this for CUDA detection)"
+else
+  echo "Keeping ${dists[0]}  (needed for CUDA platform detection)"
+fi
 
 # AngelSlim-tracked patches (portable across servers). Must run AFTER rsync
 # overlay, which restores stock vLLM sources from the wheel.
@@ -110,7 +125,12 @@ echo "Optional (portable across shells):"
 echo "  source ${ROOT}/third_party/env.sh"
 
 python - <<'PY'
-import os, vllm
+import os
+from importlib.metadata import PackageNotFoundError, version
+
+import vllm
+from vllm.platforms import current_platform
+
 path = os.path.realpath(vllm.__file__)
 print(f"OK: vllm {vllm.__version__}")
 print(f"    {path}")
@@ -118,4 +138,18 @@ if "third_party/vllm/vllm" not in path.replace("\\", "/"):
     raise SystemExit(f"import did not resolve to third_party checkout: {path}")
 if "site-packages/vllm" in path.replace("\\", "/"):
     raise SystemExit(f"still importing from site-packages: {path}")
+try:
+    meta = version("vllm")
+except PackageNotFoundError as e:
+    raise SystemExit(
+        "importlib.metadata cannot see vllm — keep site-packages/vllm-*.dist-info"
+    ) from e
+print(f"    importlib.metadata version: {meta}")
+dev = current_platform.device_type
+print(f"    platform device_type: {dev!r}")
+if not dev:
+    raise SystemExit(
+        "empty device_type (CUDA detection failed). "
+        "Usually means vllm-*.dist-info is missing."
+    )
 PY
