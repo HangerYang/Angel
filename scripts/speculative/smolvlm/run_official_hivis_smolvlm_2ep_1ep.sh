@@ -9,7 +9,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 export STAGE=${STAGE:-all}
 export GPUS=${GPUS:-"0 1 2 3"}
-export DATA_FILE=${DATA_FILE:-$ROOT/dataset/smolvlm_256m_target_gen_mixed_70k70k/train.jsonl}
+export DATA_FILE=${DATA_FILE:-$ROOT/dataset/preprocessed/mixed_sharegpt_llava665k_70k70k_b64.jsonl}
 export HIVIS_DATA_ROOT=${HIVIS_DATA_ROOT:-$ROOT/dataset/hivis_smolvlm_256m_generated}
 export OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT/output/hivis_official/smolvlm_256m_stage1_2ep_stage2_1ep}
 export STAGE1_DIR=${STAGE1_DIR:-$OUTPUT_ROOT/stage1}

@@ -3,7 +3,12 @@
 from transformers import AutoConfig
 
 
-DEFAULT_MODEL_PATHS = {"llava": "llava-hf/llava-v1.6-vicuna-7b-hf", "qwen": "Qwen/Qwen2.5-VL-7B-Instruct"}
+DEFAULT_MODEL_PATHS = {
+    "llava": "llava-hf/llava-v1.6-vicuna-7b-hf",
+    "qwen": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "smolvlm": "HuggingFaceTB/SmolVLM-256M-Instruct",
+    "smolvlm_vispec": "HuggingFaceTB/SmolVLM-256M-Instruct",
+}
 
 
 def _name_from_reference(model_reference):

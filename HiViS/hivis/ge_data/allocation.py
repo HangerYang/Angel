@@ -11,7 +11,7 @@ from .model_names import DEFAULT_MODEL_PATHS, model_directory_name
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=("llava", "qwen"), default="llava")
+    parser.add_argument("--model", choices=("llava", "qwen", "smolvlm", "smolvlm_vispec"), default="llava")
     parser.add_argument("--data-type", choices=("text", "multimodal"), required=True)
     parser.add_argument("--gpus", type=int, nargs="+", required=True)
     parser.add_argument("--start", type=int, default=0)
@@ -54,8 +54,10 @@ def build_command(args, worker_index, gpu, start, end):
         sys.executable,
         "-m",
         module,
-        "--data-type",
-        args.data_type,
+    ]
+    if args.model in ("llava", "qwen"):
+        command += ["--data-type", args.data_type]
+    command += [
         "--start",
         str(start),
         "--end",

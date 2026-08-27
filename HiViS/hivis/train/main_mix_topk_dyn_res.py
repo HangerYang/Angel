@@ -35,6 +35,8 @@ parser.add_argument('--topk', type=int, default=10)
 parser.add_argument('--topk_w', type=float, default=1.0)
 parser.add_argument('--forward_num_total', type=int, default=3)
 parser.add_argument('--ckpt_path', type=str, default='checkpoints/stage1')
+parser.add_argument('--num-epochs', dest='num_epochs', type=int, default=10)
+parser.add_argument('--max-len', dest='max_len', type=int, default=4096)
 
 
 args = parser.parse_args()
@@ -49,7 +51,7 @@ train_config={
     "text_datapath": args.text_data_dir,
     "multimodal_datapath": args.multimodal_data_dir,
     "is_warmup":True,
-    "num_epochs":10,
+    "num_epochs":args.num_epochs,
     "num_warmup_steps":2000,
     "total_steps":800000,
     "p_w":0.1,
@@ -64,7 +66,7 @@ train_config={
     "mean":0.0,
     "std":0.2,
     "residual":"true,norm",
-    "max_len":4096,
+    "max_len":args.max_len,
     "config_path":args.configpath,
     "b1":0.9,
     "b2": 0.95,
@@ -133,26 +135,34 @@ if accelerator.is_main_process:
     print(f"Detected {model_family} base model ({baseconfig.model_type})")
 
 
-try:
-    with open(os.path.join(base_model_path, "model.safetensors.index.json"), "r") as f:
-        index_json = json.loads(f.read())
-        head_path = index_json["weight_map"]["language_model.lm_head.weight"]
-    with safe_open(os.path.join(base_model_path, head_path),
-                   framework="pt",
-                   device="cpu") as f:
-        tensor_slice = f.get_slice("language_model.lm_head.weight")
-        vocab_size, hidden_dim = tensor_slice.get_shape()
-        tensor = tensor_slice[:, :hidden_dim].float()
-except:
-    with open(os.path.join(base_model_path, "model.safetensors.index.json"), "r") as f:
-        index_json = json.loads(f.read())
-        head_path = index_json["weight_map"]["lm_head.weight"]
-    with safe_open(os.path.join(base_model_path, head_path),
-                   framework="pt",
-                   device="cpu") as f:
-        tensor_slice = f.get_slice("lm_head.weight")
-        vocab_size, hidden_dim = tensor_slice.get_shape()
-        tensor = tensor_slice[:, :hidden_dim].float()
+_LM_HEAD_KEY_CANDIDATES = ("language_model.lm_head.weight", "lm_head.weight")
+_index_file = os.path.join(base_model_path, "model.safetensors.index.json")
+_single_file = os.path.join(base_model_path, "model.safetensors")
+tensor = None
+if os.path.exists(_index_file):
+    with open(_index_file, "r") as f:
+        _index_json = json.loads(f.read())
+    _weight_map = _index_json["weight_map"]
+    for _key in _LM_HEAD_KEY_CANDIDATES:
+        if _key in _weight_map:
+            _shard = os.path.join(base_model_path, _weight_map[_key])
+            with safe_open(_shard, framework="pt", device="cpu") as f:
+                tensor_slice = f.get_slice(_key)
+                vocab_size, hidden_dim = tensor_slice.get_shape()
+                tensor = tensor_slice[:, :hidden_dim].float()
+            break
+else:
+    with safe_open(_single_file, framework="pt", device="cpu") as f:
+        for _key in _LM_HEAD_KEY_CANDIDATES:
+            try:
+                tensor_slice = f.get_slice(_key)
+                vocab_size, hidden_dim = tensor_slice.get_shape()
+                tensor = tensor_slice[:, :hidden_dim].float()
+                break
+            except Exception:
+                continue
+if tensor is None:
+    raise KeyError(f"Could not find lm_head weight in {base_model_path}")
 
 head = torch.nn.Linear(tensor.shape[1], tensor.shape[0], bias=False)
 head.weight.data = tensor
@@ -561,7 +571,7 @@ for epoch in range(num_epochs + 1):
     #         wandb.log({f'train/epochtop_{id + 1}_acc': i.sum().item() / total})
     if accelerator.is_local_main_process:
         print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
-        print('Train Accuracy: {:.2f}%'.format(100 * correct / total))
+        print('Train Accuracy: {:.2f}%'.format(100 * correct / total if total else 0.0))
         print(args.cpdir)
         print(f'Train speed: {batches_per_sec:.2f} batches/s')
 

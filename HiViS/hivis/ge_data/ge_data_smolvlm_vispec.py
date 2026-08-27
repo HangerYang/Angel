@@ -1,8 +1,16 @@
-"""Generate hidden-state data from a SmolVLM (Idefics3) model for HiViS training.
+"""Generate hidden-state data from a SmolVLM (Idefics3) model for ViSpec-style training.
 
-Handles the role/content dataset format where image entries carry either
-absolute file paths or base64 data URIs (data:image/...;base64,...),
-auto-detecting whether each record is text-only or multimodal.
+Identical to ge_data_smolvlm.py (teacher-forced forward pass, same loss-mask
+mechanism) except multimodal samples are prefixed with ViSpec's Vicuna-style
+system message and get "Please answer with at least 1000 words." appended to
+the first user turn, matching upstream ViSpec's ge_data_all_llava_pretrain_gen.py
+prompt (https://github.com/KangJialiang/ViSpec). Text-only samples are left
+untouched, matching upstream ViSpec's ge_data_all_llava_shargpt.py.
+
+Note this keeps the existing (already target-generated) assistant answer and
+teacher-forces over it rather than calling model.generate() the way upstream
+ViSpec does -- the instruction text is prompt context only, it does not force
+the captured target to actually be 1000 words.
 """
 
 import argparse
@@ -15,10 +23,16 @@ from pathlib import Path
 DEFAULT_MODEL_PATH = "HuggingFaceTB/SmolVLM-256M-Instruct"
 DEFAULT_DATA = "dataset/mixed_text_vl_36/mixed_text_vl_36.jsonl"
 
+VISPEC_SYSTEM_PROMPT = (
+    "A chat between a curious human and an artificial intelligence assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the human's questions."
+)
+VISPEC_LENGTH_INSTRUCTION = " Please answer with at least 1000 words."
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate SmolVLM hidden-state data for HiViS training."
+        description="Generate SmolVLM hidden-state data for ViSpec-style training."
     )
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=100000)
@@ -38,6 +52,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--no-length-instruction",
+        action="store_true",
+        help="Disable the ViSpec system prompt / 1000-word instruction (falls back to plain teacher-forcing).",
+    )
     return parser.parse_args()
 
 
@@ -49,8 +68,6 @@ from datasets import Features, Value, load_dataset
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
-from transformers import AutoConfig, AutoProcessor, Idefics3ForConditionalGeneration
 
 # Content items are either {"type": "text", "text": ...} or {"type": "image",
 # "image": ...}. Without an explicit schema, datasets' JSON loader infers the
@@ -75,6 +92,8 @@ RECORD_FEATURES = Features(
         ],
     }
 )
+from tqdm import tqdm
+from transformers import AutoConfig, AutoProcessor, Idefics3ForConditionalGeneration
 
 from .model_names import model_directory_name
 
@@ -104,11 +123,29 @@ def load_image_field(img_ref):
         return opened.convert("RGB").copy()
 
 
-def record_to_messages_and_image(record):
-    """Convert role/content format to HF messages list and load the first image."""
+def record_to_messages_and_image(record, *, apply_vispec_prompt):
+    """Convert role/content format to HF messages list and load the first image.
+
+    When apply_vispec_prompt is set and the record is multimodal, prepends a
+    system turn and appends the "at least 1000 words" instruction to the
+    first user turn -- matching upstream ViSpec's multimodal prompt, applied
+    only to multimodal samples (text-only ShareGPT samples are untouched).
+    """
     conversations = record["conversations"]
+    is_multimodal = any(
+        entry.get("type") == "image"
+        for turn in conversations
+        for entry in turn.get("content", [])
+    )
+
     messages = []
+    if apply_vispec_prompt and is_multimodal:
+        messages.append(
+            {"role": "system", "content": [{"type": "text", "text": VISPEC_SYSTEM_PROMPT}]}
+        )
+
     image = None
+    first_user_seen = False
     for turn in conversations:
         role = turn["role"]  # "user" or "assistant"
         content_entries = turn["content"]
@@ -125,20 +162,31 @@ def record_to_messages_and_image(record):
                 new_content.append({"type": "image"})
             elif entry_type == "text":
                 new_content.append({"type": "text", "text": entry.get("text", "")})
+        if (
+            apply_vispec_prompt
+            and is_multimodal
+            and role == "user"
+            and not first_user_seen
+        ):
+            new_content.append({"type": "text", "text": VISPEC_LENGTH_INSTRUCTION})
+            first_user_seen = True
         messages.append({"role": role, "content": new_content})
     return messages, image
 
 
 class ConversationDataset(Dataset):
-    def __init__(self, dataset):
+    def __init__(self, dataset, apply_vispec_prompt):
         self.dataset = dataset
+        self.apply_vispec_prompt = apply_vispec_prompt
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index):
         record = self.dataset[index]
-        messages, image = record_to_messages_and_image(record)
+        messages, image = record_to_messages_and_image(
+            record, apply_vispec_prompt=self.apply_vispec_prompt
+        )
         return messages, image
 
 
@@ -233,7 +281,7 @@ if args.outdir is None:
     args.outdir = (
         Path("eval_data/generated")
         / model_directory_name(args.model_path, model_config)
-        / "smolvlm_mixed"
+        / "smolvlm_vispec_mixed"
     )
 
 tokenizer = processor.tokenizer
@@ -253,7 +301,7 @@ end = min(args.end, len(dataset))
 dataset = dataset.select(range(args.start, end))
 
 data_loader = DataLoader(
-    ConversationDataset(dataset),
+    ConversationDataset(dataset, apply_vispec_prompt=not args.no_length_instruction),
     batch_size=1,
     shuffle=False,
     num_workers=args.num_workers,

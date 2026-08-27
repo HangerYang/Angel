@@ -30,6 +30,8 @@ parser.add_argument(
 )
 parser.add_argument('--outdir', type=str, default='outdir1')
 parser.add_argument('--cpdir', type=str, default='checkpoints/stage1')
+parser.add_argument('--num-epochs', dest='num_epochs', type=int, default=20)
+parser.add_argument('--max-len', dest='max_len', type=int, default=4096)
 
 args = parser.parse_args()
 
@@ -41,7 +43,7 @@ train_config={
     "text_datapath": args.text_data_dir,
     "multimodal_datapath": args.multimodal_data_dir,
     "is_warmup":True,
-    "num_epochs":20,
+    "num_epochs":args.num_epochs,
     "num_warmup_steps":2000,
     "total_steps":800000,
     "p_w":0.1,
@@ -55,7 +57,7 @@ train_config={
     "mean":0.0,
     "std":0.2,
     "residual":"true,norm",
-    "max_len":4096,
+    "max_len":args.max_len,
     "config_path":args.configpath,
     "b1":0.9,
     "b2": 0.95,
@@ -490,7 +492,7 @@ for epoch in range(num_epochs + 1):
     #         wandb.log({f'train/epochtop_{id + 1}_acc': i.sum().item() / total})
     if accelerator.is_local_main_process:
         print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
-        print('Train Accuracy: {:.2f}%'.format(100 * correct / total))
+        print('Train Accuracy: {:.2f}%'.format(100 * correct / total if total else 0.0))
         print(args.cpdir)
         # print(f'Train speed: {batches_per_sec:.2f} batches/s')
         # wandb.log({"train/epochacc": correct / total, "train/epochloss": epoch_loss})

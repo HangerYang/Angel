@@ -29,6 +29,11 @@ dataset/**/.map_cache/
 dataset/smolvlm_256m_target_gen_mixed_70k70k/
 dataset/smolvlm_256m_target_gen/train.jsonl
 dataset/smolvlm_256m_target_gen/eval.jsonl
+dataset/raw/
+dataset/angelslim-smolvlm-eagle3-artifacts/
+dataset/hivis_smolvlm_256m_generated/
+dataset/smolvlm_256m_target_gen_long_prompt/
+dataset/vispec_smolvlm_256m_generated/
 
 # Local editable vLLM checkout (full upstream clone + wheel .so overlays)
 third_party/vllm/

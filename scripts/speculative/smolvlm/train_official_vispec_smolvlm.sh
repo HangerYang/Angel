@@ -1,8 +1,16 @@
 #!/bin/bash
-# Official HiViS training setup for SmolVLM-256M in the AngelSLIM checkout.
+# Official ViSpec-style training setup for SmolVLM-256M in the AngelSLIM checkout.
+#
+# Same hivis.train.main_mix / main_mix_topk_dyn_res two-stage training as
+# train_official_hivis_smolvlm.sh -- the only difference is the .ckpt data
+# comes from hivis.ge_data.ge_data_smolvlm_vispec (system prompt + "at least
+# 1000 words" instruction on multimodal samples, per upstream ViSpec's
+# ge_data_all_llava_pretrain_gen.py), routed through --model smolvlm_vispec.
+# Uses the same DATA_FILE (mix_train_70k, target-generated) as the HiViS run
+# so the two baselines are directly comparable.
 #
 # Stages:
-#   STAGE=generate          generate official HiViS .ckpt data from the mixed JSONL
+#   STAGE=generate          generate ViSpec-style .ckpt data from the mixed JSONL
 #   STAGE=generate_text     generate text-only .ckpt data
 #   STAGE=generate_mm       generate multimodal .ckpt data
 #   STAGE=stage1            run official hivis.train.main_mix
@@ -24,11 +32,11 @@ fi
 STAGE=${STAGE:-all}
 TARGET_MODEL_NAME_OR_PATH=${TARGET_MODEL_NAME_OR_PATH:-HuggingFaceTB/SmolVLM-256M-Instruct}
 DATA_FILE=${DATA_FILE:-$ROOT/dataset/preprocessed/mixed_sharegpt_llava665k_70k70k_b64.jsonl}
-HIVIS_DATA_ROOT=${HIVIS_DATA_ROOT:-$ROOT/dataset/hivis_smolvlm_256m_generated}
-TEXT_CKPT_DIR=${TEXT_CKPT_DIR:-$HIVIS_DATA_ROOT/sharegpt}
-MULTIMODAL_CKPT_DIR=${MULTIMODAL_CKPT_DIR:-$HIVIS_DATA_ROOT/llava_v1_5_mix665k}
+VISPEC_DATA_ROOT=${VISPEC_DATA_ROOT:-$ROOT/dataset/vispec_smolvlm_256m_generated}
+TEXT_CKPT_DIR=${TEXT_CKPT_DIR:-$VISPEC_DATA_ROOT/sharegpt}
+MULTIMODAL_CKPT_DIR=${MULTIMODAL_CKPT_DIR:-$VISPEC_DATA_ROOT/llava_v1_5_mix665k}
 CONFIG_PATH=${CONFIG_PATH:-$HIVIS_ROOT/hivis/train/smolvlm_256m_config.json}
-OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT/output/hivis_official/smolvlm_256m}
+OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT/output/vispec_official/smolvlm_256m}
 STAGE1_DIR=${STAGE1_DIR:-$OUTPUT_ROOT/stage1}
 STAGE2_DIR=${STAGE2_DIR:-$OUTPUT_ROOT/stage2}
 STAGE1_CKPT=${STAGE1_CKPT:-$STAGE1_DIR/state_0}
@@ -55,7 +63,7 @@ run_generate_one() {
   local outdir="$2"
   local args=(
     -m hivis.ge_data.allocation
-    --model smolvlm
+    --model smolvlm_vispec
     --data-type "$data_type"
     --model-path "$TARGET_MODEL_NAME_OR_PATH"
     --data-file "$DATA_FILE"
@@ -102,7 +110,7 @@ run_stage2() {
     --topk_w "$TOPK_W"
 }
 
-echo "=== Official HiViS SmolVLM setup ==="
+echo "=== Official ViSpec-style SmolVLM setup ==="
 echo "  stage=$STAGE target=$TARGET_MODEL_NAME_OR_PATH"
 echo "  data_file=$DATA_FILE"
 echo "  text_ckpts=$TEXT_CKPT_DIR"
@@ -112,7 +120,7 @@ echo "  hivis_root=$HIVIS_ROOT"
 echo "  gpus=$GPU_CSV"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  echo "DRY_RUN=1: command validated, not launching HiViS generation/training."
+  echo "DRY_RUN=1: command validated, not launching ViSpec-style generation/training."
   exit 0
 fi
 

@@ -211,27 +211,31 @@ class LlamaAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
-            if hasattr(self.config, "rope_theta"):
-                self.rotary_emb = LlamaRotaryEmbedding(self.head_dim,
-                                                       max_position_embeddings=self.max_position_embeddings,
-                                                       base=self.config.rope_theta)
-            else:
-                self.rotary_emb = LlamaRotaryEmbedding(self.head_dim,
-                                                       max_position_embeddings=self.max_position_embeddings)
+        rope_theta = getattr(self.config, "rope_theta", 10000.0)
+        # Newer transformers auto-populates rope_scaling with {'rope_type': 'default'}.
+        # Treat None or rope_type=='default' as standard (unscaled) RoPE.
+        scaling = self.config.rope_scaling
+        rope_type = None
+        if scaling is not None:
+            rope_type = scaling.get("rope_type") or scaling.get("type")
+        if scaling is None or rope_type in (None, "default"):
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=rope_theta,
+            )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
+            scaling_factor = scaling.get("factor", 1.0)
+            if rope_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
                 )
-            elif scaling_type == "dynamic":
+            elif rope_type == "dynamic":
                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
                 )
             else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+                raise ValueError(f"Unknown RoPE scaling type {rope_type}")
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -503,26 +507,38 @@ class Model(nn.Module):
         if load_emb:
             from safetensors import safe_open
             import json
-            try:
-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+            _EMBED_KEY_CANDIDATES = (
+                "language_model.model.embed_tokens.weight",
+                "model.text_model.embed_tokens.weight",
+                "model.embed_tokens.weight",
+            )
+            index_file = os.path.join(path, "model.safetensors.index.json")
+            single_file = os.path.join(path, "model.safetensors")
+            tensor = None
+            if os.path.exists(index_file):
+                with open(index_file, "r") as f:
                     index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["language_model.model.embed_tokens.weight"]
-                with safe_open(os.path.join(path, emb_path),
-                               framework="pt",
-                               device="cpu") as f:
-                    tensor_slice = f.get_slice("language_model.model.embed_tokens.weight")
-                    vocab_size, hidden_dim = tensor_slice.get_shape()
-                    tensor = tensor_slice[:, :hidden_dim].float()
-            except:
-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
-                    index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                with safe_open(os.path.join(path, emb_path),
-                               framework="pt",
-                               device="cpu") as f:
-                    tensor_slice = f.get_slice("model.embed_tokens.weight")
-                    vocab_size, hidden_dim = tensor_slice.get_shape()
-                    tensor = tensor_slice[:, :hidden_dim].float()
+                weight_map = index_json["weight_map"]
+                for key in _EMBED_KEY_CANDIDATES:
+                    if key in weight_map:
+                        shard = os.path.join(path, weight_map[key])
+                        with safe_open(shard, framework="pt", device="cpu") as f:
+                            tensor_slice = f.get_slice(key)
+                            vocab_size, hidden_dim = tensor_slice.get_shape()
+                            tensor = tensor_slice[:, :hidden_dim].float()
+                        break
+            else:
+                with safe_open(single_file, framework="pt", device="cpu") as f:
+                    for key in _EMBED_KEY_CANDIDATES:
+                        try:
+                            tensor_slice = f.get_slice(key)
+                            vocab_size, hidden_dim = tensor_slice.get_shape()
+                            tensor = tensor_slice[:, :hidden_dim].float()
+                            break
+                        except Exception:
+                            continue
+            if tensor is None:
+                raise KeyError(f"Could not find embed_tokens weight in {path}")
             self.embed_tokens.weight.data = tensor
 
         self.top_k = top_k
