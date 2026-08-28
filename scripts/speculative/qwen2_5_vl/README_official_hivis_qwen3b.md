@@ -34,18 +34,18 @@ ShareGPT schema — `eval_data/sharegpt/sharegpt.jsonl` +
 `eval_data/llava_v1_5_mix665k/llava_v1_5_mix665k_long_context.jsonl` — which
 don't exist in this checkout; only their `prepare_data.py` generators do).
 
-### text vs. multimodal split: real, not duplicated
+### text vs. multimodal split: real, one pass, not duplicated
 
-Unlike `ge_data_smolvlm.py` (which ignores `--data-type` and writes the same
-full mixed pass into both `--text-data-dir` and `--multimodal-data-dir` —
-`main_mix.py`'s `list_files()` just concatenates whatever files exist in each
-directory into one training pool, it doesn't care whether the split is real),
-`ge_data_qwen.py` now actually filters: a `--data-type text` invocation only
-keeps records with no image anywhere in `conversations`, and `--data-type
-multimodal` only keeps records with at least one. So `sharegpt/` and
-`llava_v1_5_mix665k/` end up as a genuine disjoint partition of the one mixed
-file — half the generate compute and disk of the duplicate-everything
-approach, same total training pool size.
+Unlike `ge_data_smolvlm.py` (which writes the same full mixed pass into both
+`--text-data-dir` and `--multimodal-data-dir` — `main_mix.py`'s `list_files()`
+just concatenates whatever files exist in each directory into one training
+pool, it doesn't care whether the split is real), `ge_data_qwen.py` loads the
+target model and the mixed file **once** and routes each record to `--outdir`
+(text) or `--multimodal-outdir` (has an image) based on that record's own
+content. `sharegpt/` and `llava_v1_5_mix665k/` end up a genuine disjoint
+partition of the one mixed file, at the cost of one model load and one pass
+over the data — not two of each, which is what an earlier version of this
+script did (see "Bugs fixed" below).
 
 ## Draft config
 
@@ -83,20 +83,23 @@ DRY_RUN=1 bash scripts/speculative/qwen2_5_vl/run_official_hivis_qwen3b_2ep_1ep.
 ### Running stages individually
 
 ```bash
-STAGE=generate       bash scripts/speculative/qwen2_5_vl/train_official_hivis_qwen3b.sh   # both text + multimodal
-STAGE=generate_text  bash scripts/speculative/qwen2_5_vl/train_official_hivis_qwen3b.sh
-STAGE=generate_mm    bash scripts/speculative/qwen2_5_vl/train_official_hivis_qwen3b.sh
-STAGE=stage1         bash scripts/speculative/qwen2_5_vl/train_official_hivis_qwen3b.sh
-STAGE=stage2         bash scripts/speculative/qwen2_5_vl/train_official_hivis_qwen3b.sh
+STAGE=generate  bash scripts/speculative/qwen2_5_vl/train_official_hivis_qwen3b.sh   # one pass, both outputs
+STAGE=stage1    bash scripts/speculative/qwen2_5_vl/train_official_hivis_qwen3b.sh
+STAGE=stage2    bash scripts/speculative/qwen2_5_vl/train_official_hivis_qwen3b.sh
 ```
+
+(No more `generate_text`/`generate_mm` — one `generate` pass produces both
+now; see "Bugs fixed".)
 
 Useful env var overrides (all have defaults, see the script header):
 `GPUS`, `TARGET_MODEL_NAME_OR_PATH` (default: the local
 `/home/hyang/HiViS/models/Qwen2.5-VL-3B-Instruct` checkpoint), `DATA_FILE`,
-`START`/`END` (row-range slice, pre-shuffle, applied independently within
-each of the text/multimodal filtered pools), `MODEL_MAX_LENGTH`,
-`BS_STAGE1`/`BS_STAGE2`, `LR`, `STAGE1_EPOCHS`, `STAGE2_EPOCHS`,
-`FORWARD_NUM_TOTAL`, `TOPK`, `TOPK_W`, `FAIL_FAST`.
+`START`/`END` (row-range slice, pre-shuffle — `END` gets clamped to the data
+file's real row count regardless of what you pass, see "Bugs fixed"),
+`MODEL_MAX_LENGTH`, `BS_STAGE1`/`BS_STAGE2`, `LR`, `STAGE1_EPOCHS`,
+`STAGE2_EPOCHS`, `FORWARD_NUM_TOTAL`, `TOPK`, `TOPK_W`, `FAIL_FAST`,
+`HIVIS_CONDA_ENV` (path to prepend to `PATH`; only applied if it exists on
+this machine, set to `""` to always skip it — see "Bugs fixed").
 
 ### Smoke test
 
@@ -196,6 +199,55 @@ the same per-GPU memory ceiling regardless of GPU *count*. Lower `BS_STAGE1`/
    correct for the `attn_weights.size()` assertion a few lines down --
    `cnets_res.py` doesn't have that downstream assertion, so it could reuse
    one variable for both purposes; `cnets_dyn_res.py` can't.
+
+## Bugs fixed, round 2 (2026-08-28, after actually trying to run generate)
+
+Found running `STAGE=generate` for real, past the earlier smoke test's tiny
+40-sample slice:
+
+7. **Only one GPU ever did any work.** `train_official_hivis_qwen3b.sh`
+   defaults `END=1000000000000` (meaning "everything from START"). Before
+   this fix, `allocation.py` divided `[0, END)` evenly across `--gpus`
+   *before* knowing how many rows the data file actually has. With that
+   sentinel, GPU 0's slice (`[0, 1.25e11)` for 8 GPUs) comfortably contains
+   the entire real dataset, while every other GPU's slice starts far past
+   the last real row -- so those workers silently process nothing and GPU 0
+   does everything alone. This bug predates this recipe (the SmolVLM script
+   has the identical `END=${END:-1000000000000}` default and would hit the
+   same thing), but it got copied forward here without being caught. Fixed
+   in `allocation.py`'s `main()`: count the data file's rows upfront
+   (`count_data_file_rows`, gated on `--data-file` being a real, resolvable
+   path -- a no-op fallback otherwise, so callers that don't pass `--end` an
+   oversized sentinel are unaffected) and clamp `--end` to that before
+   `split_range` runs. Verified with `--dry-run`: `--end 1000000000000` over
+   the real 140,000-row mixed file now produces 8 non-empty, evenly-sized
+   per-GPU commands instead of 1.
+8. **One input file, generated twice.** `run_generate_one()` called
+   `allocation.py` once per `--data-type` (`text`, `multimodal`), each
+   invocation reloading the target model from scratch and rescanning the
+   whole file, just to filter it down to disjoint halves -- 2x the model
+   loads and 2x the dataset scanning for one file. Fixed: `ge_data_qwen.py`
+   no longer takes `--data-type` at all. It loads the model once, does one
+   pass over the file, and routes each record to `--outdir` (text) or the
+   new `--multimodal-outdir` (has an image) based on that record's own
+   content -- matching the pattern the *original* (pre-rewrite) script
+   already used for its code/non-code text split, just applied to the
+   text/multimodal split instead. `allocation.py` special-cases `--model
+   qwen` to build one command per GPU (not two) and pass both output dirs;
+   `llava`'s existing two-pass `--data-type` behavior is untouched.
+   `train_official_hivis_qwen3b.sh`'s `generate_text`/`generate_mm` stages
+   are gone along with it (a single pass can't produce just one half).
+9. **`HIVIS_CONDA_ENV` was an unconditional `PATH` prepend to a path that
+   only exists on this one machine.** Fine here, breaks completely on any
+   other server (a `uv`-managed env, a different conda install, no conda at
+   all) -- `python`/`accelerate` would still resolve to *something*, just
+   not to an environment with the right package versions, and the failure
+   mode is a confusing crash deep inside dataset loading or model init
+   rather than "this env doesn't have what we need." Fixed in both this
+   script and the SmolVLM one: only prepend `$HIVIS_CONDA_ENV/bin` if that
+   directory actually exists; otherwise it's a silent no-op and whatever the
+   caller's shell already has active (activated conda env, `uv` venv, ...)
+   is left alone. Set `HIVIS_CONDA_ENV=""` to always skip it.
 
 ## Known caveats carried over from the SmolVLM pipeline (not re-verified here)
 

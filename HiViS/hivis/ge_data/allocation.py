@@ -12,11 +12,22 @@ from .model_names import DEFAULT_MODEL_PATHS, model_directory_name
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=("llava", "qwen", "smolvlm", "smolvlm_vispec"), default="llava")
-    parser.add_argument("--data-type", choices=("text", "multimodal"), required=True)
+    # qwen does one pass over the file and routes each record to
+    # --outdir/--multimodal-outdir itself (see ge_data_qwen.py), so it has no
+    # use for --data-type. llava still takes separate text/multimodal passes.
+    parser.add_argument("--data-type", choices=("text", "multimodal"), default=None)
     parser.add_argument("--gpus", type=int, nargs="+", required=True)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=68000, help="Exclusive end index.")
     parser.add_argument("--outdir", type=Path, default=None)
+    parser.add_argument(
+        "--multimodal-outdir",
+        type=Path,
+        default=None,
+        help="qwen only: second output directory for multimodal records "
+        "(--outdir takes the text records) -- one pass over the file "
+        "produces both, no separate --data-type invocation needed.",
+    )
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--data-file", default=None)
     parser.add_argument("--image-root", type=Path, default=None)
@@ -28,9 +39,18 @@ def parse_args():
     args = parser.parse_args()
     if args.start < 0 or args.end < args.start:
         parser.error("require 0 <= --start <= --end")
+    if args.model != "qwen" and args.data_type is None:
+        parser.error(f"--data-type is required for --model {args.model}")
     if args.model_path is None:
         args.model_path = DEFAULT_MODEL_PATHS[args.model]
-    if args.outdir is None:
+    if args.model == "qwen":
+        if args.outdir is None:
+            args.outdir = Path("eval_data/generated") / model_directory_name(args.model_path) / "sharegpt"
+        if args.multimodal_outdir is None:
+            args.multimodal_outdir = (
+                Path("eval_data/generated") / model_directory_name(args.model_path) / "llava_v1_5_mix665k"
+            )
+    elif args.outdir is None:
         dataset_name = "sharegpt" if args.data_type == "text" else "llava_v1_5_mix665k"
         args.outdir = Path("eval_data/generated") / model_directory_name(args.model_path) / dataset_name
     return args
@@ -48,15 +68,35 @@ def split_range(start, end, number_of_parts):
     return ranges
 
 
+def count_data_file_rows(data_file):
+    """Count newlines in data_file, or None if it can't be counted upfront.
+
+    Without this, an unbounded --end sentinel (e.g. train_official_hivis_
+    qwen3b.sh's default of 10**12, meaning "the whole file") gets divided
+    evenly across --gpus *before* anyone knows how many rows actually exist.
+    GPU 0's slice ([0, 10**12/N)) then comfortably contains the entire real
+    dataset while every other GPU's slice starts past the end of the file --
+    so only GPU 0 ever does any work, silently. Clamping --end to the real
+    row count first makes the split land on the actual data.
+    """
+    if data_file is None:
+        return None
+    path = Path(data_file)
+    if not path.is_file():
+        return None
+    with open(path, "rb") as handle:
+        return sum(1 for _ in handle)
+
+
 def build_command(args, worker_index, gpu, start, end):
     module = f"hivis.ge_data.ge_data_{args.model}"
-    command = [
-        sys.executable,
-        "-m",
-        module,
-    ]
-    if args.model in ("llava", "qwen"):
-        command += ["--data-type", args.data_type]
+    command = [sys.executable, "-m", module]
+    if args.model == "qwen":
+        command += ["--outdir", str(args.outdir), "--multimodal-outdir", str(args.multimodal_outdir)]
+    else:
+        if args.model == "llava":
+            command += ["--data-type", args.data_type]
+        command += ["--outdir", str(args.outdir)]
     command += [
         "--start",
         str(start),
@@ -66,8 +106,6 @@ def build_command(args, worker_index, gpu, start, end):
         str(worker_index),
         "--gpu-index",
         str(gpu),
-        "--outdir",
-        str(args.outdir),
         "--seed",
         str(args.seed),
         "--num-workers",
@@ -93,6 +131,13 @@ def run(command):
 def main():
     args = parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
+    if args.model == "qwen":
+        args.multimodal_outdir.mkdir(parents=True, exist_ok=True)
+
+    total_rows = count_data_file_rows(args.data_file)
+    if total_rows is not None and args.end > total_rows:
+        args.end = total_rows
+
     ranges = split_range(args.start, args.end, len(args.gpus))
     commands = [
         build_command(args, index, gpu, start, end)

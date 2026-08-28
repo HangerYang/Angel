@@ -6,16 +6,13 @@
 #
 # Stages:
 #   STAGE=generate          generate official HiViS .ckpt data from the mixed JSONL
-#   STAGE=generate_text     generate text-only .ckpt data
-#   STAGE=generate_mm       generate multimodal .ckpt data
+#                           (one pass: loads the target model once and routes
+#                           each record to the text or multimodal output dir
+#                           based on its own content -- see ge_data_qwen.py)
 #   STAGE=stage1            run official hivis.train.main_mix
 #   STAGE=stage2            run official hivis.train.main_mix_topk_dyn_res
 #   STAGE=all               generate, stage1, stage2
 #
-# Unlike the SmolVLM script, --data-type here actually filters the shared
-# mixed file (see ge_data_qwen.py) instead of writing the same records to
-# both text-data-dir and multimodal-data-dir -- so text/multimodal-data-dir
-# are a genuine disjoint split, not duplicates of the same generate pass.
 # Also: stage2 here points at the same text-data-dir as stage1 (no /non_code
 # subfolder) -- ge_data_qwen.py never creates a non_code split, so pointing
 # stage2 at "$TEXT_CKPT_DIR/non_code" the way the SmolVLM script does would
@@ -31,10 +28,15 @@ export PYTHONPATH="$ROOT:$HIVIS_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 # hivis conda env has the torch/torchvision/transformers/accelerate versions
-# this pipeline needs; put it first on PATH so bare `python`/`accelerate`
-# calls below resolve there regardless of what's active in the caller's shell.
+# this pipeline was validated against. Prepend it to PATH ONLY if it exists
+# on this machine -- on a server managed with something other than this one
+# conda env (uv, a different conda install, ...), silently do nothing and
+# rely on whatever the caller already has active. Override the expected path
+# via HIVIS_CONDA_ENV, or set HIVIS_CONDA_ENV="" to always skip this.
 HIVIS_CONDA_ENV="${HIVIS_CONDA_ENV:-/home/hyang/anaconda3/envs/hivis}"
-export PATH="$HIVIS_CONDA_ENV/bin:$PATH"
+if [[ -n "$HIVIS_CONDA_ENV" && -d "$HIVIS_CONDA_ENV/bin" ]]; then
+  export PATH="$HIVIS_CONDA_ENV/bin:$PATH"
+fi
 if [[ "${DRY_RUN:-0}" != "1" && -f "$ROOT/third_party/env.sh" ]]; then
   # shellcheck disable=SC1091
   source "$ROOT/third_party/env.sh"
@@ -64,6 +66,8 @@ else
   ACCELERATE_MULTI_GPU_ARGS=()
 fi
 START=${START:-0}
+# allocation.py clamps this to the data file's actual row count before
+# splitting across GPUS, so this sentinel just means "everything from START".
 END=${END:-1000000000000}
 MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-4096}
 NUM_WORKERS=${NUM_WORKERS:-1}
@@ -78,16 +82,14 @@ TOPK=${TOPK:-10}
 TOPK_W=${TOPK_W:-1.0}
 FAIL_FAST=${FAIL_FAST:-false}
 
-run_generate_one() {
-  local data_type="$1"
-  local outdir="$2"
+run_generate() {
   local args=(
     -m hivis.ge_data.allocation
     --model qwen
-    --data-type "$data_type"
     --model-path "$TARGET_MODEL_NAME_OR_PATH"
     --data-file "$DATA_FILE"
-    --outdir "$outdir"
+    --outdir "$TEXT_CKPT_DIR"
+    --multimodal-outdir "$MULTIMODAL_CKPT_DIR"
     --start "$START"
     --end "$END"
     --max-length "$MODEL_MAX_LENGTH"
@@ -146,14 +148,7 @@ fi
 
 case "$STAGE" in
   generate)
-    run_generate_one text "$TEXT_CKPT_DIR"
-    run_generate_one multimodal "$MULTIMODAL_CKPT_DIR"
-    ;;
-  generate_text)
-    run_generate_one text "$TEXT_CKPT_DIR"
-    ;;
-  generate_mm)
-    run_generate_one multimodal "$MULTIMODAL_CKPT_DIR"
+    run_generate
     ;;
   stage1)
     run_stage1
@@ -162,13 +157,12 @@ case "$STAGE" in
     run_stage2
     ;;
   all)
-    run_generate_one text "$TEXT_CKPT_DIR"
-    run_generate_one multimodal "$MULTIMODAL_CKPT_DIR"
+    run_generate
     run_stage1
     run_stage2
     ;;
   *)
-    echo "ERROR: STAGE must be generate, generate_text, generate_mm, stage1, stage2, or all (got: $STAGE)" >&2
+    echo "ERROR: STAGE must be generate, stage1, stage2, or all (got: $STAGE)" >&2
     exit 1
     ;;
 esac

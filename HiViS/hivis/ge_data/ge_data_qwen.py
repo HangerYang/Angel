@@ -2,11 +2,10 @@
 
 Handles the same role/content dataset format as ge_data_smolvlm.py, where
 image entries carry either absolute file paths or base64 data URIs
-(data:image/...;base64,...). Unlike ge_data_smolvlm.py, --data-type actually
-filters records here: a "text" invocation only sees records with no image
-content anywhere, and a "multimodal" invocation only sees records with at
-least one image -- so text-data-dir and multimodal-data-dir end up as a
-genuine, disjoint split of one mixed input file (no duplicated samples).
+(data:image/...;base64,...). One pass over the input file loads the model
+once and routes each record to --outdir (text) or --multimodal-outdir
+(has an image) based on its own content -- so a single mixed input file
+produces a genuine, disjoint split without generating twice.
 """
 
 import argparse
@@ -26,7 +25,6 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate Qwen2.5-VL hidden-state data for HiViS training."
     )
-    parser.add_argument("--data-type", choices=("text", "multimodal"), required=True)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=100000)
     parser.add_argument("--index", type=int, default=0)
@@ -38,7 +36,15 @@ def parse_args():
         nargs="+",
         default=[0],
     )
-    parser.add_argument("--outdir", type=Path, default=None)
+    parser.add_argument(
+        "--outdir", type=Path, default=None, help="Output directory for text-only records."
+    )
+    parser.add_argument(
+        "--multimodal-outdir",
+        type=Path,
+        default=None,
+        help="Output directory for records with at least one image.",
+    )
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--data-file", default=DEFAULT_DATA)
     parser.add_argument("--max-length", type=int, default=4096)
@@ -88,21 +94,17 @@ RECORD_FEATURES = Features(
 from .model_names import model_directory_name
 
 
-def load_model(model_path, data_type):
+def load_model(model_path):
     config = AutoConfig.from_pretrained(model_path)
     if config.model_type != "qwen2_5_vl":
         raise ValueError(
             f"Unsupported model type {config.model_type!r}; expected qwen2_5_vl."
         )
-    model_kwargs = {
-        "torch_dtype": torch.bfloat16,
-        "device_map": "auto",
-    }
-    # Preserve the pure-text source script's attention implementation.
-    if data_type == "text":
-        model_kwargs["attn_implementation"] = "eager"
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_path, **model_kwargs
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="eager",
     )
     model.eval()
     return model, config, AutoProcessor.from_pretrained(model_path)
@@ -160,15 +162,15 @@ class ConversationDataset(Dataset):
     def __getitem__(self, index):
         record = self.dataset[index]
         messages, image = record_to_messages_and_image(record)
-        return messages, image
+        return messages, image, record_has_image(record)
 
 
 def collate_fn(batch):
-    conversations, images = zip(*batch)
+    conversations, images, has_image = zip(*batch)
     prompt = processor.apply_chat_template(
         conversations[0], add_generation_prompt=True
     )
-    return prompt, list(images)
+    return prompt, list(images), has_image[0]
 
 
 def build_visual_keep_mask(input_ids):
@@ -240,8 +242,7 @@ def build_loss_mask(input_ids, assistant_tokens, end_tokens):
 
 @torch.no_grad()
 def generate_sample(batch):
-    prompt, images = batch
-    has_image = any(img is not None for img in images)
+    prompt, images, has_image = batch
     processor_kwargs = {
         "text": [prompt],
         "return_tensors": "pt",
@@ -281,10 +282,13 @@ def save_sample(output_dir, sample):
     torch.save(sample, output_dir / f"data_{sample_index}.ckpt")
 
 
-model, model_config, processor = load_model(args.model_path, args.data_type)
+model, model_config, processor = load_model(args.model_path)
 if args.outdir is None:
-    dataset_name = "sharegpt" if args.data_type == "text" else "llava_v1_5_mix665k"
-    args.outdir = Path("eval_data/generated") / model_directory_name(args.model_path, model_config) / dataset_name
+    args.outdir = Path("eval_data/generated") / model_directory_name(args.model_path, model_config) / "sharegpt"
+if args.multimodal_outdir is None:
+    args.multimodal_outdir = (
+        Path("eval_data/generated") / model_directory_name(args.model_path, model_config) / "llava_v1_5_mix665k"
+    )
 
 tokenizer = processor.tokenizer
 assistant_tokens = tokenizer.encode(
@@ -292,16 +296,16 @@ assistant_tokens = tokenizer.encode(
 )
 end_tokens = tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
 
-output_dir = args.outdir / str(args.index)
-output_dir.mkdir(parents=True, exist_ok=True)
+text_output_dir = args.outdir / str(args.index)
+multimodal_output_dir = args.multimodal_outdir / str(args.index)
+text_output_dir.mkdir(parents=True, exist_ok=True)
+multimodal_output_dir.mkdir(parents=True, exist_ok=True)
 
 dataset = load_dataset(
     "json", data_files=str(args.data_file), split="train", features=RECORD_FEATURES
 )
 dataset = dataset.shuffle(seed=args.seed)
 dataset = dataset.filter(lambda row: row.get("conversations") is not None)
-want_image = args.data_type == "multimodal"
-dataset = dataset.filter(lambda row: record_has_image(row) == want_image)
 end = min(args.end, len(dataset))
 dataset = dataset.select(range(args.start, end))
 
@@ -317,6 +321,7 @@ data_loader = DataLoader(
 for batch_index, batch in enumerate(tqdm(data_loader)):
     torch.cuda.empty_cache()
     try:
+        output_dir = multimodal_output_dir if batch[2] else text_output_dir
         save_sample(output_dir, generate_sample(batch))
     except Exception as error:
         absolute_index = args.start + batch_index

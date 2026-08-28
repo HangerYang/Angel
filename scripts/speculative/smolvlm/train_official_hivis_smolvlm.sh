@@ -17,10 +17,15 @@ cd "$ROOT"
 
 export PYTHONPATH="$ROOT:$HIVIS_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # hivis conda env has the torch/torchvision/transformers/accelerate versions
-# this pipeline needs; put it first on PATH so bare `python`/`accelerate`
-# calls below resolve there regardless of what's active in the caller's shell.
+# this pipeline was validated against. Prepend it to PATH ONLY if it exists
+# on this machine -- on a server managed with something other than this one
+# conda env (uv, a different conda install, ...), silently do nothing and
+# rely on whatever the caller already has active. Override the expected path
+# via HIVIS_CONDA_ENV, or set HIVIS_CONDA_ENV="" to always skip this.
 HIVIS_CONDA_ENV="${HIVIS_CONDA_ENV:-/home/hyang/anaconda3/envs/hivis}"
-export PATH="$HIVIS_CONDA_ENV/bin:$PATH"
+if [[ -n "$HIVIS_CONDA_ENV" && -d "$HIVIS_CONDA_ENV/bin" ]]; then
+  export PATH="$HIVIS_CONDA_ENV/bin:$PATH"
+fi
 if [[ "${DRY_RUN:-0}" != "1" && -f "$ROOT/third_party/env.sh" ]]; then
   # shellcheck disable=SC1091
   source "$ROOT/third_party/env.sh"
