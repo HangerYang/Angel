@@ -27,6 +27,7 @@ eval_data/sharegpt/*/
 eval_data/llava_v1_5_mix665k/*.json
 eval_data/llava_v1_5_mix665k/*.jsonl
 eval_data/llava_v1_5_mix665k/*/
+eval_data/llava_v1_5_mix665k/images
 
 hivis/evaluation/data/MME_Benchmark_release_version/
 hivis/evaluation/data/mm-vet/

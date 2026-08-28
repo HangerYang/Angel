@@ -14,7 +14,9 @@ DEFAULT_MODEL_PATHS = {
 def _name_from_reference(model_reference):
     name = str(model_reference).lower().replace("_", "-")
     if "qwen2.5-vl" in name or "qwen2-5-vl" in name or "qwen25vl" in name:
-        return "qwen25vl_7b"
+        qwen_size = "3b" if "3b" in name else "7b" if "7b" in name else None
+        if qwen_size is not None:
+            return f"qwen25vl_{qwen_size}"
     size = "13b" if "13b" in name else "7b" if "7b" in name else None
     if size and ("llava-v1.6" in name or "llava1.6" in name or "llava16" in name):
         return f"llava16_{size}"
@@ -39,9 +41,10 @@ def model_directory_name(model_reference, config=None):
     text_config = getattr(config, "text_config", None) or config
     hidden_size = getattr(text_config, "hidden_size", getattr(config, "hidden_size", None))
     if "qwen2_5_vl" in model_type or "qwen2.5_vl" in model_type:
-        if hidden_size != 3584:
+        qwen_size = {2048: "3b", 3584: "7b"}.get(hidden_size)
+        if qwen_size is None:
             raise ValueError(f"Unsupported Qwen2.5-VL hidden size: {hidden_size}")
-        return "qwen25vl_7b"
+        return f"qwen25vl_{qwen_size}"
     if model_type == "idefics3":
         size_tag = {576: "256m", 2048: "2b"}.get(hidden_size, f"{hidden_size}d")
         return f"smolvlm_{size_tag}"

@@ -1,14 +1,23 @@
-"""Generate text or multimodal Qwen2.5-VL data for HiViS training."""
+"""Generate hidden-state data from a Qwen2.5-VL model for HiViS training.
+
+Handles the same role/content dataset format as ge_data_smolvlm.py, where
+image entries carry either absolute file paths or base64 data URIs
+(data:image/...;base64,...). Unlike ge_data_smolvlm.py, --data-type actually
+filters records here: a "text" invocation only sees records with no image
+content anywhere, and a "multimodal" invocation only sees records with at
+least one image -- so text-data-dir and multimodal-data-dir end up as a
+genuine, disjoint split of one mixed input file (no duplicated samples).
+"""
 
 import argparse
+import base64
+import io
 import os
 from pathlib import Path
 
 
 DEFAULT_MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"
-DEFAULT_TEXT_DATA = "eval_data/sharegpt/sharegpt.jsonl"
-DEFAULT_MULTIMODAL_DATA = "eval_data/llava_v1_5_mix665k/llava_v1_5_mix665k_long_context.jsonl"
-DEFAULT_IMAGE_ROOT = "eval_data/llava_v1_5_mix665k/images"
+DEFAULT_DATA = "dataset/preprocessed/mixed_sharegpt_llava665k_70k70k_b64.jsonl"
 VISION_START_TOKEN_ID = 151652
 IMAGE_TOKEN_ID = 151655
 
@@ -17,13 +26,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate Qwen2.5-VL hidden-state data for HiViS training."
     )
-    parser.add_argument(
-        "--data-type",
-        choices=("text", "multimodal"),
-        required=True,
-    )
+    parser.add_argument("--data-type", choices=("text", "multimodal"), required=True)
     parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--end", type=int, default=68000)
+    parser.add_argument("--end", type=int, default=100000)
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument(
         "--gpu-index",
@@ -35,28 +40,14 @@ def parse_args():
     )
     parser.add_argument("--outdir", type=Path, default=None)
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--data-file", default=None)
-    parser.add_argument("--image-root", type=Path, default=Path(DEFAULT_IMAGE_ROOT))
-    parser.add_argument(
-        "--max-length",
-        type=int,
-        default=None,
-        help="Defaults to 2048 for text and 4096 for multimodal data.",
-    )
+    parser.add_argument("--data-file", default=DEFAULT_DATA)
+    parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
     if args.start < 0 or args.end < args.start:
         parser.error("require 0 <= --start <= --end")
-    if args.data_file is None:
-        args.data_file = (
-            DEFAULT_TEXT_DATA
-            if args.data_type == "text"
-            else DEFAULT_MULTIMODAL_DATA
-        )
-    if args.max_length is None:
-        args.max_length = 2048 if args.data_type == "text" else 4096
     return args
 
 
@@ -65,12 +56,34 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_index))
 
 # CUDA visibility must be configured before importing torch/transformers.
 import torch
-from datasets import load_dataset
+from datasets import Features, Value, load_dataset
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+# See ge_data_smolvlm.py for why the schema is pinned up front: without it,
+# datasets' JSON loader infers "content"'s struct type from the first chunk
+# it reads, and later chunks of the opposite (text-only vs multimodal) shape
+# fail to cast into that narrower inferred schema.
+RECORD_FEATURES = Features(
+    {
+        "id": Value("string"),
+        "conversations": [
+            {
+                "role": Value("string"),
+                "content": [
+                    {
+                        "type": Value("string"),
+                        "text": Value("string"),
+                        "image": Value("string"),
+                    }
+                ],
+            }
+        ],
+    }
+)
 
 from .model_names import model_directory_name
 
@@ -95,61 +108,67 @@ def load_model(model_path, data_type):
     return model, config, AutoProcessor.from_pretrained(model_path)
 
 
-def conversation_to_messages(conversation):
-    """Match the conversation conversion in the two original Qwen scripts."""
+def load_image_field(img_ref):
+    """Load a PIL image from either a base64 data URI or a file path."""
+    if img_ref.startswith("data:image/"):
+        _, _, b64_data = img_ref.partition(",")
+        with Image.open(io.BytesIO(base64.b64decode(b64_data))) as opened:
+            return opened.convert("RGB").copy()
+    with Image.open(img_ref) as opened:
+        return opened.convert("RGB").copy()
+
+
+def record_has_image(record):
+    return any(
+        entry.get("type") == "image"
+        for turn in record["conversations"]
+        for entry in turn.get("content", [])
+    )
+
+
+def record_to_messages_and_image(record):
+    """Convert role/content format to HF messages list and load the first image."""
+    conversations = record["conversations"]
     messages = []
-    for message in conversation:
-        role = "user" if message.get("from") == "human" else "assistant"
-        value = message.get("value", "")
-        content = []
-        if role == "user" and "\n<image>" in value:
-            text, _ = value.split("\n<image>", 1)
-            text = text.strip()
-            if text:
-                content.append({"type": "text", "text": text})
-            content.append({"type": "image"})
-        else:
-            if role == "user":
-                value = value.replace(
-                    "<image>",
-                    "<|vision_start|><|image_pad|><|vision_end|>",
-                )
-            content.append({"type": "text", "text": value})
-        messages.append({"role": role, "content": content})
-    return messages
+    image = None
+    for turn in conversations:
+        role = turn["role"]  # "user" or "assistant"
+        new_content = []
+        for entry in turn.get("content", []):
+            entry_type = entry.get("type")
+            if entry_type == "image":
+                img_path = entry.get("image", "")
+                if img_path and image is None:
+                    try:
+                        image = load_image_field(img_path)
+                    except Exception as exc:
+                        print(f"Could not load image {img_path[:80]}: {exc}")
+                new_content.append({"type": "image"})
+            elif entry_type == "text":
+                new_content.append({"type": "text", "text": entry.get("text", "")})
+        messages.append({"role": role, "content": new_content})
+    return messages, image
 
 
 class ConversationDataset(Dataset):
-    def __init__(self, dataset, data_type, image_root):
+    def __init__(self, dataset):
         self.dataset = dataset
-        self.multimodal = data_type == "multimodal"
-        self.image_root = image_root
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index):
         record = self.dataset[index]
-        image = None
-        if self.multimodal:
-            image_path = record.get("image")
-            if not image_path:
-                raise ValueError(f"Multimodal sample {index} has no image path")
-            full_path = self.image_root / image_path
-            try:
-                with Image.open(full_path) as opened_image:
-                    image = opened_image.copy()
-            except Exception as error:
-                print(f"Could not load image {full_path}: {error}")
-        return image, conversation_to_messages(record["conversations"]), bool(record.get("is_code", False))
+        messages, image = record_to_messages_and_image(record)
+        return messages, image
 
 
 def collate_fn(batch):
-    images, conversations, is_code = zip(*batch)
+    conversations, images = zip(*batch)
     prompt = processor.apply_chat_template(
         conversations[0], add_generation_prompt=True
     )
-    return prompt, list(images), is_code
+    return prompt, list(images)
 
 
 def build_visual_keep_mask(input_ids):
@@ -221,7 +240,8 @@ def build_loss_mask(input_ids, assistant_tokens, end_tokens):
 
 @torch.no_grad()
 def generate_sample(batch):
-    prompt, images, _ = batch
+    prompt, images = batch
+    has_image = any(img is not None for img in images)
     processor_kwargs = {
         "text": [prompt],
         "return_tensors": "pt",
@@ -230,8 +250,8 @@ def generate_sample(batch):
         "truncation": True,
         "max_length": args.max_length,
     }
-    if args.data_type == "multimodal":
-        processor_kwargs["images"] = images
+    if has_image:
+        processor_kwargs["images"] = [img for img in images if img is not None]
 
     inputs = processor(**processor_kwargs).to(model.device)
     outputs = model(**inputs, output_hidden_states=True)
@@ -242,7 +262,7 @@ def generate_sample(batch):
         sequence_length, dtype=torch.long, device=input_ids.device
     ).unsqueeze(0)
 
-    if args.data_type == "multimodal":
+    if has_image:
         input_ids, target, position_ids = remove_visual_span(
             input_ids, target, position_ids
         )
@@ -265,45 +285,38 @@ model, model_config, processor = load_model(args.model_path, args.data_type)
 if args.outdir is None:
     dataset_name = "sharegpt" if args.data_type == "text" else "llava_v1_5_mix665k"
     args.outdir = Path("eval_data/generated") / model_directory_name(args.model_path, model_config) / dataset_name
+
 tokenizer = processor.tokenizer
 assistant_tokens = tokenizer.encode(
     "<|im_start|>assistant\n", add_special_tokens=False
 )
 end_tokens = tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
 
-dataset = load_dataset("json", data_files=args.data_file, split="train")
+output_dir = args.outdir / str(args.index)
+output_dir.mkdir(parents=True, exist_ok=True)
+
+dataset = load_dataset(
+    "json", data_files=str(args.data_file), split="train", features=RECORD_FEATURES
+)
 dataset = dataset.shuffle(seed=args.seed)
-if args.data_type == "multimodal":
-    dataset = dataset.filter(
-        lambda row: row.get("image") is not None
-        and row.get("conversations") is not None
-    )
-else:
-    dataset = dataset.filter(lambda row: row.get("conversations") is not None)
+dataset = dataset.filter(lambda row: row.get("conversations") is not None)
+want_image = args.data_type == "multimodal"
+dataset = dataset.filter(lambda row: record_has_image(row) == want_image)
 end = min(args.end, len(dataset))
 dataset = dataset.select(range(args.start, end))
+
 data_loader = DataLoader(
-    ConversationDataset(dataset, args.data_type, args.image_root),
+    ConversationDataset(dataset),
     batch_size=1,
-    shuffle=True,
+    shuffle=False,
     num_workers=args.num_workers,
     collate_fn=collate_fn,
     pin_memory=True,
 )
 
-if args.data_type == "text":
-    code_output_dir = args.outdir / "code" / str(args.index)
-    non_code_output_dir = args.outdir / "non_code" / str(args.index)
-    code_output_dir.mkdir(parents=True, exist_ok=True)
-    non_code_output_dir.mkdir(parents=True, exist_ok=True)
-else:
-    output_dir = args.outdir / str(args.index)
-    output_dir.mkdir(parents=True, exist_ok=True)
 for batch_index, batch in enumerate(tqdm(data_loader)):
     torch.cuda.empty_cache()
     try:
-        if args.data_type == "text":
-            output_dir = code_output_dir if batch[2][0] else non_code_output_dir
         save_sample(output_dir, generate_sample(batch))
     except Exception as error:
         absolute_index = args.start + batch_index

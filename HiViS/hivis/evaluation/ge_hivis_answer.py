@@ -68,7 +68,9 @@ def run_eval(
     assert num_gpus_total % num_gpus_per_model == 0
     worker_count = num_gpus_total // num_gpus_per_model
     dataset = _dataset_slice(
-        load_benchmark(args.dataset, SAMPLE_COUNT), question_begin, question_end
+        load_benchmark(args.dataset, args.candidate_count),
+        question_begin,
+        question_end,
     )
 
     call_args = (
@@ -167,25 +169,44 @@ def get_model_answers(
         os.makedirs(answer_dir, exist_ok=True)
 
     all_accept_lengths = []
+    completed = 0
     for question_id in tqdm(range(len(dataset))):
-        inputs = prepare_inputs(
-            model, dataset, question_id, args.dataset, truncation=False
-        )
-        input_ids = torch.as_tensor(inputs.input_ids).cuda()
-        if input_ids.shape[1] > 4000:
-            continue
+        if completed >= args.target_samples:
+            break
+        try:
+            inputs = prepare_inputs(
+                model, dataset, question_id, args.dataset, truncation=False
+            )
+            input_ids = torch.as_tensor(inputs.input_ids).cuda()
+            if input_ids.shape[1] > args.max_input_tokens:
+                print(
+                    f"Skipping candidate {question_id}: input length "
+                    f"{input_ids.shape[1]} exceeds {args.max_input_tokens}",
+                    flush=True,
+                )
+                continue
 
-        torch.cuda.synchronize()
-        start_time = time.time()
-        output_ids, new_token, idx, accept_lengths = model.eagenerate(
-            inputs,
-            temperature=temperature,
-            max_new_tokens=max_new_token,
-            is_llama3=args.model_type == "llama-3-instruct",
-            log=True,
-        )
-        torch.cuda.synchronize()
-        elapsed = time.time() - start_time
+            torch.cuda.synchronize()
+            start_time = time.time()
+            output_ids, new_token, idx, accept_lengths = model.eagenerate(
+                inputs,
+                temperature=temperature,
+                max_new_tokens=max_new_token,
+                is_llama3=args.model_type == "llama-3-instruct",
+                log=True,
+            )
+            torch.cuda.synchronize()
+            elapsed = time.time() - start_time
+        except (RuntimeError, ValueError) as error:
+            if not args.skip_errors:
+                raise
+            print(
+                f"Skipping candidate {question_id}: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+            torch.cuda.empty_cache()
+            continue
 
         output_ids = output_ids[0][len(input_ids[0]) :]
         output_ids[output_ids > tokenizer.vocab_size] = 0
@@ -220,6 +241,13 @@ def get_model_answers(
         }
         with open(os.path.expanduser(answer_file), "a", encoding="utf-8") as output:
             output.write(json.dumps(answer) + "\n")
+        completed += 1
+
+    if completed < args.target_samples:
+        raise RuntimeError(
+            f"Only generated {completed} successful answers from {len(dataset)} "
+            f"candidates; target was {args.target_samples}"
+        )
 
     mean_accept_length = sum(all_accept_lengths) / len(all_accept_lengths)
     print(mean_accept_length)
@@ -268,6 +296,14 @@ def build_parser():
     parser.add_argument("--num-gpus-total", type=int, default=1)
     parser.add_argument("--max-gpu-memory")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--target-samples", type=int, default=SAMPLE_COUNT)
+    parser.add_argument("--candidate-count", type=int, default=SAMPLE_COUNT)
+    parser.add_argument("--max-input-tokens", type=int, default=4000)
+    parser.add_argument(
+        "--skip-errors",
+        action="store_true",
+        help="Continue to later candidates when an individual sample fails.",
+    )
     parser.add_argument("--tree-choices", default="mc_sim_7b_63")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--testing", default="try")

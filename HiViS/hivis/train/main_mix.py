@@ -140,31 +140,47 @@ if accelerator.is_main_process:
 
 
 _LM_HEAD_KEY_CANDIDATES = ("language_model.lm_head.weight", "lm_head.weight")
+_EMBED_KEY_CANDIDATES = (
+    "language_model.model.embed_tokens.weight",
+    "model.embed_tokens.weight",
+    "embed_tokens.weight",
+)
 _index_file = os.path.join(base_model_path, "model.safetensors.index.json")
 _single_file = os.path.join(base_model_path, "model.safetensors")
-tensor = None
-if os.path.exists(_index_file):
-    with open(_index_file, "r") as f:
-        _index_json = json.loads(f.read())
-    _weight_map = _index_json["weight_map"]
-    for _key in _LM_HEAD_KEY_CANDIDATES:
-        if _key in _weight_map:
-            _shard = os.path.join(base_model_path, _weight_map[_key])
-            with safe_open(_shard, framework="pt", device="cpu") as f:
-                tensor_slice = f.get_slice(_key)
-                vocab_size, hidden_dim = tensor_slice.get_shape()
-                tensor = tensor_slice[:, :hidden_dim].float()
-            break
-else:
-    with safe_open(_single_file, framework="pt", device="cpu") as f:
-        for _key in _LM_HEAD_KEY_CANDIDATES:
-            try:
-                tensor_slice = f.get_slice(_key)
-                vocab_size, hidden_dim = tensor_slice.get_shape()
-                tensor = tensor_slice[:, :hidden_dim].float()
+
+
+def _load_head_tensor(key_candidates):
+    tensor = None
+    if os.path.exists(_index_file):
+        with open(_index_file, "r") as f:
+            _index_json = json.loads(f.read())
+        _weight_map = _index_json["weight_map"]
+        for _key in key_candidates:
+            if _key in _weight_map:
+                _shard = os.path.join(base_model_path, _weight_map[_key])
+                with safe_open(_shard, framework="pt", device="cpu") as f:
+                    tensor_slice = f.get_slice(_key)
+                    vocab_size, hidden_dim = tensor_slice.get_shape()
+                    tensor = tensor_slice[:, :hidden_dim].float()
                 break
-            except Exception:
-                continue
+    else:
+        with safe_open(_single_file, framework="pt", device="cpu") as f:
+            for _key in key_candidates:
+                try:
+                    tensor_slice = f.get_slice(_key)
+                    vocab_size, hidden_dim = tensor_slice.get_shape()
+                    tensor = tensor_slice[:, :hidden_dim].float()
+                    break
+                except Exception:
+                    continue
+    return tensor
+
+
+tensor = _load_head_tensor(_LM_HEAD_KEY_CANDIDATES)
+if tensor is None and getattr(baseconfig, "tie_word_embeddings", False):
+    # Tied embeddings: no separate lm_head.weight is saved; the embedding
+    # table doubles as the output projection.
+    tensor = _load_head_tensor(_EMBED_KEY_CANDIDATES)
 if tensor is None:
     raise KeyError(f"Could not find lm_head weight in {base_model_path}")
 

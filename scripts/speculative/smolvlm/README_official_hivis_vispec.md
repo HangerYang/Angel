@@ -13,7 +13,10 @@ Both share the same two-stage trainer (`hivis.train.main_mix` then
 `.ge_data` generation step and output directories differ.
 
 Verified working end-to-end (generate -> stage1 -> stage2) on 2026-08-27 after
-fixing four bugs blocking the SmolVLM path (see "Bugs fixed" below).
+fixing four bugs blocking the SmolVLM path (see "Bugs fixed" below), and
+re-verified on 2026-08-28 via `train_official_hivis_smolvlm.sh` directly
+(1 GPU, 40 samples, 1 epoch/stage) after fixing two more issues that surfaced
+running it end-to-end through that exact script (see "Bugs fixed" below).
 
 ## Prerequisites
 
@@ -131,6 +134,43 @@ sample): the "Train Accuracy" print in both `main_mix.py` and
 be 0 on a very small/short batch, crashing *after* the epoch's loss was
 already computed and *before* `accelerator.save_state(...)` — losing that
 epoch's checkpoint. Now guarded to print 0.00% instead of raising.
+
+## Bugs fixed to make this runnable (2026-08-28)
+
+Found running `train_official_hivis_smolvlm.sh` directly end-to-end
+(`STAGE=all`) for the first time with this exact script:
+
+5. **`run_stage2()` pointed `--text-data-dir` at `"$TEXT_CKPT_DIR/non_code"`,
+   but `ge_data_smolvlm.py`'s `generate` step never creates a `non_code`
+   subdirectory** (it has no code/non-code split at all — the shared dataset
+   has no `is_code` field). Stage 2 would raise `FileNotFoundError:
+   text training data directory does not exist: .../non_code` the first
+   time it actually ran end-to-end via this script. Fixed: stage 1 and
+   stage 2 now both point at the same `$TEXT_CKPT_DIR`.
+6. **The launcher relied on bare `python`/`accelerate` from `$PATH`.**
+   Fine interactively with `conda activate hivis` already active, but
+   running non-interactively (`nohup ... &` from a shell that hadn't
+   activated any env) resolved `python` to a different env missing
+   `torchvision`, crashing immediately in the `generate` step. Fixed by
+   prepending `/home/hyang/anaconda3/envs/hivis/bin` to `$PATH` inside the
+   script itself (override via `HIVIS_CONDA_ENV`).
+
+Re-verified end-to-end after both fixes: 1 GPU, 40 samples, 1 epoch/stage,
+real checkpoints saved at `stage1/state_0` and `stage2/state_0` (`state_1`
+too — `--num-epochs 1` saves two checkpoints, an off-by-one in the epoch
+loop, not investigated further since it doesn't block anything).
+
+Note: `ge_data_smolvlm.py` still doesn't do a real text/multimodal split —
+`--data-type` is accepted for output-directory naming only, so both the
+"text" and "multimodal" `generate` calls process the *same* full mixed pool
+and write duplicate content into both `TEXT_CKPT_DIR` and
+`MULTIMODAL_CKPT_DIR`. Harmless (`main_mix.py`'s `list_files()` just
+concatenates both directories into one training pool regardless of the
+label), but doubles `generate`'s compute and disk versus a real split.
+`ge_data_qwen.py` was rewritten with a real split for the Qwen2.5-VL-3B
+recipe (see `scripts/speculative/qwen2_5_vl/README_official_hivis_qwen3b.md`)
+— porting the same real-split filtering to `ge_data_smolvlm.py` would apply
+here too, not done in this pass.
 
 ## Known caveat (not fixed, out of scope for training)
 

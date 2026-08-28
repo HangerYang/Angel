@@ -287,7 +287,17 @@ class LlamaAttention(nn.Module):
         kv_seq_len = key_states[0].shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states[0], seq_len=kv_seq_len)
+        if position_ids is None:
+            rope_seq_len = kv_seq_len
+        else:
+            # position_ids can have gaps (e.g. Qwen2.5-VL samples with an
+            # image-token span removed), so the rope cache must cover the
+            # largest position actually referenced, not just the tensor's
+            # raw sequence length -- see cnets_res.py's identical branch.
+            # kv_seq_len itself must stay the real key length: it's reused
+            # below in the attn_weights shape assertion.
+            rope_seq_len = position_ids.max() + 1
+        cos, sin = self.rotary_emb(value_states[0], seq_len=rope_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
