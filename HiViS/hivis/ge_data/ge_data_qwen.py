@@ -3,15 +3,19 @@
 Handles the same role/content dataset format as ge_data_smolvlm.py, where
 image entries carry either absolute file paths or base64 data URIs
 (data:image/...;base64,...). One pass over the input file loads the model
-once and routes each record to --outdir (text) or --multimodal-outdir
-(has an image) based on its own content -- so a single mixed input file
-produces a genuine, disjoint split without generating twice.
+once and routes each record based on its own content: has an image ->
+--multimodal-outdir; text-only -> --outdir/code or --outdir/non_code
+(HiViS's own is_code_heavy() heuristic, verbatim from
+eval_data/sharegpt/prepare_data.py, applied to the assistant turns) -- so a
+single mixed input file produces the same three-way split HiViS's stock
+two-file pipeline does, without generating twice.
 """
 
 import argparse
 import base64
 import io
 import os
+import re
 from pathlib import Path
 
 
@@ -19,6 +23,24 @@ DEFAULT_MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_DATA = "dataset/preprocessed/mixed_sharegpt_llava665k_70k70k_b64.jsonl"
 VISION_START_TOKEN_ID = 151652
 IMAGE_TOKEN_ID = 151655
+
+# Verbatim from eval_data/sharegpt/prepare_data.py's is_code_heavy(), so a
+# text record lands in the same code/non_code bucket HiViS's own stock
+# pipeline would put it in.
+CODE_KEYWORDS = ("def ", "class ", "import ", "return", "#include", "public ", "private ", "func ", "let ", "var ")
+
+
+def is_code_heavy(text, code_ratio_threshold=0.3, symbol_ratio_threshold=0.1):
+    if not text:
+        return False
+    code_characters = sum(len(block) for block in re.findall(r"```.*?```", text, flags=re.DOTALL))
+    symbol_count = len(re.findall(r"[@{}();<>/=+\-_*]", text))
+    keyword_count = sum(keyword in text for keyword in CODE_KEYWORDS)
+    return (
+        code_characters / len(text) >= code_ratio_threshold
+        or symbol_count / len(text) >= symbol_ratio_threshold
+        or keyword_count > 2
+    )
 
 
 def parse_args():
@@ -128,6 +150,18 @@ def record_has_image(record):
     )
 
 
+def assistant_text(record):
+    """Join assistant-turn text, matching prepare_data.py's ' '.join(gpt_values)."""
+    parts = []
+    for turn in record["conversations"]:
+        if turn.get("role") != "assistant":
+            continue
+        parts.append(
+            " ".join(e.get("text", "") for e in turn.get("content", []) if e.get("type") == "text")
+        )
+    return " ".join(parts)
+
+
 def record_to_messages_and_image(record):
     """Convert role/content format to HF messages list and load the first image."""
     conversations = record["conversations"]
@@ -162,15 +196,17 @@ class ConversationDataset(Dataset):
     def __getitem__(self, index):
         record = self.dataset[index]
         messages, image = record_to_messages_and_image(record)
-        return messages, image, record_has_image(record)
+        has_image = record_has_image(record)
+        is_code = False if has_image else is_code_heavy(assistant_text(record))
+        return messages, image, has_image, is_code
 
 
 def collate_fn(batch):
-    conversations, images, has_image = zip(*batch)
+    conversations, images, has_image, is_code = zip(*batch)
     prompt = processor.apply_chat_template(
         conversations[0], add_generation_prompt=True
     )
-    return prompt, list(images), has_image[0]
+    return prompt, list(images), has_image[0], is_code[0]
 
 
 def build_visual_keep_mask(input_ids):
@@ -242,7 +278,7 @@ def build_loss_mask(input_ids, assistant_tokens, end_tokens):
 
 @torch.no_grad()
 def generate_sample(batch):
-    prompt, images, has_image = batch
+    prompt, images, has_image, _is_code = batch
     processor_kwargs = {
         "text": [prompt],
         "return_tensors": "pt",
@@ -296,9 +332,11 @@ assistant_tokens = tokenizer.encode(
 )
 end_tokens = tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
 
-text_output_dir = args.outdir / str(args.index)
+code_output_dir = args.outdir / "code" / str(args.index)
+non_code_output_dir = args.outdir / "non_code" / str(args.index)
 multimodal_output_dir = args.multimodal_outdir / str(args.index)
-text_output_dir.mkdir(parents=True, exist_ok=True)
+code_output_dir.mkdir(parents=True, exist_ok=True)
+non_code_output_dir.mkdir(parents=True, exist_ok=True)
 multimodal_output_dir.mkdir(parents=True, exist_ok=True)
 
 dataset = load_dataset(
@@ -321,7 +359,11 @@ data_loader = DataLoader(
 for batch_index, batch in enumerate(tqdm(data_loader)):
     torch.cuda.empty_cache()
     try:
-        output_dir = multimodal_output_dir if batch[2] else text_output_dir
+        _, _, has_image, is_code = batch
+        if has_image:
+            output_dir = multimodal_output_dir
+        else:
+            output_dir = code_output_dir if is_code else non_code_output_dir
         save_sample(output_dir, generate_sample(batch))
     except Exception as error:
         absolute_index = args.start + batch_index

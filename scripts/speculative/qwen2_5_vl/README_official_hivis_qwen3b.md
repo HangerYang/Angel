@@ -40,12 +40,16 @@ Unlike `ge_data_smolvlm.py` (which writes the same full mixed pass into both
 `--text-data-dir` and `--multimodal-data-dir` — `main_mix.py`'s `list_files()`
 just concatenates whatever files exist in each directory into one training
 pool, it doesn't care whether the split is real), `ge_data_qwen.py` loads the
-target model and the mixed file **once** and routes each record to `--outdir`
-(text) or `--multimodal-outdir` (has an image) based on that record's own
-content. `sharegpt/` and `llava_v1_5_mix665k/` end up a genuine disjoint
-partition of the one mixed file, at the cost of one model load and one pass
-over the data — not two of each, which is what an earlier version of this
-script did (see "Bugs fixed" below).
+target model and the mixed file **once** and routes each record based on its
+own content: has an image -> `--multimodal-outdir`; text-only -> `--outdir`,
+further split into `code/`/`non_code/` subdirectories via HiViS's own
+`is_code_heavy()` heuristic (verbatim from `eval_data/sharegpt/prepare_data.py`,
+applied to the assistant turns). This is the same three-way split HiViS's
+stock two-file pipeline produces (`sharegpt/{code,non_code}/`,
+`llava_v1_5_mix665k/`), from one input file and one model load/pass instead
+of two of each (see "Bugs fixed" below) — and it's what makes stage 2's
+`--text-data-dir=$TEXT_CKPT_DIR/non_code` (below) a real, populated directory
+rather than the placeholder it used to be.
 
 ## Draft config
 
@@ -147,21 +151,22 @@ the same per-GPU memory ceiling regardless of GPU *count*. Lower `BS_STAGE1`/
    via `<|vision_start|>`/`<|image_pad|>` token IDs, `<|im_start|>`/`<|im_end|>`
    chat tokens, `position_ids` output required by `main_mix.py`'s
    `use_qwen_position_ids` path).
-3. **Avoided reproducing a latent SmolVLM-pipeline bug.**
-   `train_official_hivis_smolvlm.sh`'s `run_stage2()` points
-   `--text-data-dir` at `"$TEXT_CKPT_DIR/non_code"`, but
+3. **Avoided reproducing a latent SmolVLM-pipeline bug, initially by
+   sidestepping the split entirely — later (2026-08-29) by actually
+   implementing it.** `train_official_hivis_smolvlm.sh`'s `run_stage2()`
+   points `--text-data-dir` at `"$TEXT_CKPT_DIR/non_code"`, but
    `ge_data_smolvlm.py`'s `generate` step never creates a `non_code`
    subdirectory (no code/non-code split anywhere in that script) — so stage 2
-   would raise `FileNotFoundError` the first time it actually runs. Not fixed
-   there (out of scope, and that queued run never got far enough to hit it —
-   see the SmolVLM training queue script, which was still waiting on an
-   unrelated 8-GPU job when this was written). For Qwen2.5-VL-3B, stage 1 and
-   stage 2 both point `--text-data-dir` at the same `$TEXT_CKPT_DIR` here, no
-   `/non_code` suffix — `ge_data_qwen.py` has no code/non-code concept either
-   (the shared dataset has no `is_code` field), and `main_mix.py`'s
-   `list_files()` treats the text/multimodal label as cosmetic (log text
-   only) regardless, so there's no functional reason to introduce a split
-   that doesn't exist upstream of it.
+   would raise `FileNotFoundError` the first time it actually runs. Still not
+   fixed there (out of scope for the SmolVLM script). For Qwen2.5-VL-3B,
+   this README originally had stage 1 and stage 2 both point at the same
+   `$TEXT_CKPT_DIR` (no split at all, since the shared dataset has no
+   `is_code` field and `main_mix.py`'s `list_files()` treats the label as
+   cosmetic either way) — since superseded: `ge_data_qwen.py` now computes
+   `is_code` itself (HiViS's own heuristic, applied to the assistant turns)
+   and writes a real `code/`/`non_code/` split, so stage 2 now points at
+   `$TEXT_CKPT_DIR/non_code` for real, matching HiViS's actual stage 2
+   recipe. See "text vs. multimodal split" above.
 4. **The launcher relied on bare `python`/`accelerate` from `$PATH`.**
    `train_official_hivis_smolvlm.sh` does the same — presumably relying on
    `conda activate hivis` (or similar) already being active in the caller's

@@ -7,16 +7,19 @@
 # Stages:
 #   STAGE=generate          generate official HiViS .ckpt data from the mixed JSONL
 #                           (one pass: loads the target model once and routes
-#                           each record to the text or multimodal output dir
-#                           based on its own content -- see ge_data_qwen.py)
+#                           each record based on its own content -- has an
+#                           image -> multimodal; text-only -> code/non_code
+#                           via HiViS's own is_code_heavy() heuristic -- see
+#                           ge_data_qwen.py)
 #   STAGE=stage1            run official hivis.train.main_mix
 #   STAGE=stage2            run official hivis.train.main_mix_topk_dyn_res
 #   STAGE=all               generate, stage1, stage2
 #
-# Also: stage2 here points at the same text-data-dir as stage1 (no /non_code
-# subfolder) -- ge_data_qwen.py never creates a non_code split, so pointing
-# stage2 at "$TEXT_CKPT_DIR/non_code" the way the SmolVLM script does would
-# raise FileNotFoundError the first time stage2 actually runs.
+# Stage 1 points --text-data-dir at $TEXT_CKPT_DIR (main_mix.py's
+# list_files() recurses, so it picks up both code/ and non_code/). Stage 2
+# points at $TEXT_CKPT_DIR/non_code only, matching HiViS's own stage2
+# recipe (README: --text-data-dir=.../sharegpt/non_code) -- non_code is a
+# real subdirectory now that ge_data_qwen.py classifies text records.
 
 set -euo pipefail
 
@@ -118,7 +121,7 @@ run_stage2() {
   CUDA_VISIBLE_DEVICES="$GPU_CSV" accelerate launch -m "${ACCELERATE_MULTI_GPU_ARGS[@]}" --mixed_precision=bf16 hivis.train.main_mix_topk_dyn_res \
     --basepath "$TARGET_MODEL_NAME_OR_PATH" \
     --configpath "$CONFIG_PATH" \
-    --text-data-dir "$TEXT_CKPT_DIR" \
+    --text-data-dir "$TEXT_CKPT_DIR/non_code" \
     --multimodal-data-dir "$MULTIMODAL_CKPT_DIR" \
     --ckpt_path "$STAGE1_CKPT" \
     --cpdir "$STAGE2_DIR" \
