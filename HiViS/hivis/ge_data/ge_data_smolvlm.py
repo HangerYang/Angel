@@ -1,13 +1,13 @@
 """Generate hidden-state data from a SmolVLM (Idefics3) model for HiViS training.
 
-Handles the role/content dataset format where image entries carry either
-absolute file paths or base64 data URIs (data:image/...;base64,...),
-auto-detecting whether each record is text-only or multimodal.
+Model-specific parts only -- see common.py for the schema/loss-mask/is_code
+logic shared with ge_data_qwen.py. One pass over the input file loads the
+model once and routes each record based on its own content: has an image ->
+--multimodal-outdir; text-only -> --outdir/code or --outdir/non_code (HiViS's
+own is_code_heavy() heuristic, applied to the assistant turns).
 """
 
 import argparse
-import base64
-import io
 import os
 from pathlib import Path
 
@@ -31,7 +31,15 @@ def parse_args():
         nargs="+",
         default=[0],
     )
-    parser.add_argument("--outdir", type=Path, default=None)
+    parser.add_argument(
+        "--outdir", type=Path, default=None, help="Output directory for text-only records."
+    )
+    parser.add_argument(
+        "--multimodal-outdir",
+        type=Path,
+        default=None,
+        help="Output directory for records with at least one image.",
+    )
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--data-file", default=DEFAULT_DATA)
     parser.add_argument("--max-length", type=int, default=2048)
@@ -45,37 +53,20 @@ args = parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_index))
 
 import torch
-from datasets import Features, Value, load_dataset
-from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, Idefics3ForConditionalGeneration
 
-# Content items are either {"type": "text", "text": ...} or {"type": "image",
-# "image": ...}. Without an explicit schema, datasets' JSON loader infers the
-# "content" struct type from the first chunk it reads; since text-only and
-# multimodal records live in different regions of the file, later chunks fail
-# to cast into that narrower inferred schema. Fixing the schema up front
-# avoids the mismatch.
-RECORD_FEATURES = Features(
-    {
-        "id": Value("string"),
-        "conversations": [
-            {
-                "role": Value("string"),
-                "content": [
-                    {
-                        "type": Value("string"),
-                        "text": Value("string"),
-                        "image": Value("string"),
-                    }
-                ],
-            }
-        ],
-    }
+from .common import (
+    assistant_text,
+    build_loss_mask,
+    is_code_heavy,
+    load_record_dataset,
+    record_has_image,
+    record_to_messages_and_image,
+    save_sample,
 )
-
 from .model_names import model_directory_name
 
 
@@ -94,41 +85,6 @@ def load_model(model_path):
     return model, config, AutoProcessor.from_pretrained(model_path)
 
 
-def load_image_field(img_ref):
-    """Load a PIL image from either a base64 data URI or a file path."""
-    if img_ref.startswith("data:image/"):
-        _, _, b64_data = img_ref.partition(",")
-        with Image.open(io.BytesIO(base64.b64decode(b64_data))) as opened:
-            return opened.convert("RGB").copy()
-    with Image.open(img_ref) as opened:
-        return opened.convert("RGB").copy()
-
-
-def record_to_messages_and_image(record):
-    """Convert role/content format to HF messages list and load the first image."""
-    conversations = record["conversations"]
-    messages = []
-    image = None
-    for turn in conversations:
-        role = turn["role"]  # "user" or "assistant"
-        content_entries = turn["content"]
-        new_content = []
-        for entry in content_entries:
-            entry_type = entry.get("type")
-            if entry_type == "image":
-                img_path = entry.get("image", "")
-                if img_path and image is None:
-                    try:
-                        image = load_image_field(img_path)
-                    except Exception as exc:
-                        print(f"Could not load image {img_path[:80]}: {exc}")
-                new_content.append({"type": "image"})
-            elif entry_type == "text":
-                new_content.append({"type": "text", "text": entry.get("text", "")})
-        messages.append({"role": role, "content": new_content})
-    return messages, image
-
-
 class ConversationDataset(Dataset):
     def __init__(self, dataset):
         self.dataset = dataset
@@ -139,15 +95,17 @@ class ConversationDataset(Dataset):
     def __getitem__(self, index):
         record = self.dataset[index]
         messages, image = record_to_messages_and_image(record)
-        return messages, image
+        has_image = record_has_image(record)
+        is_code = False if has_image else is_code_heavy(assistant_text(record))
+        return messages, image, has_image, is_code
 
 
 def collate_fn(batch):
-    conversations, images = zip(*batch)
+    conversations, images, has_image, is_code = zip(*batch)
     prompt = processor.apply_chat_template(
         conversations[0], add_generation_prompt=True
     )
-    return prompt, list(images)
+    return prompt, list(images), has_image[0], is_code[0]
 
 
 def remove_image_tokens(input_ids, target, image_token_id):
@@ -163,42 +121,9 @@ def remove_image_tokens(input_ids, target, image_token_id):
     )
 
 
-def build_loss_mask(input_ids, assistant_tokens, end_tokens):
-    loss_mask = torch.zeros_like(input_ids)
-    asst_len = len(assistant_tokens)
-    end_len = len(end_tokens)
-    for bi, tokens in enumerate(input_ids.cpu()):
-        asst_start = None
-        i = 0
-        while i < tokens.numel():
-            if (
-                asst_start is None
-                and i <= tokens.numel() - asst_len
-                and tokens[i : i + asst_len].tolist() == assistant_tokens
-            ):
-                asst_start = i + asst_len
-                i += asst_len
-                continue
-            if (
-                asst_start is not None
-                and i <= tokens.numel() - end_len
-                and tokens[i : i + end_len].tolist() == end_tokens
-            ):
-                loss_mask[bi, asst_start:i] = 1
-                asst_start = None
-                i += end_len
-                continue
-            i += 1
-        if asst_start is not None:
-            end = -asst_len if asst_len else None
-            loss_mask[bi, asst_start:end] = 1
-    return loss_mask
-
-
 @torch.no_grad()
 def generate_sample(batch):
-    prompt, images = batch
-    has_image = any(img is not None for img in images)
+    prompt, images, has_image, _is_code = batch
     processor_kwargs = {
         "text": [prompt],
         "return_tensors": "pt",
@@ -223,17 +148,12 @@ def generate_sample(batch):
     }
 
 
-def save_sample(output_dir, sample):
-    sample_index = len(list(output_dir.glob("data_*.ckpt")))
-    torch.save(sample, output_dir / f"data_{sample_index}.ckpt")
-
-
 model, model_config, processor = load_model(args.model_path)
 if args.outdir is None:
-    args.outdir = (
-        Path("eval_data/generated")
-        / model_directory_name(args.model_path, model_config)
-        / "smolvlm_mixed"
+    args.outdir = Path("eval_data/generated") / model_directory_name(args.model_path, model_config) / "sharegpt"
+if args.multimodal_outdir is None:
+    args.multimodal_outdir = (
+        Path("eval_data/generated") / model_directory_name(args.model_path, model_config) / "smolvlm_mixed"
     )
 
 tokenizer = processor.tokenizer
@@ -241,12 +161,14 @@ assistant_tokens = tokenizer.encode("Assistant:", add_special_tokens=False)
 end_tokens = tokenizer.encode("<end_of_utterance>", add_special_tokens=False)
 image_token_id = model_config.image_token_id
 
-output_dir = args.outdir / str(args.index)
-output_dir.mkdir(parents=True, exist_ok=True)
+code_output_dir = args.outdir / "code" / str(args.index)
+non_code_output_dir = args.outdir / "non_code" / str(args.index)
+multimodal_output_dir = args.multimodal_outdir / str(args.index)
+code_output_dir.mkdir(parents=True, exist_ok=True)
+non_code_output_dir.mkdir(parents=True, exist_ok=True)
+multimodal_output_dir.mkdir(parents=True, exist_ok=True)
 
-dataset = load_dataset(
-    "json", data_files=str(args.data_file), split="train", features=RECORD_FEATURES
-)
+dataset = load_record_dataset(args.data_file)
 dataset = dataset.shuffle(seed=args.seed)
 dataset = dataset.filter(lambda row: row.get("conversations") is not None)
 end = min(args.end, len(dataset))
@@ -264,6 +186,11 @@ data_loader = DataLoader(
 for batch_index, batch in enumerate(tqdm(data_loader)):
     torch.cuda.empty_cache()
     try:
+        _, _, has_image, is_code = batch
+        if has_image:
+            output_dir = multimodal_output_dir
+        else:
+            output_dir = code_output_dir if is_code else non_code_output_dir
         save_sample(output_dir, generate_sample(batch))
     except Exception as error:
         absolute_index = args.start + batch_index

@@ -32,6 +32,14 @@ parser.add_argument('--outdir', type=str, default='outdir1')
 parser.add_argument('--cpdir', type=str, default='checkpoints/stage1')
 parser.add_argument('--num-epochs', dest='num_epochs', type=int, default=20)
 parser.add_argument('--max-len', dest='max_len', type=int, default=4096)
+parser.add_argument(
+    '--ddp-backend',
+    dest='ddp_backend',
+    type=str,
+    default=None,
+    choices=('nccl', 'gloo'),
+    help='torch.distributed backend for multi-GPU DDP. Default: unset, accelerate/torch picks nccl on CUDA.',
+)
 
 args = parser.parse_args()
 
@@ -75,11 +83,15 @@ import torch
 
 torch.backends.cuda.matmul.allow_tf32 = True
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import InitProcessGroupKwargs, set_seed
 
 set_seed(0)
+_accelerator_kwargs = {}
+if args.ddp_backend:
+    _accelerator_kwargs["kwargs_handlers"] = [InitProcessGroupKwargs(backend=args.ddp_backend)]
 accelerator = Accelerator(mixed_precision='bf16',
-                          gradient_accumulation_steps=train_config["gradient_accumulation_steps"])
+                          gradient_accumulation_steps=train_config["gradient_accumulation_steps"],
+                          **_accelerator_kwargs)
 
 from .cnets_res import Model
 from .model_paths import is_qwen_model, resolve_base_model_path

@@ -8,13 +8,16 @@ from pathlib import Path
 
 from .model_names import DEFAULT_MODEL_PATHS, model_directory_name
 
+# qwen and smolvlm do one pass over the file and route each record to
+# --outdir/--multimodal-outdir themselves (see ge_data_qwen.py/
+# ge_data_smolvlm.py), so they have no use for --data-type. llava and
+# smolvlm_vispec still take separate text/multimodal passes.
+SINGLE_PASS_MODELS = ("qwen", "smolvlm")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=("llava", "qwen", "smolvlm", "smolvlm_vispec"), default="llava")
-    # qwen does one pass over the file and routes each record to
-    # --outdir/--multimodal-outdir itself (see ge_data_qwen.py), so it has no
-    # use for --data-type. llava still takes separate text/multimodal passes.
     parser.add_argument("--data-type", choices=("text", "multimodal"), default=None)
     parser.add_argument("--gpus", type=int, nargs="+", required=True)
     parser.add_argument("--start", type=int, default=0)
@@ -39,11 +42,11 @@ def parse_args():
     args = parser.parse_args()
     if args.start < 0 or args.end < args.start:
         parser.error("require 0 <= --start <= --end")
-    if args.model != "qwen" and args.data_type is None:
+    if args.model not in SINGLE_PASS_MODELS and args.data_type is None:
         parser.error(f"--data-type is required for --model {args.model}")
     if args.model_path is None:
         args.model_path = DEFAULT_MODEL_PATHS[args.model]
-    if args.model == "qwen":
+    if args.model in SINGLE_PASS_MODELS:
         if args.outdir is None:
             args.outdir = Path("eval_data/generated") / model_directory_name(args.model_path) / "sharegpt"
         if args.multimodal_outdir is None:
@@ -91,7 +94,7 @@ def count_data_file_rows(data_file):
 def build_command(args, worker_index, gpu, start, end):
     module = f"hivis.ge_data.ge_data_{args.model}"
     command = [sys.executable, "-m", module]
-    if args.model == "qwen":
+    if args.model in SINGLE_PASS_MODELS:
         command += ["--outdir", str(args.outdir), "--multimodal-outdir", str(args.multimodal_outdir)]
     else:
         if args.model == "llava":
@@ -131,7 +134,7 @@ def run(command):
 def main():
     args = parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
-    if args.model == "qwen":
+    if args.model in SINGLE_PASS_MODELS:
         args.multimodal_outdir.mkdir(parents=True, exist_ok=True)
 
     total_rows = count_data_file_rows(args.data_file)
