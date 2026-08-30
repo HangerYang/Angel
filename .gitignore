@@ -32,6 +32,8 @@ dataset/smolvlm_256m_target_gen/eval.jsonl
 dataset/raw/
 dataset/angelslim-smolvlm-eagle3-artifacts/
 dataset/hivis_smolvlm_256m_generated/
+dataset/hivis_smolvlm_256m_generated_artifacts/
+dataset/hivis_smolvlm_256m_generated_artifacts_smoke/
 dataset/smolvlm_256m_target_gen_long_prompt/
 dataset/vispec_smolvlm_256m_generated/
 
