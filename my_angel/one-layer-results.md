@@ -45,9 +45,6 @@ speculation to pay — which is why this sweep, not the default one, is the reco
 | `no_eagle_baseline` | target only, no speculative decoding |
 | `baseline_1layer` | stock EAGLE-3: 3 aux layers, 3H→H fusion FC, 2H layer 0 |
 | `banded_mix_fc_3.1` | 9 aux layers → 3 learned band mixes → 3H→H FC, EAGLE 3.1 |
-| `banded_mix_wide_3.1` | same 3 band mixes, **no** FC: 4H layer 0 `[emb｜band0｜band1｜seed]` |
-| `branch_distill_top1_w01` | `banded_mix_fc_3.1` + branch-aware distillation (draft top-1 vs teacher top-3, w=0.1, 1 step) |
-| `vistoken_k1` | `banded_mix_fc_3.1` + learned-query row compression: each tile's 64 visual rows → k=1 summary |
 | `branch_change_top1_w01` | `banded_mix_fc_3.1` + branch-change distillation: where the draft's top-1 is not the teacher's but sits in the teacher's top-3, fork one draft step onto that token and match the teacher's centered-logit *delta* (w=0.1, 1 step). The default. |
 
 ## Prompt
@@ -75,10 +72,7 @@ itself is unchanged. How each benchmark is treated:
 |---|---|---|---|---|---|---|---|---|---|
 | `baseline_1layer` | 2.373 | 2.484 | 2.594 | 3.070 | 2.515 | 2.043 | 2.531 | 2.454 | **2.508** |
 | `banded_mix_fc_3.1` | 2.626 | 2.656 | 2.809 | 3.532 | 2.700 | 2.214 | 2.576 | 2.535 | **2.706** |
-| `branch_ratio_t02_top1_w01` | 2.545 | 2.687 | 2.814 | 3.508 | 2.632 | 2.181 | 2.642 | 2.516 | **2.691** |
-| `branch_change_top1_w01` | 2.590 | **2.867** | **2.977** | **3.605** | **2.774** | 2.217 | **2.939** | **2.551** | **2.815** |
-| *`branch_change_top2_curr_r33k`* | 2.620 | 2.755 | 2.884 | 3.577 | 2.676 | 2.221 | 2.840 | 2.540 | **2.764** |
-| *`branch_change_top2_curr_synth_r33k`* | **2.631** | 2.762 | 2.890 | 3.581 | 2.699 | **2.230** | 2.786 | 2.534 | **2.764** |
+| `branch_change_top1_w01` | 2.590 | 2.867 | 2.977 | 3.605 | 2.774 | 2.217 | 2.939 | 2.551 | **2.815** |
 
 ### Throughput (tok/s)
 
@@ -86,22 +80,16 @@ itself is unchanged. How each benchmark is treated:
 |---|---|---|---|---|---|---|---|---|---|
 | `no_eagle_baseline` | 180.6 | 199.4 | 207.4 | 207.9 | 186.2 | 185.5 | 180.3 | 205.7 | **194.1** |
 | `baseline_1layer` | 254.3 | 324.5 | 361.2 | 424.9 | 292.0 | 246.3 | 283.9 | 334.1 | **315.2** |
-| `banded_mix_fc_3.1` | **279.5** | 332.4 | 370.9 | 475.2 | 295.3 | 257.4 | 268.5 | 335.2 | **326.8** |
-| `branch_ratio_t02_top1_w01` | 264.3 | 336.8 | 372.4 | 468.8 | 292.1 | 260.3 | 274.6 | 333.1 | **325.3** |
-| `branch_change_top1_w01` | 266.7 | **359.6** | **391.1** | **497.3** | **307.1** | **261.2** | **299.2** | 335.1 | **339.7** |
-| *`branch_change_top2_curr_r33k`* | 269.6 | 344.2 | 374.0 | 481.3 | 297.7 | 257.6 | 298.5 | 338.0 | **332.6** |
-| *`branch_change_top2_curr_synth_r33k`* | 276.7 | 345.3 | 381.3 | 475.8 | 295.8 | 260.5 | 285.4 | **342.0** | **332.9** |
+| `banded_mix_fc_3.1` | 279.5 | 332.4 | 370.9 | 475.2 | 295.3 | 257.4 | 268.5 | 335.2 | **326.8** |
+| `branch_change_top1_w01` | 266.7 | 359.6 | 391.1 | 497.3 | 307.1 | 261.2 | 299.2 | 335.1 | **339.7** |
 
 ### Speedup vs `no_eagle_baseline`
 
 | run | MMStar | MMMU | OmniDocBench | MATH-500 | textvqa | chartqa | mathvista | COCO-Caption | mean |
 |---|---|---|---|---|---|---|---|---|---|
 | `baseline_1layer` | 1.408x | 1.628x | 1.742x | 2.044x | 1.568x | 1.328x | 1.575x | 1.624x | **1.615x** |
-| `banded_mix_fc_3.1` | **1.548x** | 1.667x | 1.789x | 2.286x | 1.586x | 1.388x | 1.489x | 1.629x | **1.673x** |
-| `branch_ratio_t02_top1_w01` | 1.463x | 1.689x | 1.796x | 2.255x | 1.569x | 1.404x | 1.523x | 1.619x | **1.665x** |
-| `branch_change_top1_w01` | 1.477x | **1.804x** | **1.886x** | **2.392x** | **1.650x** | **1.408x** | **1.660x** | 1.629x | **1.738x** |
-| *`branch_change_top2_curr_r33k`* | 1.493x | 1.726x | 1.804x | 2.315x | 1.599x | 1.389x | 1.656x | 1.643x | **1.703x** |
-| *`branch_change_top2_curr_synth_r33k`* | 1.532x | 1.732x | 1.839x | 2.289x | 1.589x | 1.405x | 1.583x | **1.662x** | **1.704x** |
+| `banded_mix_fc_3.1` | 1.548x | 1.667x | 1.789x | 2.286x | 1.586x | 1.388x | 1.489x | 1.629x | **1.673x** |
+| `branch_change_top1_w01` | 1.477x | 1.804x | 1.886x | 2.392x | 1.650x | 1.408x | 1.660x | 1.629x | **1.738x** |
 
 ## Results — temp 1
 
@@ -111,33 +99,24 @@ itself is unchanged. How each benchmark is treated:
 |---|---|---|---|---|---|---|---|---|---|
 | `baseline_1layer` | 1.478 | 1.335 | 1.302 | 1.490 | 1.379 | 1.245 | 1.496 | 1.424 | **1.394** |
 | `banded_mix_fc_3.1` | 1.553 | 1.368 | 1.296 | 1.630 | 1.430 | 1.245 | 1.481 | 1.433 | **1.429** |
-| `branch_ratio_t02_top1_w01` | 1.527 | **1.385** | 1.309 | 1.596 | 1.401 | 1.227 | **1.598** | 1.422 | **1.433** |
-| `branch_change_top1_w01` | **1.604** | 1.371 | 1.327 | 1.616 | **1.450** | 1.261 | 1.525 | 1.435 | **1.449** |
-| *`branch_change_top2_curr_r33k`* | 1.534 | 1.378 | **1.401** | **1.633** | 1.413 | **1.265** | 1.507 | 1.437 | **1.446** |
-| *`branch_change_top2_curr_synth_r33k`* | 1.488 | 1.371 | 1.335 | 1.581 | 1.395 | 1.232 | 1.537 | **1.443** | **1.422** |
+| `branch_change_top1_w01` | 1.604 | 1.371 | 1.327 | 1.616 | 1.450 | 1.261 | 1.525 | 1.435 | **1.449** |
 
 ### Throughput (tok/s)
 
 | run | MMStar | MMMU | OmniDocBench | MATH-500 | textvqa | chartqa | mathvista | COCO-Caption | mean |
 |---|---|---|---|---|---|---|---|---|---|
-| `no_eagle_baseline` | **171.5** | **197.3** | **200.8** | 208.2 | **195.0** | **189.5** | 172.4 | **205.1** | **192.5** |
+| `no_eagle_baseline` | 171.5 | 197.3 | 200.8 | 208.2 | 195.0 | 189.5 | 172.4 | 205.1 | **192.5** |
 | `baseline_1layer` | 163.7 | 178.7 | 176.8 | 209.5 | 174.8 | 160.0 | 179.6 | 196.3 | **179.9** |
-| `banded_mix_fc_3.1` | 156.1 | 175.3 | 174.5 | **221.5** | 178.4 | 156.3 | 167.9 | 195.9 | **178.2** |
-| `branch_ratio_t02_top1_w01` | 166.3 | 175.9 | 171.1 | 221.4 | 173.0 | 152.3 | **182.0** | 193.5 | **179.4** |
+| `banded_mix_fc_3.1` | 156.1 | 175.3 | 174.5 | 221.5 | 178.4 | 156.3 | 167.9 | 195.9 | **178.2** |
 | `branch_change_top1_w01` | 155.5 | 181.3 | 174.2 | 217.9 | 182.8 | 157.4 | 170.7 | 193.3 | **179.1** |
-| *`branch_change_top2_curr_r33k`* | 163.8 | 171.4 | 183.9 | 218.4 | 171.9 | 161.1 | 164.9 | 191.2 | **178.3** |
-| *`branch_change_top2_curr_synth_r33k`* | 164.8 | 179.6 | 176.4 | 213.4 | 169.3 | 156.2 | 168.9 | 193.4 | **177.7** |
 
 ### Speedup vs `no_eagle_baseline`
 
 | run | MMStar | MMMU | OmniDocBench | MATH-500 | textvqa | chartqa | mathvista | COCO-Caption | mean |
 |---|---|---|---|---|---|---|---|---|---|
-| `baseline_1layer` | 0.954x | 0.906x | 0.880x | 1.007x | 0.896x | 0.844x | 1.042x | **0.957x** | **0.936x** |
-| `banded_mix_fc_3.1` | 0.910x | 0.888x | 0.869x | **1.064x** | 0.915x | 0.825x | 0.974x | 0.955x | **0.925x** |
-| `branch_ratio_t02_top1_w01` | **0.969x** | 0.892x | 0.852x | **1.064x** | 0.887x | 0.804x | **1.056x** | 0.943x | **0.933x** |
-| `branch_change_top1_w01` | 0.907x | **0.919x** | 0.868x | 1.047x | **0.937x** | 0.830x | 0.990x | 0.942x | **0.930x** |
-| *`branch_change_top2_curr_r33k`* | 0.955x | 0.869x | **0.915x** | 1.049x | 0.882x | **0.850x** | 0.956x | 0.932x | **0.926x** |
-| *`branch_change_top2_curr_synth_r33k`* | 0.961x | 0.910x | 0.878x | 1.025x | 0.868x | 0.824x | 0.979x | 0.943x | **0.924x** |
+| `baseline_1layer` | 0.954x | 0.906x | 0.880x | 1.007x | 0.896x | 0.844x | 1.042x | 0.957x | **0.936x** |
+| `banded_mix_fc_3.1` | 0.910x | 0.888x | 0.869x | 1.064x | 0.915x | 0.825x | 0.974x | 0.955x | **0.925x** |
+| `branch_change_top1_w01` | 0.907x | 0.919x | 0.868x | 1.047x | 0.937x | 0.830x | 0.990x | 0.942x | **0.930x** |
 
 ## Prompt / output sizes
 
