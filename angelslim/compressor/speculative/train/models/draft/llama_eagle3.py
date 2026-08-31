@@ -1727,6 +1727,11 @@ class Eagle3LlamaForCausalLM(Eagle3BaseDraftModel):
                 device=device,
             )
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        elif position_ids.ndim == 3:
+            # mrope (T/H/W) position ids, already (3, batch, seq_length) -- the
+            # plain-RoPE `.view(-1, seq_length)` below would flatten the leading
+            # (3, batch) into a single dim, corrupting it into a fake batch of 3.
+            position_ids = position_ids.long()
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 

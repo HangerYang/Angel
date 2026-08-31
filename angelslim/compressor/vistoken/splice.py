@@ -19,7 +19,7 @@ weights -- is what lets vLLM reuse this: it builds the draft's slot mapping
 before the model runs (``speculator.py:_maybe_set_l0_compact_prefill``).
 """
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -63,16 +63,30 @@ def compress_image_rows(
     target_logits: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     image_token_id: int,
+    compressor_rows_per_sample: Optional[List[Optional[torch.Tensor]]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Keep k rows per image tile, carrying the tile's compressed summaries.
 
     All inputs are aligned 1:1 on absolute positions (pre-shift). Returns the
     same keys, right-padded to the longest surviving sample in the batch, plus
     ``compressed_rows``: a mask of the rows now holding summaries.
+
+    The tile itself is always auto-detected from ``input_ids`` via
+    ``image_tiles()`` (a real contiguous 64-row run) -- ALL of a tile's rows
+    are dropped from the sequence regardless of pruning, so this can't change.
+
+    ``compressor_rows_per_sample`` (optional): one ``[T, M]`` absolute-position
+    subset of each sample's own (auto-detected) tile rows, fed to the
+    compressor INSTEAD of the full tile (``None`` entries, or omitting this
+    arg, use the full tile -- the existing unpruned behavior). This is what
+    lets a caller pre-prune each tile to M < tile_tokens rows (e.g.
+    ``target_attn_prune.py``) before the learned compressor ever sees them:
+    the summary's output slot is then chosen from the M kept rows, not the
+    original 64, but every row outside that M-subset is still removed here,
+    same as an unpruned tile's other 64-k rows always were.
     """
     cfg = compressor.cfg
     tile_tokens = cfg.tile_tokens
-    offsets = torch.as_tensor(compressor.offsets, device=input_ids.device)
     bsz, seq_len = input_ids.shape
     device = input_ids.device
 
@@ -107,14 +121,28 @@ def compress_image_rows(
                 "terms. Check the loss mask before enabling row compression"
             )
         n_tiles = tiles.shape[0]
-        # Positions of the k rows each tile keeps, in tile order.
-        slots = tiles.index_select(1, offsets).reshape(-1)
+        compress_rows = tiles
+        if compressor_rows_per_sample is not None and compressor_rows_per_sample[b] is not None:
+            compress_rows = compressor_rows_per_sample[b]
+        n_rows = compress_rows.shape[1]
+        # Positions of the k rows each tile keeps, in tile order. Offsets are
+        # computed against the ACTUAL row count fed to the compressor
+        # (n_rows), which is tile_tokens unless a caller pre-pruned via
+        # compressor_rows_per_sample -- the compressor's own params don't
+        # depend on tile_tokens, only the evenly-spaced-centres slot
+        # convention does (VisRowCompressor.slot_offsets).
+        offsets = torch.as_tensor(
+            compressor.slot_offsets(cfg.num_queries, tile_tokens=n_rows), device=device
+        )
+        slots = compress_rows.index_select(1, offsets).reshape(-1)
 
-        out, _ = compressor(hidden_states[b][tiles].unsqueeze(0), n_tiles)
+        out, _ = compressor(
+            hidden_states[b][compress_rows].unsqueeze(0), n_tiles, expected_rows=n_rows
+        )
         summaries.append(out[0].reshape(slots.numel(), -1))
 
         keep = torch.ones(seq_len, dtype=torch.bool, device=device)
-        keep[tiles.reshape(-1)] = False
+        keep[tiles.reshape(-1)] = False  # drop the FULL original tile, pruned or not
         keep[slots] = True
         idx = keep.nonzero().flatten()
         keep_indices.append(idx)

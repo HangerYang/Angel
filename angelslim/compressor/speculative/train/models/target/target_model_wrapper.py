@@ -889,6 +889,19 @@ class VLMTransformersBackend(BaseBackend):
             return self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
         raise ValueError(f"Unsupported target model type: {self.target_model_type}")
 
+    def get_text_decoder_layers(self):
+        """The text tower's decoder layer list, same family branching as
+        ``_register_language_model_hook`` -- for callers that need to hook
+        individual layers (e.g. target-attention row pruning's q_proj/k_proj
+        capture) rather than the whole tower's forward-pre-hook."""
+        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
+            return self.model.model.language_model.layers
+        if self.target_model_type in ("smolvlm", "idefics3"):
+            return self.model.model.text_model.layers
+        if self.target_model_type == "hunyuan_vl":
+            return self.model.model.layers
+        raise ValueError(f"Unsupported target model type: {self.target_model_type}")
+
     def _build_vlm_forward_kwargs(
         self,
         input_ids: torch.Tensor,
@@ -2122,6 +2135,11 @@ class TargetModelWrapper:
             attention_mask=attention_mask,
             **kwargs,
         )
+
+    def get_text_decoder_layers(self):
+        """Forwards to the backend's decoder layer list (e.g. for hooking
+        individual layers -- see VLMTransformersBackend.get_text_decoder_layers)."""
+        return self.backend.get_text_decoder_layers()
 
     def get_aux_and_target_hiddens(
         self,

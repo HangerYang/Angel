@@ -167,12 +167,22 @@ class VisRowCompressor(nn.Module):
             outs.append(torch.softmax(logits.float(), dim=-1).to(ref.dtype))
         return torch.stack(outs, dim=2)
 
-    def forward(self, tiles: torch.Tensor, n_tiles: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, tiles: torch.Tensor, n_tiles: int, expected_rows: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compress ``[B, T, N, n*d]`` tile rows to ``[B, T, k, n*d]``.
 
         Also returns the routing weights ``[B, T, k, N]`` (band-averaged when
         routing is per_band) so the caller can place each output row's RoPE
         position at the weighted mean of its sources.
+
+        ``N`` need not equal ``cfg.tile_tokens`` -- nothing below this check
+        actually depends on ``tile_tokens`` (that field only sizes
+        ``slot_offsets`` for the *unpruned* case). A caller that pre-prunes
+        each tile to ``M < tile_tokens`` rows (e.g. target-attention row
+        pruning, before this module ever sees them) passes
+        ``expected_rows=M`` to assert against the real row count instead of
+        the config default.
         """
         cfg = self.cfg
         b, t, n, flat = tiles.shape
@@ -180,8 +190,9 @@ class VisRowCompressor(nn.Module):
             raise ValueError(
                 f"expected {cfg.num_streams}*{cfg.hidden_size} feature dims, got {flat}"
             )
-        if n != cfg.tile_tokens:
-            raise ValueError(f"expected {cfg.tile_tokens} rows per tile, got {n}")
+        want = cfg.tile_tokens if expected_rows is None else expected_rows
+        if n != want:
+            raise ValueError(f"expected {want} rows per tile, got {n}")
 
         streams = tiles.view(b, t, n, cfg.num_streams, cfg.hidden_size)
         ref = self._reference(streams)

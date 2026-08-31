@@ -19,8 +19,11 @@ from torch import nn
 
 try:
     from ....vistoken.splice import compress_image_rows
+    from ....vistoken.target_attn_prune import TargetQKCapture, prune_sample_image_rows
 except ModuleNotFoundError:
     compress_image_rows = None
+    TargetQKCapture = None
+    prune_sample_image_rows = None
 from ...utils import padding
 from .eagle3_trainer import Eagle3Trainer
 from .trainer_factory import Eagle3TrainerFactory
@@ -128,6 +131,21 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
         self._aux_hidden_states_layer_ids = getattr(
             draft_model_config, "aux_hidden_states_layer_ids", None
         )
+        # Optional target-attention row pruning in front of vistoken's
+        # compressor -- see angelslim/compressor/vistoken/target_attn_prune.py.
+        # {"group_size": x, "keep_m": M, "mode": "target_attn"|"random"|"none"}
+        self._vistoken_prune_cfg = getattr(draft_model_config, "vistoken_prune", None)
+        self._target_head_dim = None
+
+    def _get_target_head_dim(self) -> int:
+        if self._target_head_dim is None:
+            cfg = getattr(self.target_model.model, "config", None)
+            cfg = getattr(cfg, "text_config", cfg)
+            head_dim = getattr(cfg, "head_dim", None)
+            if head_dim is None:
+                head_dim = cfg.hidden_size // cfg.num_attention_heads
+            self._target_head_dim = int(head_dim)
+        return self._target_head_dim
 
     def prepare_data_for_draft_model(self, inputs):
         input_ids = inputs["input_ids"]
@@ -148,24 +166,69 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
                 "attention_mask": attention_mask,
                 "kwargs": kwargs,
             }
-        # Get hidden states and logits from target model
-        hidden_states, target_logits, _, position_ids = (
-            self.target_model.get_hidden_states_and_logits(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                aux_hidden_states_layer_ids=self._aux_hidden_states_layer_ids,
-                **kwargs,
-            )
-        )
-
         # Row compression, before the left shift: every tensor here is still
         # aligned 1:1 on absolute positions, so one splice keeps them so.
         compressor = getattr(self.draft_model, "vistoken", None)
+        prune_cfg = self._vistoken_prune_cfg if compressor is not None else None
+        prune_mode = (prune_cfg or {}).get("mode", "none")
+        layer_ids = self._aux_hidden_states_layer_ids
+
+        if prune_mode != "none" and prune_mode != "random":
+            if TargetQKCapture is None:
+                raise RuntimeError(
+                    "vistoken target-attention pruning is not available on clean main; "
+                    "use the visual compression feature branch"
+                )
+            with TargetQKCapture(self.target_model.get_text_decoder_layers(), layer_ids) as qk_cap:
+                hidden_states, target_logits, _, position_ids = (
+                    self.target_model.get_hidden_states_and_logits(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        aux_hidden_states_layer_ids=self._aux_hidden_states_layer_ids,
+                        **kwargs,
+                    )
+                )
+        else:
+            qk_cap = None
+            # Get hidden states and logits from target model
+            hidden_states, target_logits, _, position_ids = (
+                self.target_model.get_hidden_states_and_logits(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    aux_hidden_states_layer_ids=self._aux_hidden_states_layer_ids,
+                    **kwargs,
+                )
+            )
+
         if compressor is not None:
             if compress_image_rows is None:
                 raise RuntimeError(
                     "vistoken compression is not available on clean main; use the visual compression feature branch"
                 )
+            compressor_rows_per_sample = None
+            if prune_mode != "none":
+                bsz = input_ids.shape[0]
+                valid = (
+                    attention_mask.bool()
+                    if attention_mask is not None
+                    else torch.ones_like(input_ids, dtype=torch.bool)
+                )
+                compressor_rows_per_sample = [
+                    prune_sample_image_rows(
+                        qk_cap,
+                        layer_ids,
+                        self._get_target_head_dim(),
+                        input_ids[b],
+                        valid[b],
+                        loss_mask[b],
+                        self.draft_model.vistoken_image_token_id,
+                        compressor.cfg.tile_tokens,
+                        prune_cfg["group_size"],
+                        prune_cfg["keep_m"],
+                        prune_mode,
+                    )
+                    for b in range(bsz)
+                ]
             spliced = compress_image_rows(
                 compressor,
                 hidden_states=hidden_states,
@@ -175,6 +238,7 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
                 target_logits=target_logits,
                 position_ids=position_ids,
                 image_token_id=self.draft_model.vistoken_image_token_id,
+                compressor_rows_per_sample=compressor_rows_per_sample,
             )
             hidden_states = spliced["hidden_states"]
             input_ids = spliced["input_ids"]
