@@ -9,6 +9,7 @@ from angelslim.compressor.vistoken.row_compressor import (
 from angelslim.compressor.vistoken.splice import compress_image_rows, image_tiles
 from angelslim.compressor.vistoken.target_attn_prune import (
     TargetQKCapture,
+    image_row_scores,
     prune_sample_image_rows,
     prune_tiles_by_score,
 )
@@ -115,6 +116,50 @@ def test_qk_capture_and_end_to_end_prune_compress():
     print("mode=none reproduces image_tiles() unchanged. ok")
 
 
+def test_scores_pick_the_right_sample_in_a_batch():
+    """The hooks fire once for the WHOLE batch, so sample b must be selected
+    out of the captured [B, S, H*d] before the head reshape. Folding B into
+    the reshape does not raise -- the element count still matches -- it just
+    scrambles positions into the head axis, so only an explicit B>1 check
+    catches it."""
+    torch.manual_seed(0)
+    n_tiles, n_text = 2, 5
+    input_ids, hidden, loss_mask, attn, is_img = build_batch(n_tiles, n_text)
+    seq_len = input_ids.shape[1]
+
+    layer = nn.Module()
+    layer.self_attn = nn.Module()
+    layer.self_attn.q_proj = nn.Linear(D, N_HEADS * HEAD_DIM, bias=False)
+    layer.self_attn.k_proj = nn.Linear(D, N_HEADS * HEAD_DIM, bias=False)
+    layers = [layer]
+
+    # Two DIFFERENT samples through one forward, exactly as training does.
+    x = torch.randn(2, seq_len, D)
+    with TargetQKCapture(layers, [0]) as cap:
+        _ = layer.self_attn.q_proj(x)
+        _ = layer.self_attn.k_proj(x)
+    assert cap.captured[0][0].shape == (2, seq_len, N_HEADS * HEAD_DIM)
+
+    tiles = image_tiles(input_ids[0], attn[0].bool(), IMG, TILE)
+    qpos = loss_mask[0].nonzero().flatten()
+    ipos = tiles.reshape(-1)
+
+    batched = [image_row_scores(cap, [0], qpos, ipos, HEAD_DIM, sample_idx=b) for b in (0, 1)]
+
+    # Each sample must match what that sample alone would have produced.
+    for b in (0, 1):
+        with TargetQKCapture(layers, [0]) as solo_cap:
+            _ = layer.self_attn.q_proj(x[b : b + 1])
+            _ = layer.self_attn.k_proj(x[b : b + 1])
+        solo = image_row_scores(solo_cap, [0], qpos, ipos, HEAD_DIM)
+        assert torch.allclose(batched[b], solo, atol=1e-6), f"sample {b} scored from the wrong rows"
+
+    # And the two samples must actually differ, or the check above is vacuous.
+    assert not torch.allclose(batched[0], batched[1])
+    print("image_row_scores: B>1 scores each sample from its own q/k. ok")
+
+
 if __name__ == "__main__":
     test_prune_tiles_by_score_picks_top_m()
     test_qk_capture_and_end_to_end_prune_compress()
+    test_scores_pick_the_right_sample_in_a_batch()

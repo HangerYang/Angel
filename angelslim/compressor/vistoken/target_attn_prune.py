@@ -88,6 +88,7 @@ def image_row_scores(
     query_positions: torch.Tensor,
     image_positions: torch.Tensor,
     head_dim: int,
+    sample_idx: int = 0,
 ) -> torch.Tensor:
     """[n_image_rows] relevance score for one sample, mean over heads, over
     the 9 aux layers, and over every loss_mask==1 query position (training
@@ -98,6 +99,10 @@ def image_row_scores(
     K is mean-pooled over whatever (possibly fewer, under GQA) KV heads it
     has before the dot product, then broadcast against every query head --
     a ranking signal only, so exact query/kv head grouping isn't needed.
+
+    ``sample_idx`` selects the row of the captured ``[B, S, H*d]`` projection
+    output to score. The hooks fire once for the whole batch, so this must be
+    the same ``b`` the caller took ``input_ids[b]`` / ``loss_mask[b]`` from.
     """
     per_layer = []
     for layer_id in layer_ids:
@@ -105,8 +110,11 @@ def image_row_scores(
         if q is None or k is None:
             raise RuntimeError(f"no captured q/k for layer {layer_id}; was the hook active?")
         seq_len = q.shape[1]
-        q = q.view(1, seq_len, -1, head_dim)[0].index_select(0, query_positions)  # [Nq, Hq, d]
-        k = k.view(1, seq_len, -1, head_dim)[0].index_select(0, image_positions)  # [Ni, Hk, d]
+        # Select the sample FIRST: these are [B, S, H*d] for the whole batch,
+        # and folding B into the reshape silently scrambles positions into the
+        # head axis instead of failing.
+        q = q[sample_idx].view(seq_len, -1, head_dim).index_select(0, query_positions)  # [Nq, Hq, d]
+        k = k[sample_idx].view(seq_len, -1, head_dim).index_select(0, image_positions)  # [Ni, Hk, d]
         k_mean = k.mean(dim=1)  # [Ni, d] -- collapse KV heads
         scores = torch.einsum("qhd,id->qhi", q.float(), k_mean.float()) / (head_dim**0.5)
         scores = scores.mean(dim=1)  # mean over query heads -> [Nq, Ni]
@@ -168,6 +176,7 @@ def prune_sample_image_rows(
     group_size: int,
     keep_m: int,
     mode: str,
+    sample_idx: int = 0,
 ) -> Optional[torch.Tensor]:
     """One sample's pruned ``[T, n_groups*keep_m]`` absolute-position tile
     index tensor, or ``None`` if the sample has no image rows (mirrors
@@ -191,7 +200,9 @@ def prune_sample_image_rows(
             return tiles
         image_positions = tiles.reshape(-1)
         assert qk_capture is not None, "target_attn mode requires a TargetQKCapture"
-        row_scores = image_row_scores(qk_capture, layer_ids, query_positions, image_positions, head_dim)
+        row_scores = image_row_scores(
+            qk_capture, layer_ids, query_positions, image_positions, head_dim, sample_idx
+        )
         scores = torch.zeros(seq_len, device=device, dtype=row_scores.dtype)
         scores[image_positions] = row_scores
 

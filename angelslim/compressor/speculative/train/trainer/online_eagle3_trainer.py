@@ -226,6 +226,7 @@ class OnlineVLMEagle3Trainer(Eagle3Trainer):
                         prune_cfg["group_size"],
                         prune_cfg["keep_m"],
                         prune_mode,
+                        sample_idx=b,
                     )
                     for b in range(bsz)
                 ]
