@@ -198,6 +198,73 @@ calling the script (or prefixing the call, e.g. `VAR=val bash ...`).
 | `DRY_RUN` | `0` | print the resolved config and exit without launching anything |
 | `HIVIS_ROOT` | `HiViS/` next to this repo | HiViS checkout to run against |
 
+## Resuming / continuing from a checkpoint
+
+**There is no true resume.** Neither `main_mix.py` (stage 1) nor
+`main_mix_topk_dyn_res.py` (stage 2) ever calls `accelerator.load_state()` —
+each only calls `accelerator.save_state(output_dir=f"{cpdir}/state_{epoch}")`
+once per full pass (so `--num-epochs N` actually writes `state_0` through
+`state_N`, i.e. N+1 checkpoints — see the loop `for epoch in range(num_epochs
++ 1)`). There is no `--resume` flag on either script, and the optimizer/LR
+scheduler state saved inside each `state_*/` (`optimizer.bin`,
+`scheduler.bin`, `random_states_0.pkl`) is never read back by either script.
+Concretely: **you cannot pick up a stage 1 or stage 2 run mid-training with
+its optimizer/LR-schedule state intact.**
+
+What *is* supported is weight-chaining stage 1 → stage 2, and only in that
+direction:
+
+- `main_mix_topk_dyn_res.py` (stage 2) takes `--ckpt_path <dir>`, loads
+  `<dir>/model.safetensors` via `safetensors.torch.load_file` +
+  `model.load_state_dict(..., strict=True)`, **before** `accelerator.prepare`
+  — so it's a fresh optimizer/scheduler seeded with stage 1's model weights,
+  not a resume.
+- `main_mix.py` (stage 1) has **no `--ckpt_path` argument at all** — it
+  always builds `Model(config, load_emb=True, path=base_model_path)` from
+  scratch, so there is no built-in way to continue stage 1 itself for more
+  epochs from an existing `state_N/`. Doing that would require patching
+  `main_mix.py` to add the same `--ckpt_path` load stage 2 already has,
+  before its `accelerator.prepare` call.
+
+### Recipe: continue from our SmolVLM-256M stage1(20ep) checkpoint into stage2
+
+We ran stage 1 alone for 20 epochs (21 passes) on `smolvlm256m`, final
+checkpoint `state_20` (Loss=0.4472, Train Accuracy=85.64%):
+
+```
+output/hivis_official/smolvlm_256m_artifacts_stage1_20ep_only/stage1/state_20/
+```
+
+A minimal eval-ready copy (`model.safetensors` + `config.json`, no
+optimizer/scheduler/rng, no aux training head) is also backed up on the HF
+Hub dataset repo at
+`WindUpHanger/angelslim-smolvlm-eagle3-artifacts/weight/hivis_way_smolvlm256m/checkpoint-stage1-20ep/`.
+
+To feed that into stage 2 (fresh optimizer, stage1's weights as the start
+point):
+
+```bash
+cd /home/hyang/Angel
+conda activate hivis
+
+MODEL=smolvlm256m STAGE=stage2 \
+HIVIS_DATA_ROOT=/home/hyang/Angel/dataset/hivis_smolvlm_256m_generated_artifacts \
+STAGE1_CKPT=/home/hyang/Angel/output/hivis_official/smolvlm_256m_artifacts_stage1_20ep_only/stage1/state_20 \
+OUTPUT_ROOT=/home/hyang/Angel/output/hivis_official/smolvlm_256m_artifacts_stage1_20ep_only \
+GPUS="0 1 2 3 4 5 6 7" \
+STAGE2_EPOCHS=<n> \
+BS_STAGE1=2 BS_STAGE2=1 \
+bash scripts/speculative/train_official_hivis.sh
+```
+
+`HIVIS_DATA_ROOT` above is the actual generated-artifacts directory this
+checkpoint's stage 1 trained on (**not** the script's own default
+`dataset/hivis_smolvlm256m_generated` — no underscore, different path) —
+must match or stage 2 trains on the wrong/nonexistent data. `BS_STAGE1`/
+`BS_STAGE2` pinned to 2/1 — the script's own unset-env defaults, 4/2, OOM'd
+on this machine's free GPU memory during this run; see git history
+(`48fd685`) for that fix.
+
 ## Relationship to the old per-model scripts
 
 `scripts/speculative/qwen2_5_vl/train_official_hivis_qwen3b.sh` and
