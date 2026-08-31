@@ -55,7 +55,15 @@ DATASETS = {
 }
 
 
-def load_samples(dataset: str, n: int):
+# Lengthens a raw VQA-style question so there's enough decode length for a
+# speculative-decoding comparison to show anything -- same template as
+# tools/vllm_offline_eagle3_vlm_batch.py's answer_then_describe.
+ANSWER_THEN_DESCRIBE = (
+    "Answer this question: {q} Then describe the image in detail to justify your answer."
+)
+
+
+def load_samples(dataset: str, n: int, prompt_style: str = "raw"):
     from datasets import load_dataset
     spec = DATASETS.get(dataset)
     if spec is None:
@@ -70,6 +78,8 @@ def load_samples(dataset: str, n: int):
         q = str(it[q_f]) if q_f else "Describe the image."
         if ph:
             q = q.replace(ph, "").strip()
+        if prompt_style == "answer_then_describe" and q_f:
+            q = ANSWER_THEN_DESCRIBE.format(q=q)
         out.append((it[img_f].convert("RGB"), q))
     return out
 
@@ -114,13 +124,61 @@ def fix_dtype_skipped_params(model, ckpt, dtype):
                 param.data = f.get_tensor(name).to(device=param.device, dtype=dtype)
 
 
-def load_draft(ckpt, depth):
+def _ckpt_has_key(ckpt, key):
+    """Whether `key` is one of the checkpoint's OWN saved tensors (vs. left at
+    from_pretrained's random init) -- some published checkpoints (e.g.
+    AngelSlim/Qwen3-VL-4B-Instruct_eagle3) omit embed_tokens.weight on purpose,
+    meaning to have it copied from the target instead of trained."""
+    idx = os.path.join(ckpt, "model.safetensors.index.json")
+    if os.path.exists(idx):
+        return key in json.load(open(idx))["weight_map"]
+    st = os.path.join(ckpt, "model.safetensors")
+    if os.path.exists(st):
+        from safetensors import safe_open
+        with safe_open(st, framework="pt") as f:
+            return key in f.keys()
+    return True  # unknown layout; don't false-positive into an embed overwrite
+
+
+def _default_aux_layer_ids(target_model_name_or_path):
+    """Mirror target_model_wrapper.py's _get_default_aux_layer_ids: early/mid/
+    late decoder layers, used whenever a checkpoint's config doesn't pin
+    aux_hidden_states_layer_ids explicitly (true of every currently-published
+    Qwen3-VL eagle3 config)."""
+    from transformers import AutoConfig
+    tcfg = AutoConfig.from_pretrained(target_model_name_or_path)
+    tcfg = getattr(tcfg, "text_config", tcfg)
+    n = tcfg.num_hidden_layers
+    return [1, n // 2 - 1, n - 4]
+
+
+def load_draft(ckpt, depth, target_model_name_or_path=None):
     from angelslim.compressor.speculative.train.models.draft.llama_eagle3 import (
         Eagle3LlamaForCausalLM)
     cfg = json.load(open(os.path.join(ckpt, "config.json")))
-    aux = cfg.get("aux_hidden_states_layer_ids") or [1, 14, 26]
+    aux = cfg.get("aux_hidden_states_layer_ids")
+    if not aux:
+        aux = (_default_aux_layer_ids(target_model_name_or_path) if target_model_name_or_path
+               else [1, 14, 26])
     m = Eagle3LlamaForCausalLM.from_pretrained(ckpt, dtype=DT).to(DEV).eval()
     fix_dtype_skipped_params(m, ckpt, DT)
+    if not _ckpt_has_key(ckpt, "embed_tokens.weight"):
+        # See _ckpt_has_key: copy the token embedding from the TARGET model
+        # instead of leaving it at from_pretrained's random init, which would
+        # make every draft prediction noise regardless of aux layers/rope --
+        # confirmed empirically on AngelSlim/Qwen3-VL-4B-Instruct_eagle3.
+        from angelslim.compressor.speculative.train.models.model_utils import MODEL_TYPE_PARAM_MAP
+        target_type = cfg.get("target_model_type")
+        entry = MODEL_TYPE_PARAM_MAP.get(target_type)
+        if entry is None or target_model_name_or_path is None:
+            raise RuntimeError(
+                f"{ckpt} has no embed_tokens.weight and cannot source one: "
+                f"target_model_type={target_type!r} in map={entry is not None}, "
+                f"target_model_name_or_path={target_model_name_or_path!r}")
+        _, embed_weight_key, _ = entry
+        print(f"Loading draft embed_tokens from {target_model_name_or_path}:{embed_weight_key}")
+        m.load_embed_weights(target_model_name_or_path, embed_weight_key)
+        m.to(device=DEV, dtype=DT)
     # rotary cos/sin are non-persistent buffers; from_pretrained's meta init leaves
     # them uninitialised (NaN). Rebuild before use. MRotaryEmbedding (Qwen-VL-family
     # mrope drafts) has no such cache -- it recomputes cos/sin from inv_freq fresh on
@@ -159,27 +217,91 @@ def target_inputs(model, proc, image, question, aux_ids, img_tok):
 
 
 @torch.no_grad()
-def eagle3_target_prefill(model, proc, image, question, aux_ids):
+def eagle3_target_prefill(model, proc, image, question, aux_ids, img_tok=None):
     """Like target_inputs, but WITH use_cache=True -- for round-based (real
     multi-round) generation, where the target's KV cache must persist and
     grow incrementally (via compact_cache) across rounds instead of being
     rebuilt from scratch. Returns (aux, draft_ids, first, prefix_cache,
-    prev_len): same "shift by one" aux/draft_ids pairing as target_inputs
-    (aux[i] pairs with the REAL token at prompt position i+1, matching
-    EAGLE's hidden[t]-predicts-token[t+1] convention), `prefix_cache` is a
-    DynamicCache the caller only ever grows via compact_cache, `prev_len` is
-    its current length (the real prompt's token count).
+    prev_len, mask): same "shift by one" aux/draft_ids pairing as
+    target_inputs (aux[i] pairs with the REAL token at prompt position i+1,
+    matching EAGLE's hidden[t]-predicts-token[t+1] convention), `prefix_cache`
+    is a DynamicCache the caller only ever grows via compact_cache, `prev_len`
+    is its current length (the real prompt's token count). `mask` is the
+    image-token boolean mask on the UNSHIFTED prompt ids (None if `img_tok`
+    is None) -- same one-position-off-from-draft_ids approximation make_roll's
+    --prefill noimg already uses, since the image span is far from either
+    boundary. `mrope` is (prefix_pos, rope_delta) from qwen_mrope_prefix, or
+    None for non-mrope targets -- see that function's docstring for why this
+    is required (not merely nicer) for Qwen-VL-family targets.
     """
     msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]}]
     prompt = proc.apply_chat_template(msgs, add_generation_prompt=True)
     inp = proc(text=prompt, images=[image], return_tensors="pt").to(DEV)
-    out = model(**inp, output_hidden_states=True, use_cache=True)
+    mrope = qwen_mrope_prefix(model, inp)
+    out = model(**inp, position_ids=(mrope[0] if mrope is not None else None),
+                output_hidden_states=True, use_cache=True)
     hs = out.hidden_states
     aux = torch.cat([hs[j + 1] for j in aux_ids], dim=-1).to(DT)
     first = int(out.logits[0, -1].argmax())
     ids = inp["input_ids"]
     draft_ids = torch.cat([ids[:, 1:], torch.tensor([[first]], device=DEV)], dim=1)
-    return aux, draft_ids, first, out.past_key_values, ids.shape[1]
+    mask = (ids == img_tok)[0] if img_tok is not None else None
+    return aux, draft_ids, first, out.past_key_values, ids.shape[1], mask, mrope
+
+
+def qwen_mrope_prefix(model, inp):
+    """Real (T,H,W) mrope prefix positions for a Qwen-VL-family target, via
+    its own get_rope_index -- None for non-mrope targets (no image_grid_thw
+    in the processor output, e.g. SmolVLM/Idefics3). Manually calling a
+    Qwen-VL target outside its own generate() loop with position_ids=None is
+    NOT safe -- confirmed by reproduction: it corrupts the attention output
+    shape on the second (incremental-decode) forward. Explicit real mrope
+    positions sidestep this and are the only path validated here.
+    """
+    image_grid_thw = inp.get("image_grid_thw")
+    if image_grid_thw is None:
+        return None
+    inner = getattr(model, "model", model)
+    fn = getattr(inner, "get_rope_index", None)
+    if fn is None:
+        return None
+    kw = dict(image_grid_thw=image_grid_thw, video_grid_thw=inp.get("video_grid_thw"),
+              attention_mask=inp.get("attention_mask"))
+    try:
+        # transformers>=5: mm_token_type_ids is a required positional arg.
+        pos, delta = fn(inp["input_ids"], inp["mm_token_type_ids"], **kw)
+    except (TypeError, KeyError):
+        pos, delta = fn(inp["input_ids"], **kw)
+    return pos, delta
+
+
+def mrope_positions_for_len(prefix_pos, rope_delta, seq_len, device):
+    """Extend real [3,1,prefix_len] mrope prefix positions to a longer
+    image-inclusive draft/target sequence: prompt rows copied verbatim, every
+    row past the prefix continues Qwen's own post-vision-span scalar
+    convention (index + mrope_position_delta, same value on T/H/W)."""
+    prefix_len = prefix_pos.shape[-1]
+    if seq_len <= prefix_len:
+        return prefix_pos[:, :, :seq_len].to(device)
+    extra_n = seq_len - prefix_len
+    idx = torch.arange(prefix_len, prefix_len + extra_n, device=device, dtype=prefix_pos.dtype).view(1, 1, -1)
+    delta = rope_delta.reshape(1, 1, 1).to(device=device, dtype=prefix_pos.dtype)
+    extra = (idx + delta).expand(3, prefix_pos.shape[1], -1)
+    return torch.cat([prefix_pos.to(device), extra], dim=-1)
+
+
+def _pos_at(step_index, mrope, device):
+    """Position id for ONE new row at absolute index `step_index`. Every
+    caller in make_eagle3_tree_roll uses this only for rows PAST the initial
+    prefix (newly drafted/accepted tokens are always plain text), so the
+    scalar continuation formula applies unconditionally -- never the real
+    per-row prefix positions (those come from mrope_positions_for_len /
+    `mrope[0]` directly, only for the very first prefill row-block)."""
+    if mrope is None:
+        return torch.full((1, 1), step_index, dtype=torch.long, device=device)
+    prefix_pos, rope_delta = mrope
+    val = step_index + int(rope_delta.reshape(-1)[0].item())
+    return torch.full((3, 1, 1), val, dtype=prefix_pos.dtype, device=device)
 
 
 @torch.no_grad()
@@ -329,7 +451,7 @@ def make_tree_roll(m, aux, ids, mask, first, prefill, sampler, tree_depth, top_k
 
 @torch.no_grad()
 def make_eagle3_tree_roll(m, aux, ids, tree_depth, top_k, total_token,
-                           draft_cache=None, draft_h=None, cache_len=0):
+                           draft_cache=None, draft_h=None, cache_len=0, mrope=None):
     """Round-based (real multi-round) tree builder for EAGLE3 -- a SEPARATE
     function from make_tree_roll (that one stays untouched for cmd_tree's
     draft-only timing use), because round decoding needs draft-side
@@ -369,6 +491,12 @@ def make_eagle3_tree_roll(m, aux, ids, tree_depth, top_k, total_token,
     the tree loop's own appends (on the SAME list objects) can never leak
     into it. `all_nodes` matches verify_tree_hivis/verify_tree_eagle3's
     input shape: a flat list of {"tok","parent","depth","score"} dicts.
+
+    `mrope` is (prefix_pos, rope_delta) from qwen_mrope_prefix, or None for
+    non-mrope drafts / once --prefill noimg has dropped the image span (see
+    cmd_round_eagle3). Row positions here describe the ROW, not which token
+    happens to sit in it, so `ids`/`aux` being the EAGLE-shifted draft_ids
+    doesn't change what position each row gets.
     """
     progressive = bool(getattr(m, "progressive_staged", False))
 
@@ -377,7 +505,7 @@ def make_eagle3_tree_roll(m, aux, ids, tree_depth, top_k, total_token,
             h = m.combine_hidden_states(aux)
             cache = m.init_cache_hidden()
             S = ids.shape[1]
-            pos0 = torch.arange(S, device=DEV).unsqueeze(0)
+            pos0 = mrope[0] if mrope is not None else torch.arange(S, device=DEV).unsqueeze(0)
             msk0 = torch.full((1, 1, S, S), float("-inf"), device=DEV, dtype=h.dtype).triu(1)
             h, cache = m.encode_layers(m.embed_tokens(ids).to(h.dtype), h, cache, msk0, pos0, True)
             h = h[:, -1:]
@@ -387,7 +515,7 @@ def make_eagle3_tree_roll(m, aux, ids, tree_depth, top_k, total_token,
             S = ids.shape[1]
             for i in range(S):
                 h_in = m.combine_hidden_states(aux[:, i:i + 1])
-                pos_i = torch.full((1, 1), kv_now, dtype=torch.long, device=DEV)
+                pos_i = _pos_at(kv_now, mrope, DEV)
                 msk_i = torch.zeros(1, 1, 1, 1, device=DEV, dtype=h_in.dtype)
                 h_in, cache = m.encode_layers(
                     m.embed_tokens(ids[:, i:i + 1]).to(h_in.dtype), h_in, cache, msk_i, pos_i, True)
@@ -413,7 +541,7 @@ def make_eagle3_tree_roll(m, aux, ids, tree_depth, top_k, total_token,
             new_idx = []
             for node_i in frontier_idx:
                 node = pool[node_i]
-                pos = torch.full((1, 1), start + d, dtype=torch.long, device=DEV)
+                pos = _pos_at(start + d, mrope, DEV)
                 msk = torch.zeros(1, 1, 1, 1, device=DEV, dtype=node["h"].dtype)
                 h_new, cache_new = m.encode_layers(
                     m.embed_tokens(node["tok"]).to(node["h"].dtype),
@@ -897,15 +1025,18 @@ def verify_tree_hivis(tgt, prefix_len, prefix_cache, rope_deltas, first, all_nod
 
 
 @torch.no_grad()
-def verify_tree_eagle3(tgt, prefix_len, prefix_cache, first, all_nodes, aux_ids):
+def verify_tree_eagle3(tgt, prefix_len, prefix_cache, first, all_nodes, aux_ids, mrope=None):
     """Single-pass target verify for EAGLE3 round decoding -- same design as
     verify_tree_hivis (flatten the tree, ONE target forward with a
     tree-structured additive attention mask built via the same vectorized
     ancestor-chain walk, greedy accept-until-mismatch per leaf), generalized
     two ways for EAGLE3:
 
-    - no mrope: SmolVLM's target uses plain 1D position_ids, so there's no
-      Qwen-style rope_deltas plumbing to carry between rounds.
+    - `mrope` (from qwen_mrope_prefix): SmolVLM's target uses plain 1D
+      position_ids (mrope=None); Qwen-VL-family targets need the real
+      rope_delta-continued scalar positions (see _pos_at) -- position_ids is
+      always explicit either way, never left None (manual incremental decode
+      with position_ids=None corrupts a Qwen-VL target's attention output).
     - accept_hidden concatenates EVERY aux_ids layer (not just the last
       one), since that's what the draft's combine_hidden_states expects as
       its next-round grounding input (make_eagle3_tree_roll's `aux` arg).
@@ -936,7 +1067,12 @@ def verify_tree_eagle3(tgt, prefix_len, prefix_cache, first, all_nodes, aux_ids)
     additive_mask[:, :, :, prefix_len:] = torch.where(
         ancestor_mask, torch.zeros((), dtype=DT, device=DEV), torch.finfo(DT).min
     )
-    positions = torch.tensor([[prefix_len + d for d in depths]], device=DEV, dtype=torch.long)
+    if mrope is not None:
+        delta = int(mrope[1].reshape(-1)[0].item())
+        positions = torch.tensor([[prefix_len + d + delta for d in depths]], device=DEV, dtype=torch.long)
+        positions = positions.view(1, 1, -1).expand(3, -1, -1)
+    else:
+        positions = torch.tensor([[prefix_len + d for d in depths]], device=DEV, dtype=torch.long)
 
     out = tgt(input_ids=new_ids, attention_mask=additive_mask, position_ids=positions,
               past_key_values=prefix_cache, use_cache=True, output_hidden_states=True)
@@ -1231,12 +1367,12 @@ def cmd_round_hivis(args):
 
 def setup(args):
     from transformers import AutoModelForImageTextToText, AutoProcessor
-    m, aux_ids, cfg = load_draft(args.ckpt, args.depth)
+    m, aux_ids, cfg = load_draft(args.ckpt, args.depth, target_model_name_or_path=args.target)
     proc = AutoProcessor.from_pretrained(args.target)
     tgt = AutoModelForImageTextToText.from_pretrained(
         args.target, dtype=DT, device_map=DEV).eval()
     img_tok = getattr(tgt.config, "image_token_id", None)
-    samples = load_samples(args.dataset, args.n)
+    samples = load_samples(args.dataset, args.n, getattr(args, "prompt_style", "raw"))
     print(f"ckpt    : {args.ckpt}")
     print(f"draft   : mode={cfg.get('eagle_aux_injection_mode')} layers={len(m.layers)} "
           f"aux={aux_ids} (n={len(aux_ids)})")
@@ -1377,7 +1513,22 @@ def cmd_round_eagle3(args):
     all_accepts, all_new_tokens, all_wall_s = [], [], []
     baseline_tok_s_list = []
     for k, (img, q) in enumerate(samples):
-        aux, ids, first, prefix_cache, prev_len = eagle3_target_prefill(tgt, proc, img, q, aux_ids)
+        aux, ids, first, prefix_cache, prev_len, mask, mrope = eagle3_target_prefill(
+            tgt, proc, img, q, aux_ids, img_tok=img_tok if args.prefill == "noimg" else None)
+        # The TARGET always sees every image row regardless of --prefill, so
+        # verify_tree_eagle3 always gets the real mrope. The DRAFT only gets
+        # it while its own sequence still has the image span in original
+        # order (qwen_mrope_prefix's docstring / draft_mrope=None once
+        # --prefill noimg has pruned it -- see make_eagle3_tree_roll).
+        draft_mrope = None if args.prefill == "noimg" else mrope
+        if args.prefill == "noimg":
+            # Same ablation as make_roll's --prefill noimg: drop image rows from
+            # the DRAFT's initial (aux, ids) only -- the target (prefix_cache)
+            # keeps the full prompt untouched. keep[-1]=True preserves the final
+            # (shifted-in `first`) position make_eagle3_tree_roll roots from.
+            keep = ~mask
+            keep[-1] = True
+            aux, ids = aux[:, keep], ids[:, keep]
 
         generated, round_accepts, wall_s = [], [], 0.0
         first_round = True
@@ -1386,13 +1537,14 @@ def cmd_round_eagle3(args):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             roll = make_eagle3_tree_roll(m, aux, ids, args.tree_depth, args.top_k, args.total_token,
-                                          draft_cache=draft_cache, draft_h=draft_h, cache_len=draft_cache_len)
+                                          draft_cache=draft_cache, draft_h=draft_h, cache_len=draft_cache_len,
+                                          mrope=draft_mrope)
             all_nodes, root_cache, root_h, root_kv = roll()
             torch.cuda.synchronize()
             draft_s = time.perf_counter() - t0
 
             accept_with_bonus, best_chain, best_bonus, accept_aux, select_indices, verify_s = (
-                verify_tree_eagle3(tgt, prev_len, prefix_cache, first, all_nodes, aux_ids))
+                verify_tree_eagle3(tgt, prev_len, prefix_cache, first, all_nodes, aux_ids, mrope=mrope))
 
             compact_cache(prefix_cache, prev_len, select_indices)
             prev_len += accept_with_bonus
@@ -1467,6 +1619,9 @@ def main():
                              "hivis: HiViS-way EAGLE2-style (single last-hidden-state, no vocab remap).")
         b.add_argument("--target", default=DEFAULT_TARGET)
         b.add_argument("--dataset", default="MMMU/MMMU")
+        b.add_argument("--prompt-style", choices=["raw", "answer_then_describe"], default="raw",
+                        dest="prompt_style",
+                        help="answer_then_describe lengthens VQA-style questions for more decode rounds.")
         b.add_argument("-n", "--n", type=int, default=10)
         b.add_argument("--steps", type=int, default=32)
         b.add_argument("--prefill", choices=["full", "noimg", "none"], default="full")

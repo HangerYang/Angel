@@ -56,13 +56,34 @@ def _load_draft_state(draft_dir: Path) -> Dict[str, torch.Tensor]:
     raise FileNotFoundError(f"No weights under {draft_dir}")
 
 
-def load_draft(draft_dir: Path, config_path: Path, device: torch.device, dtype: torch.dtype):
+def load_draft(draft_dir: Path, config_path: Path, device: torch.device, dtype: torch.dtype,
+                target_model_name_or_path: Optional[str] = None):
     cfg = DraftModelConfig.from_file(str(config_path if config_path.is_file() else draft_dir / "config.json"))
     draft = create_draft_model(cfg)
     missing, unexpected = draft.load_state_dict(_load_draft_state(draft_dir), strict=False)
     missing = [k for k in missing if not (k.startswith("t2d") or k.startswith("d2t"))]
     if missing:
         print(f"WARNING missing draft keys: {len(missing)} e.g. {missing[:5]}")
+    if "embed_tokens.weight" in missing:
+        # Some published checkpoints (e.g. AngelSlim/Qwen3-VL-4B-Instruct_eagle3)
+        # omit embed_tokens.weight deliberately -- it is meant to be copied from
+        # the TARGET model at load time, not trained. Without this the draft's
+        # token embeddings stay randomly initialised and every prediction is
+        # noise (mean_acceptance_length pins at 1.0 / exactly-0% acceptance
+        # regardless of aux layers or positions -- confirmed empirically).
+        from angelslim.compressor.speculative.train.models.model_utils import MODEL_TYPE_PARAM_MAP
+
+        target_type = getattr(cfg, "target_model_type", None)
+        entry = MODEL_TYPE_PARAM_MAP.get(target_type)
+        if entry is None or target_model_name_or_path is None:
+            raise RuntimeError(
+                f"draft checkpoint has no embed_tokens.weight and cannot source one: "
+                f"target_model_type={target_type!r} in MODEL_TYPE_PARAM_MAP={entry is not None}, "
+                f"target_model_name_or_path={target_model_name_or_path!r}"
+            )
+        _, embed_weight_key, _ = entry
+        print(f"Loading draft embed_tokens from {target_model_name_or_path}:{embed_weight_key}")
+        draft.load_embed_weights(target_model_name_or_path, embed_weight_key)
     if unexpected:
         print(f"WARNING unexpected draft keys: {len(unexpected)} e.g. {unexpected[:5]}")
     draft.to(device=device, dtype=dtype)
@@ -82,6 +103,55 @@ def _draft_token_to_target(draft, draft_tok: int) -> int:
     return draft_tok
 
 
+def mrope_prefix_positions(model, input_ids, attention_mask, mm_kwargs: Dict[str, Any]):
+    """Real (T,H,W) mrope position ids for a Qwen-VL-family target's full
+    prompt, via the model's own get_rope_index -- None for non-mrope targets
+    (image_grid_thw absent) so callers fall back to plain arange positions.
+
+    Only meaningful when the draft still sees the image span (the "with
+    images" arm): once image tokens are pruned from the draft's sequence the
+    remaining rows are plain text, for which arange positions already match
+    Qwen's own mrope convention (T=H=W=running index), so no caller needs
+    this in the pruned arm.
+    """
+    image_grid_thw = mm_kwargs.get("image_grid_thw")
+    if image_grid_thw is None:
+        return None
+    inner = getattr(model, "model", model)
+    fn = getattr(inner, "get_rope_index", None)
+    if fn is None:
+        return None
+    kw = dict(
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=mm_kwargs.get("video_grid_thw"),
+        attention_mask=attention_mask,
+    )
+    try:
+        # transformers>=5: mm_token_type_ids is a required positional arg.
+        pos, delta = fn(input_ids, mm_kwargs["mm_token_type_ids"], **kw)
+    except (TypeError, KeyError):
+        pos, delta = fn(input_ids, **kw)
+    return pos, delta
+
+
+def mrope_positions_for_len(prefix_pos: torch.Tensor, rope_delta: torch.Tensor, seq_len: int,
+                             device: torch.device) -> torch.Tensor:
+    """Extend a prefix's real [3,1,prefix_len] mrope positions to a longer
+    (image-inclusive) draft sequence: prompt positions are copied verbatim,
+    every appended generation token continues the scalar convention Qwen's
+    own get_rope_index uses past the vision span (index + mrope_position_delta,
+    same value broadcast across T/H/W).
+    """
+    prefix_len = prefix_pos.shape[-1]
+    if seq_len <= prefix_len:
+        return prefix_pos[:, :, :seq_len].to(device)
+    extra_n = seq_len - prefix_len
+    idx = torch.arange(prefix_len, prefix_len + extra_n, device=device, dtype=prefix_pos.dtype).view(1, 1, -1)
+    delta = rope_delta.reshape(1, 1, 1).to(device=device, dtype=prefix_pos.dtype)
+    extra = (idx + delta).expand(3, prefix_pos.shape[1], -1)
+    return torch.cat([prefix_pos.to(device), extra], dim=-1)
+
+
 @torch.no_grad()
 def draft_propose(
     draft,
@@ -89,6 +159,7 @@ def draft_propose(
     draft_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     num_spec: int,
+    mrope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> List[int]:
     """Propose tokens over the compact (image-hidden) draft sequence."""
     cur_ids = draft_ids
@@ -97,7 +168,10 @@ def draft_propose(
     proposed: List[int] = []
     for step in range(num_spec):
         seq_len = cur_ids.shape[1]
-        position_ids = torch.arange(seq_len, device=cur_ids.device, dtype=torch.long).view(1, -1)
+        if mrope is not None:
+            position_ids = mrope_positions_for_len(mrope[0], mrope[1], seq_len, cur_ids.device)
+        else:
+            position_ids = torch.arange(seq_len, device=cur_ids.device, dtype=torch.long).view(1, -1)
         out = draft(
             hidden_states=cur_hidden,
             input_ids=cur_ids,
@@ -138,19 +212,29 @@ def draft_propose(
 
 
 @torch.no_grad()
-def target_prefill(model, batch: Dict[str, torch.Tensor], aux_ids: Sequence[int]):
-    out = model(**batch, output_hidden_states=True, use_cache=True)
+def target_prefill(model, batch: Dict[str, torch.Tensor], aux_ids: Sequence[int],
+                    position_ids: Optional[torch.Tensor] = None):
+    out = model(**batch, position_ids=position_ids, output_hidden_states=True, use_cache=True)
     hs = out.hidden_states
     aux = torch.cat([hs[i + 1] for i in aux_ids], dim=-1)
     return out.logits, aux, out.past_key_values
 
 
 @torch.no_grad()
-def target_decode_tokens(model, input_ids, attention_mask, past_key_values, aux_ids):
+def target_decode_tokens(model, input_ids, attention_mask, past_key_values, aux_ids,
+                          position_ids: Optional[torch.Tensor] = None):
+    # A Qwen-VL-family target's own position_ids=None auto-derivation is only
+    # exercised (and only reliable) inside its own generate() loop; called
+    # here directly with a manually-grown past_key_values, it can mis-derive
+    # cache_position and corrupt the attention output shape. Passing the real
+    # mrope positions explicitly (mrope_positions_for_len) sidesteps this
+    # entirely -- confirmed via a minimal reproduction against the target
+    # alone. Non-mrope targets (position_ids stays None) are unaffected.
     out = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         past_key_values=past_key_values,
+        position_ids=position_ids,
         output_hidden_states=True,
         use_cache=True,
     )
@@ -186,8 +270,7 @@ def generate_hivis(
     attention_mask = inputs.get("attention_mask")
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
-    pixel_values = inputs.get("pixel_values")
-    pixel_attention_mask = inputs.get("pixel_attention_mask")
+    mm_kwargs = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
 
     eos_ids = getattr(model.config, "eos_token_id", None)
     if eos_ids is None:
@@ -206,19 +289,43 @@ def generate_hivis(
         torch.cuda.synchronize(device)
     t0 = time.perf_counter()
 
-    prefill = {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-    }
-    if pixel_values is not None:
-        prefill["pixel_values"] = pixel_values
-    if pixel_attention_mask is not None:
-        prefill["pixel_attention_mask"] = pixel_attention_mask
-    logits, aux, past = target_prefill(model, prefill, aux_ids)
+    # Real mrope (T/H/W) positions for the target's full, image-inclusive
+    # prompt -- None for non-mrope targets (no image_grid_thw). The TARGET
+    # always sees every image row regardless of hide_visual, so this is
+    # computed unconditionally and used for every target call (both prefill
+    # and decode -- see target_decode_tokens's docstring for why leaving
+    # position_ids=None breaks manual incremental decode for these models).
+    target_mrope = mrope_prefix_positions(model, input_ids, attention_mask, mm_kwargs)
+    target_pos = target_mrope[0] if target_mrope is not None else None
+
+    prefill = {"input_ids": input_ids, "attention_mask": attention_mask, **mm_kwargs}
+    logits, aux, past = target_prefill(model, prefill, aux_ids, position_ids=target_pos)
+
+    # The DRAFT only gets real mrope positions while it still sees the image
+    # span (hide_visual=False); once images are pruned the remaining rows are
+    # plain text, for which arange positions already match Qwen's own mrope
+    # convention (T=H=W=running index) -- see mrope_prefix_positions.
+    draft_mrope = None if hide_visual else target_mrope
+
+    # EAGLE3's defining shift: the draft's input token at position i is the
+    # REAL token at i+1 (`shifted_ids`), paired with aux[i] -- the target
+    # hidden state that PREDICTED it. Without this the draft is trained/run
+    # on a token/hidden-state pairing one position off from what it was ever
+    # trained on, and its output is unrelated noise (confirmed empirically:
+    # this was silently missing here and produced exactly-0% acceptance on
+    # both the SmolVLM banded-mix-fc-3.1 and Qwen3-VL-4B checkpoints, despite
+    # both loading and running without error). `first` is the target's own
+    # greedy prediction for the token right after the prompt -- the "free"
+    # first token EAGLE always gets from the prefill forward, matching
+    # draft_bench.py's eagle3_target_prefill/hivis_target_inputs.
+    first_tok = int(logits[:, -1, :].argmax(dim=-1).item())
+    shifted_ids = torch.cat(
+        [input_ids[:, 1:], torch.full((1, 1), first_tok, device=device, dtype=input_ids.dtype)], dim=1
+    )
 
     draft_ids, draft_aux, draft_mask, dropped = (
         prune_hidden_and_ids(
-            input_ids,
+            shifted_ids,
             aux,
             attention_mask,
             image_token_id=image_token_id,
@@ -231,7 +338,7 @@ def generate_hivis(
             ),
         )
         if hide_visual
-        else (input_ids, aux, attention_mask, [0])
+        else (shifted_ids, aux, attention_mask, [0])
     )
 
     generated: List[int] = []
@@ -251,16 +358,24 @@ def generate_hivis(
         nonlocal draft_ids, draft_aux, draft_mask
         generated.append(token_id)
         tok = torch.tensor([[token_id]], device=device, dtype=cur_ids.dtype)
-        cur_ids = torch.cat([cur_ids, tok], dim=1)
-        cur_mask = torch.cat([cur_mask, torch.ones_like(tok, dtype=cur_mask.dtype)], dim=1)
-        logits, aux, past = target_decode_tokens(model, tok, cur_mask, past, aux_ids)
+        # Same shift as the prompt's shifted_ids: this token pairs with the aux
+        # from the PREVIOUS target forward (the hidden state that predicted
+        # it), not the aux this token's own forward is about to produce.
+        prev_aux_last = aux[:, -1:, :]
         draft_ids = torch.cat([draft_ids, tok], dim=1)
         draft_mask = torch.cat([draft_mask, torch.ones_like(tok, dtype=draft_mask.dtype)], dim=1)
-        # New target aux is only the last position; keep previous compact aux and append.
-        draft_aux = torch.cat([draft_aux, aux[:, -1:, :]], dim=1)
+        draft_aux = torch.cat([draft_aux, prev_aux_last], dim=1)
+        cur_ids = torch.cat([cur_ids, tok], dim=1)
+        cur_mask = torch.cat([cur_mask, torch.ones_like(tok, dtype=cur_mask.dtype)], dim=1)
+        step_pos = (
+            mrope_positions_for_len(target_mrope[0], target_mrope[1], cur_ids.shape[1], device)[:, :, -1:]
+            if target_mrope is not None
+            else None
+        )
+        logits, aux, past = target_decode_tokens(model, tok, cur_mask, past, aux_ids, position_ids=step_pos)
 
     while len(generated) < max_new_tokens:
-        proposals = draft_propose(draft, draft_aux, draft_ids, draft_mask, num_spec)
+        proposals = draft_propose(draft, draft_aux, draft_ids, draft_mask, num_spec, mrope=draft_mrope)
         stats["drafts"] += 1
         n_acc = 0
         rejected = False
@@ -291,7 +406,15 @@ def generate_hivis(
     return generated[:max_new_tokens], dt, stats
 
 
-def load_prompts(dataset: str, num_prompts: int) -> List[List[dict]]:
+# Lengthens raw VQA-style questions so there is enough decode length for a
+# speculative-decoding comparison to show anything -- matches the
+# answer_then_describe variant in tools/vllm_offline_eagle3_vlm_batch.py.
+ANSWER_THEN_DESCRIBE = (
+    "Answer this question: {q} Then describe the image in detail to justify your answer."
+)
+
+
+def load_prompts(dataset: str, num_prompts: int, prompt_style: str = "raw") -> List[List[dict]]:
     if os.path.exists(dataset):
         ds = load_dataset("json", data_files=dataset, split="train")
     elif dataset == "lmms-lab/textvqa":
@@ -310,6 +433,8 @@ def load_prompts(dataset: str, num_prompts: int) -> List[List[dict]]:
             q = item.get("question") or item.get("problem") or "Describe the image."
             if isinstance(q, str):
                 q = q.replace("<image>", "").replace("<image 1>", "")
+                if prompt_style == "answer_then_describe":
+                    q = ANSWER_THEN_DESCRIBE.format(q=q)
             content: List[Any] = []
             if img is not None:
                 if not isinstance(img, Image.Image):
@@ -340,6 +465,13 @@ def main() -> None:
         ),
     )
     ap.add_argument("--dataset", default="lmms-lab/textvqa")
+    ap.add_argument(
+        "--prompt_style",
+        choices=("raw", "answer_then_describe"),
+        default="raw",
+        help="answer_then_describe lengthens VQA-style questions so there are enough "
+        "decode rounds for the with/without-images comparison to show anything.",
+    )
     ap.add_argument("--num_prompts", type=int, default=8)
     ap.add_argument("--num_spec_tokens", type=int, default=4)
     ap.add_argument("--max_new_tokens", type=int, default=32)
@@ -366,7 +498,8 @@ def main() -> None:
         p.requires_grad_(False)
 
     print(f"Loading draft {args.draft_model}")
-    draft, cfg = load_draft(args.draft_model, args.draft_model_config_path, device, dtype)
+    draft, cfg = load_draft(args.draft_model, args.draft_model_config_path, device, dtype,
+                             target_model_name_or_path=args.target_model)
     aux_ids = tuple(int(x) for x in getattr(cfg, "aux_hidden_states_layer_ids", [1, 14, 26]))
     image_token_id = int(getattr(cfg, "image_token_id", getattr(target.config, "image_token_id", 49190)))
     vision_start = getattr(cfg, "vision_start_token_id", None)
@@ -376,7 +509,7 @@ def main() -> None:
         f"aux={list(aux_ids)} mode={getattr(cfg, 'eagle_aux_injection_mode', None)}"
     )
 
-    prompts = load_prompts(args.dataset, args.num_prompts)
+    prompts = load_prompts(args.dataset, args.num_prompts, args.prompt_style)
     print(f"Loaded {len(prompts)} prompts from {args.dataset}")
 
     spec_tokens = 0
