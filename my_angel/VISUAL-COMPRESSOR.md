@@ -314,22 +314,22 @@ representation-quality idea, not an efficiency idea.
 
 ## 9. Plan 2, and what is worth running next
 
-### It exists, it is on `mess`, and it already ran
+Plan 2 is a **two-stage** plan:
 
-"Plan 2" — *first train the compressor on its own so that the **target model**
-still runs correctly on the compressed tokens, then hand it to the drafter* — is
-the **qsampler** line. It is not recorded under that name (grep for
-`idea 2|plan 2` returns only the `Idea 1` heading), but the code and results are
-on branch `mess`:
+> **Stage A.** Train the compressor against the target model alone — maximize the
+> information the compressed rows carry, such that the **target's own output is
+> unaffected**.
+> **Stage B.** *Then* train end-to-end with the drafter, starting from that.
 
-- `tools/train_qsampler.py` — freezes the vision tower, connector, text model and
-  `lm_head`; compresses each tile's 64 connector rows to N; **scatters the
-  compressed rows back into the `<image>` slots and runs the frozen target LM on
-  them** (`run_text_branch`); trains on `KL(target_full ‖ target_compressed)` over
-  the text positions plus a hidden-state cosine term. That is exactly the
-  target-invariance objective.
-- Results are on disk: `output/qsampler-n{1,4,8,16}`, `logs/qsampler_n*.log`,
-  2 epochs each, ~21 min on 4 GPUs.
+### Stage A exists and ran. Stage B never ran, and there is no code for it.
+
+Stage A is `tools/train_qsampler.py` on branch `mess`. It freezes the vision
+tower, connector, text model and `lm_head`; compresses each tile's 64 connector
+rows to N; **scatters them back into the `<image>` slots and runs the frozen
+target LM on them** (`run_text_branch`); and trains on
+`KL(target_full ‖ target_compressed)` over the text positions plus a hidden
+cosine term. That is exactly "不影响 target output". Results are on disk in
+`output/qsampler-n{1,4,8,16}` and `logs/qsampler_n*.log`, 2 epochs each:
 
 | N per tile | compression | eval KL | **target top-1 agreement** | hidden cos |
 |---:|---:|---:|---:|---:|
@@ -338,27 +338,55 @@ on branch `mess`:
 | 8 | 8x | 0.2201 | 84.3% | 0.9726 |
 | 16 | 4x | 0.1930 | **85.2%** | 0.9763 |
 
-Read the third column as *how often the target model, fed compressed visual
-tokens, still predicts its own original next token*. Even at 4x compression it
-disagrees with itself **15% of the time**; at 64x — the ratio `vistoken-k1` uses —
-**20%**. Eval flattens after ~step 1000, so more epochs buy nothing.
+Read the third column as *how often the target, fed compressed visual tokens,
+still predicts its own original next token*. Even at 4x it disagrees with itself
+**15%** of the time; at the 64x ratio `vistoken-k1` uses, **20%**. Eval flattens
+after ~step 1000, so more epochs buy nothing. **64x sits at the expensive end of a
+still-falling curve** — an independent argument for `num_queries: 4/16` over k=1.
 
-**Two caveats before using these numbers as a verdict on vistoken.**
+Stage B was never attempted. `row_compressor.py:9` records the decision:
+qsampler is *"(dropped): that compressed the connector output in LM embedding
+space against a target-invariance objective"*, and `TODO-vistoken-k1.md` adds
+**"not even used as an init"**. There is no code path that loads a trained
+QSampler (or any pretrained compressor) into the EAGLE trainer —
+`_build_vistoken_compressor` (`llama_eagle3.py:1038`) constructs a fresh
+`VisRowCompressor` from config and nothing else.
 
-1. **Different space.** qsampler compresses *connector output in LM embedding
-   space* (before the target LM). vistoken compresses *aux hidden states across 9
-   layers* (after it). `TODO-vistoken-k1.md` dropped qsampler for exactly this
-   reason — it is not even used as an init.
-2. **Different requirement.** The fixed test-time setup is that the **target reads
-   the full image** and only the *draft* sees compressed rows. So target-invariance
-   is a proxy for "did the compression keep the information the LM needs", not the
-   deployment condition. A drafter can tolerate more loss than the target can.
+### Why Stage A and Stage B do not currently connect
 
-With those caveats, the qsampler sweep is still the best available prior on how
-much a tile can be squeezed at all, and it says **64x is the expensive end of the
-curve**: going 4x → 64x costs 5.8 points of target agreement while the curve is
-still clearly falling. That is an independent argument for `num_queries: 4/16`
-over `k=1`, alongside §6.
+The two stages live in **different spaces**, and it is structural, not incidental:
+
+| | QSampler (Stage A) | VisRowCompressor (what the drafter uses) |
+|---|---|---|
+| operates on | connector output, **before** the target LM | 9 aux hidden states, **after** the target LM |
+| shape | `[64, 576]` → `[N, 576]` | `[64, 9×576]` → `[k, 9×576]` |
+| fed **into** the target? | yes — that is what makes Stage A definable | **no** — these are outputs of the target |
+
+Stage A's objective only exists where the compressed tensor is something the
+target *reads*. Aux hidden states are something the target *emits*, so
+"不影响 target output" has no meaning there — there is no second forward to
+compare against. A QSampler also cannot be transplanted into the vistoken slot:
+wrong space, wrong width.
+
+So Plan 2 needs one of these, and it is a real decision:
+
+| | how Stage A becomes definable | cost / catch |
+|---|---|---|
+| **A. Two target forwards** | Target runs once on the full image (the real one, being verified) and once on QSampler-compressed embeddings; the drafter's aux HS come from the second. Stage A pretraining is then *exactly* the right init and Stage B is natural. | One extra target prefill per request. Must be measured against the drafting cost it saves — §8 says that budget is thin. |
+| **B. Keep aux-HS compression, replace Stage A's objective** | "Unaffected target output" is not available, but *information fidelity* is: train the compressor so a frozen readout reconstructs the tile's rows, or so the target's remaining layers produce the same final hidden state. Then Stage B end-to-end. | Keeps the current architecture and the fixed test-time setup. Needs a new pretraining objective written. |
+| **C. Let the target itself run on compressed tokens** | Trivially definable. | **Ruled out** — the fixed test-time setup is that the target reads the full image; this would be a train/test mismatch. |
+
+### The finding in §6 blocks Plan 2 either way
+
+Whichever of A or B is chosen, Stage A produces a compressor with a *spread-out*
+routing distribution — that is what "carries the most information" means. Stage B
+then trains it end-to-end **under the same objective and the same optimizer
+settings that produced the one-hot collapse in §6**: `weight_decay=0.0`, no
+entropy penalty, logit range growing 170% per epoch.
+
+Stage B as currently configured would destroy Stage A's result within an epoch.
+**Fixing the routing geometry is a prerequisite for Plan 2, not an alternative to
+it.**
 
 ### The rest of the forward plan
 
@@ -385,6 +413,8 @@ running from it.
 | 1 | **Repair the routing and retrain k=1**: normalize the dot product (`q·k / (‖q‖‖k‖)`, or a LayerNorm before `k_proj`), and/or put weight decay on the compressor group, and/or add an entropy floor on `w`. `weight_decay=0.0` today, so nothing bounds `‖k_proj‖`. | Without this, every other vistoken run repeats the same collapse — the failure is in the objective's geometry, not in `k`. | 1 training run |
 | 2 | **`num_queries: 4` / `16` after the repair** | k=1 gives the drafter 13–17 rows for a whole image. Even a *correct* summarizer may not fit an image into that — the qsampler sweep above measures the same curve in a different space and 64x sits at its expensive end. Run it only after (1); with a one-hot router, raising k just samples k arbitrary rows. | 1–2 runs |
 
+| 3 | **Plan 2 Stage B, once (1) is in.** Pick option A or B above, write the Stage-A objective for the chosen space, pretrain, then end-to-end. | This is the plan the whole line was supposed to follow; it has never been executable because Stage B has no warm-start path and, until (1), would erase Stage A anyway. | 1 pretrain + 1 end-to-end run |
+
 `seq_lens` / cache-hole instrumentation (§7) stays worth one cheap eval run
 whenever a vistoken checkpoint is next evaluated, since it is the only remaining
 alternative explanation for the decode gap.
@@ -400,7 +430,10 @@ Against that: `branch_change_top1_w01` is at **+4.0% τ, +3.9% tok/s** over
 `banded_mix_fc_3.1` with several unexplored knobs, while vistoken is at **−5.5% τ**
 after two full runs and needs a third just to reach a fair test. If only one run is
 affordable, item (1) is the one that buys information — it either produces a real
-compressor or retires the idea on evidence rather than on a bug.
+compressor or retires the idea on evidence rather than on a bug. Item (1) is also
+the cheapest thing that makes Plan 2 worth starting: pretraining a compressor for
+information fidelity and then handing it to an optimizer that collapses it to a
+one-hot pick wastes both runs.
 
 ---
 
