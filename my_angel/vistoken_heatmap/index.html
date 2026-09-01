@@ -1,0 +1,229 @@
+<title>Where the Compressor Looks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Serif:wght@400;600&display=swap">
+<style>
+:root{
+  --ground:#f6f5f2; --surface:#fffefc; --ink:#191b20; --muted:#70747c;
+  --rule:#e2ded7; --rule-strong:#c9c4ba;
+  --heat-0:#eef1f3; --heat-1:#24445e;
+  --flag:#9c3d2e; --flag-soft:#f0dcd6;
+  --shadow:0 1px 2px rgba(25,27,32,.06);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#131519; --surface:#1b1e24; --ink:#e9e7e3; --muted:#8d919a;
+    --rule:#2b2f37; --rule-strong:#3d434d;
+    --heat-0:#1e232a; --heat-1:#9dc4e0;
+    --flag:#d9846f; --flag-soft:#3a2621;
+    --shadow:0 1px 2px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#131519; --surface:#1b1e24; --ink:#e9e7e3; --muted:#8d919a;
+  --rule:#2b2f37; --rule-strong:#3d434d;
+  --heat-0:#1e232a; --heat-1:#9dc4e0;
+  --flag:#d9846f; --flag-soft:#3a2621;
+  --shadow:0 1px 2px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:"IBM Plex Serif",Georgia,serif; font-size:16px; line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px; margin:0 auto; padding:56px 28px 80px; display:flex; flex-direction:column; gap:44px}
+h1,h2,h3,.eyebrow,.plot__name,th,.k__v,.stat{font-family:"IBM Plex Sans",system-ui,sans-serif}
+.eyebrow{
+  font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--muted); font-weight:600; margin:0 0 14px;
+}
+h1{font-size:clamp(30px,4.4vw,42px); line-height:1.12; font-weight:600; margin:0 0 16px; text-wrap:balance; letter-spacing:-.015em}
+.lede{font-size:18px; color:var(--ink); margin:0; max-width:64ch}
+.lede b{font-weight:600}
+h2{font-size:20px; font-weight:600; margin:0 0 6px; letter-spacing:-.005em}
+.section{display:flex; flex-direction:column; gap:18px}
+.section > p{margin:0; max-width:68ch; color:var(--ink)}
+.note{color:var(--muted); font-size:14.5px}
+hr.rule{border:0; border-top:1px solid var(--rule); margin:0}
+
+.plots{display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:26px}
+.plot{margin:0; display:flex; flex-direction:column; gap:10px}
+figcaption{display:flex; flex-direction:column; gap:2px}
+.plot__name{font-size:14px; font-weight:600; letter-spacing:-.005em}
+.plot__sub{font-size:12.5px; color:var(--muted); font-family:"IBM Plex Sans",system-ui,sans-serif}
+.grid{
+  display:grid; grid-template-columns:repeat(8,1fr); gap:2px;
+  border:1px solid var(--rule-strong); padding:2px; background:var(--rule);
+  border-radius:2px;
+}
+.cell{
+  aspect-ratio:1; display:grid; place-items:center;
+  background:color-mix(in oklab, var(--heat-1) calc(var(--t) * 100%), var(--heat-0));
+  font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:9.5px;
+  color:color-mix(in oklab, var(--ink) calc(100% - var(--t) * 62%), var(--heat-1));
+  font-variant-numeric:tabular-nums;
+}
+.cell span{opacity:.82}
+.cell--flag{outline:2px solid var(--flag); outline-offset:-2px}
+.plot__scale{margin:0; font-size:12px; color:var(--muted); font-family:"IBM Plex Sans",system-ui,sans-serif}
+.plot__scale b{color:var(--ink); font-variant-numeric:tabular-nums}
+
+.tablewrap{overflow-x:auto}
+table{border-collapse:collapse; width:100%; font-size:14.5px; min-width:520px}
+th,td{text-align:right; padding:9px 12px; border-bottom:1px solid var(--rule)}
+th:first-child,td:first-child{text-align:left}
+thead th{
+  font-size:11px; letter-spacing:.09em; text-transform:uppercase;
+  color:var(--muted); font-weight:600; border-bottom:1px solid var(--rule-strong);
+}
+tbody td{font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+tbody td:first-child{font-family:"IBM Plex Serif",Georgia,serif}
+tbody tr:last-child td{border-bottom:0}
+td.bad{color:var(--flag); font-weight:600}
+.chance{color:var(--muted); font-size:12.5px}
+
+.finds{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:16px}
+.finds li{
+  display:grid; grid-template-columns:auto 1fr; gap:0 16px; align-items:baseline;
+  padding-bottom:16px; border-bottom:1px solid var(--rule);
+}
+.finds li:last-child{border-bottom:0; padding-bottom:0}
+.stat{
+  font-size:26px; font-weight:600; letter-spacing:-.02em; font-variant-numeric:tabular-nums;
+  min-width:4.2ch; text-align:right;
+}
+.stat--flag{color:var(--flag)}
+.finds p{margin:0; max-width:60ch}
+.finds b{font-weight:600; font-family:"IBM Plex Sans",system-ui,sans-serif}
+
+.why{
+  background:var(--surface); border:1px solid var(--rule); border-left:3px solid var(--flag);
+  padding:22px 24px; display:flex; flex-direction:column; gap:12px; box-shadow:var(--shadow);
+}
+.why h2{margin:0}
+.why p{margin:0; max-width:66ch}
+.why ol{margin:0; padding-left:1.2em; display:flex; flex-direction:column; gap:9px; max-width:64ch}
+code{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:.9em; background:var(--surface); border:1px solid var(--rule); padding:.08em .34em; border-radius:2px}
+footer{color:var(--muted); font-size:13px; font-family:"IBM Plex Sans",system-ui,sans-serif}
+</style>
+
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">SmolVLM EAGLE-3 · vistoken probe · 46 images / 626 tiles</p>
+  <h1>Where the compressor looks</h1>
+  <p class="lede">Each image tile is 64 visual tokens laid out on an 8×8 grid. The compressor
+  is supposed to blend them into one summary. It doesn't blend — it <b>picks one and discards
+  the other 63</b>. These maps show which of the 64 it picks.</p>
+</header>
+
+<hr class="rule">
+
+<section class="section">
+  <h2>Where the pick lands on the tile</h2>
+  <p class="note">Each square is one of the tile's 64 token slots, in reading order.
+  The number is the percentage of all 626 tiles whose pick landed there. Uniform
+  would be 1.6% everywhere. Each map is scaled to its own maximum, printed below it.</p>
+  <div class="plots">
+    <figure class="plot">
+<figcaption><span class="plot__name">Run 1 · vistoken-k1</span><span class="plot__sub">picks 1 of all 64 slots</span></figcaption>
+<div class="grid"><div class="cell" style="--t:0.1010" title="slot 0 — 0.0160"><span>1.6</span></div><div class="cell" style="--t:0.0202" title="slot 1 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:1.0000" title="slot 2 — 0.1581"><span>15.8</span></div><div class="cell" style="--t:0.0202" title="slot 3 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.8586" title="slot 4 — 0.1358"><span>13.6</span></div><div class="cell" style="--t:0.0101" title="slot 5 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.3939" title="slot 6 — 0.0623"><span>6.2</span></div><div class="cell" style="--t:0.0808" title="slot 7 — 0.0128"><span>1.3</span></div><div class="cell" style="--t:0.0404" title="slot 8 — 0.0064"><span>0.6</span></div><div class="cell" style="--t:0.0000" title="slot 9 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0505" title="slot 10 — 0.0080"><span>0.8</span></div><div class="cell" style="--t:0.0202" title="slot 11 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0606" title="slot 12 — 0.0096"><span>1.0</span></div><div class="cell" style="--t:0.0000" title="slot 13 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0909" title="slot 14 — 0.0144"><span>1.4</span></div><div class="cell" style="--t:0.0707" title="slot 15 — 0.0112"><span>1.1</span></div><div class="cell" style="--t:0.1414" title="slot 16 — 0.0224"><span>2.2</span></div><div class="cell" style="--t:0.0000" title="slot 17 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.1212" title="slot 18 — 0.0192"><span>1.9</span></div><div class="cell" style="--t:0.0202" title="slot 19 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.1414" title="slot 20 — 0.0224"><span>2.2</span></div><div class="cell" style="--t:0.0000" title="slot 21 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0606" title="slot 22 — 0.0096"><span>1.0</span></div><div class="cell" style="--t:0.0707" title="slot 23 — 0.0112"><span>1.1</span></div><div class="cell" style="--t:0.0404" title="slot 24 — 0.0064"><span>0.6</span></div><div class="cell" style="--t:0.0404" title="slot 25 — 0.0064"><span>0.6</span></div><div class="cell" style="--t:0.0909" title="slot 26 — 0.0144"><span>1.4</span></div><div class="cell" style="--t:0.0404" title="slot 27 — 0.0064"><span>0.6</span></div><div class="cell" style="--t:0.0808" title="slot 28 — 0.0128"><span>1.3</span></div><div class="cell" style="--t:0.0101" title="slot 29 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0606" title="slot 30 — 0.0096"><span>1.0</span></div><div class="cell" style="--t:0.0303" title="slot 31 — 0.0048"><span>0.5</span></div><div class="cell" style="--t:0.5960" title="slot 32 — 0.0942"><span>9.4</span></div><div class="cell" style="--t:0.0303" title="slot 33 — 0.0048"><span>0.5</span></div><div class="cell" style="--t:0.1313" title="slot 34 — 0.0208"><span>2.1</span></div><div class="cell" style="--t:0.0000" title="slot 35 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.1212" title="slot 36 — 0.0192"><span>1.9</span></div><div class="cell" style="--t:0.0202" title="slot 37 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.1919" title="slot 38 — 0.0304"><span>3.0</span></div><div class="cell" style="--t:0.0303" title="slot 39 — 0.0048"><span>0.5</span></div><div class="cell" style="--t:0.0101" title="slot 40 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0101" title="slot 41 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0606" title="slot 42 — 0.0096"><span>1.0</span></div><div class="cell" style="--t:0.0101" title="slot 43 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0505" title="slot 44 — 0.0080"><span>0.8</span></div><div class="cell" style="--t:0.0303" title="slot 45 — 0.0048"><span>0.5</span></div><div class="cell" style="--t:0.0404" title="slot 46 — 0.0064"><span>0.6</span></div><div class="cell" style="--t:0.0202" title="slot 47 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0303" title="slot 48 — 0.0048"><span>0.5</span></div><div class="cell" style="--t:0.0101" title="slot 49 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0404" title="slot 50 — 0.0064"><span>0.6</span></div><div class="cell" style="--t:0.0000" title="slot 51 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0404" title="slot 52 — 0.0064"><span>0.6</span></div><div class="cell" style="--t:0.0101" title="slot 53 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0303" title="slot 54 — 0.0048"><span>0.5</span></div><div class="cell" style="--t:0.0909" title="slot 55 — 0.0144"><span>1.4</span></div><div class="cell" style="--t:0.0909" title="slot 56 — 0.0144"><span>1.4</span></div><div class="cell" style="--t:0.0101" title="slot 57 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.6061" title="slot 58 — 0.0958"><span>9.6</span></div><div class="cell" style="--t:0.1616" title="slot 59 — 0.0256"><span>2.6</span></div><div class="cell" style="--t:0.0404" title="slot 60 — 0.0064"><span>0.6</span></div><div class="cell" style="--t:0.0202" title="slot 61 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0202" title="slot 62 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0000" title="slot 63 — 0.0000"><span>0.0</span></div></div>
+<p class="plot__scale">darkest cell = <b>15.8%</b></p>
+</figure>
+    <figure class="plot">
+<figcaption><span class="plot__name">Run 2 · attn-prune x64/m16</span><span class="plot__sub">picks 1 of the 16 the target attends most</span></figcaption>
+<div class="grid"><div class="cell" style="--t:0.0151" title="slot 0 — 0.0128"><span>1.3</span></div><div class="cell" style="--t:0.0151" title="slot 1 — 0.0128"><span>1.3</span></div><div class="cell" style="--t:0.0094" title="slot 2 — 0.0080"><span>0.8</span></div><div class="cell" style="--t:0.0075" title="slot 3 — 0.0064"><span>0.6</span></div><div class="cell" style="--t:0.0094" title="slot 4 — 0.0080"><span>0.8</span></div><div class="cell" style="--t:0.0113" title="slot 5 — 0.0096"><span>1.0</span></div><div class="cell" style="--t:0.0056" title="slot 6 — 0.0048"><span>0.5</span></div><div class="cell" style="--t:0.0056" title="slot 7 — 0.0048"><span>0.5</span></div><div class="cell" style="--t:0.0188" title="slot 8 — 0.0160"><span>1.6</span></div><div class="cell" style="--t:0.0038" title="slot 9 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0000" title="slot 10 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 11 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0038" title="slot 12 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0000" title="slot 13 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0094" title="slot 14 — 0.0080"><span>0.8</span></div><div class="cell" style="--t:0.0000" title="slot 15 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0038" title="slot 16 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0038" title="slot 17 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0000" title="slot 18 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0019" title="slot 19 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0019" title="slot 20 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0000" title="slot 21 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 22 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 23 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0038" title="slot 24 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0000" title="slot 25 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 26 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 27 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 28 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0019" title="slot 29 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0000" title="slot 30 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0019" title="slot 31 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0019" title="slot 32 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0000" title="slot 33 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 34 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0038" title="slot 35 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0019" title="slot 36 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0019" title="slot 37 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0019" title="slot 38 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0038" title="slot 39 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0038" title="slot 40 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0000" title="slot 41 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 42 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 43 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0019" title="slot 44 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0000" title="slot 45 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 46 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0019" title="slot 47 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0000" title="slot 48 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0019" title="slot 49 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0000" title="slot 50 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0019" title="slot 51 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0019" title="slot 52 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0000" title="slot 53 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 54 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0000" title="slot 55 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0056" title="slot 56 — 0.0048"><span>0.5</span></div><div class="cell" style="--t:0.0038" title="slot 57 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0019" title="slot 58 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0038" title="slot 59 — 0.0032"><span>0.3</span></div><div class="cell" style="--t:0.0000" title="slot 60 — 0.0000"><span>0.0</span></div><div class="cell" style="--t:0.0019" title="slot 61 — 0.0016"><span>0.2</span></div><div class="cell" style="--t:0.0000" title="slot 62 — 0.0000"><span>0.0</span></div><div class="cell cell--flag" style="--t:1.0000" title="slot 63 — 0.8482"><span>84.8</span></div></div>
+<p class="plot__scale">darkest cell = <b>84.8%</b></p>
+</figure>
+    <figure class="plot">
+<figcaption><span class="plot__name">Reference · the target's own attention</span><span class="plot__sub">where SmolVLM itself looks, averaged</span></figcaption>
+<div class="grid"><div class="cell" style="--t:0.6781" title="slot 0 — 0.0200"><span>2.0</span></div><div class="cell" style="--t:0.5701" title="slot 1 — 0.0168"><span>1.7</span></div><div class="cell" style="--t:0.5899" title="slot 2 — 0.0174"><span>1.7</span></div><div class="cell" style="--t:0.5055" title="slot 3 — 0.0149"><span>1.5</span></div><div class="cell" style="--t:0.5752" title="slot 4 — 0.0170"><span>1.7</span></div><div class="cell" style="--t:0.5426" title="slot 5 — 0.0160"><span>1.6</span></div><div class="cell" style="--t:0.5854" title="slot 6 — 0.0173"><span>1.7</span></div><div class="cell" style="--t:0.7681" title="slot 7 — 0.0227"><span>2.3</span></div><div class="cell" style="--t:0.6342" title="slot 8 — 0.0187"><span>1.9</span></div><div class="cell" style="--t:0.5065" title="slot 9 — 0.0149"><span>1.5</span></div><div class="cell" style="--t:0.4936" title="slot 10 — 0.0146"><span>1.5</span></div><div class="cell" style="--t:0.4665" title="slot 11 — 0.0138"><span>1.4</span></div><div class="cell" style="--t:0.5072" title="slot 12 — 0.0150"><span>1.5</span></div><div class="cell" style="--t:0.4624" title="slot 13 — 0.0136"><span>1.4</span></div><div class="cell" style="--t:0.5012" title="slot 14 — 0.0148"><span>1.5</span></div><div class="cell" style="--t:0.7441" title="slot 15 — 0.0219"><span>2.2</span></div><div class="cell" style="--t:0.6440" title="slot 16 — 0.0190"><span>1.9</span></div><div class="cell" style="--t:0.4875" title="slot 17 — 0.0144"><span>1.4</span></div><div class="cell" style="--t:0.4867" title="slot 18 — 0.0144"><span>1.4</span></div><div class="cell" style="--t:0.4495" title="slot 19 — 0.0133"><span>1.3</span></div><div class="cell" style="--t:0.4768" title="slot 20 — 0.0141"><span>1.4</span></div><div class="cell" style="--t:0.4482" title="slot 21 — 0.0132"><span>1.3</span></div><div class="cell" style="--t:0.4798" title="slot 22 — 0.0142"><span>1.4</span></div><div class="cell" style="--t:0.5671" title="slot 23 — 0.0167"><span>1.7</span></div><div class="cell" style="--t:0.5352" title="slot 24 — 0.0158"><span>1.6</span></div><div class="cell" style="--t:0.4761" title="slot 25 — 0.0140"><span>1.4</span></div><div class="cell" style="--t:0.4764" title="slot 26 — 0.0141"><span>1.4</span></div><div class="cell" style="--t:0.4431" title="slot 27 — 0.0131"><span>1.3</span></div><div class="cell" style="--t:0.4666" title="slot 28 — 0.0138"><span>1.4</span></div><div class="cell" style="--t:0.4427" title="slot 29 — 0.0131"><span>1.3</span></div><div class="cell" style="--t:0.4636" title="slot 30 — 0.0137"><span>1.4</span></div><div class="cell" style="--t:0.4861" title="slot 31 — 0.0143"><span>1.4</span></div><div class="cell" style="--t:0.5727" title="slot 32 — 0.0169"><span>1.7</span></div><div class="cell" style="--t:0.4583" title="slot 33 — 0.0135"><span>1.4</span></div><div class="cell" style="--t:0.4833" title="slot 34 — 0.0143"><span>1.4</span></div><div class="cell" style="--t:0.4306" title="slot 35 — 0.0127"><span>1.3</span></div><div class="cell" style="--t:0.4695" title="slot 36 — 0.0138"><span>1.4</span></div><div class="cell" style="--t:0.4486" title="slot 37 — 0.0132"><span>1.3</span></div><div class="cell" style="--t:0.4916" title="slot 38 — 0.0145"><span>1.5</span></div><div class="cell" style="--t:0.5018" title="slot 39 — 0.0148"><span>1.5</span></div><div class="cell" style="--t:0.5909" title="slot 40 — 0.0174"><span>1.7</span></div><div class="cell" style="--t:0.4642" title="slot 41 — 0.0137"><span>1.4</span></div><div class="cell" style="--t:0.4746" title="slot 42 — 0.0140"><span>1.4</span></div><div class="cell" style="--t:0.4509" title="slot 43 — 0.0133"><span>1.3</span></div><div class="cell" style="--t:0.4839" title="slot 44 — 0.0143"><span>1.4</span></div><div class="cell" style="--t:0.4421" title="slot 45 — 0.0130"><span>1.3</span></div><div class="cell" style="--t:0.4832" title="slot 46 — 0.0143"><span>1.4</span></div><div class="cell" style="--t:0.6009" title="slot 47 — 0.0177"><span>1.8</span></div><div class="cell" style="--t:0.5420" title="slot 48 — 0.0160"><span>1.6</span></div><div class="cell" style="--t:0.4714" title="slot 49 — 0.0139"><span>1.4</span></div><div class="cell" style="--t:0.4575" title="slot 50 — 0.0135"><span>1.3</span></div><div class="cell" style="--t:0.4296" title="slot 51 — 0.0127"><span>1.3</span></div><div class="cell" style="--t:0.4563" title="slot 52 — 0.0135"><span>1.3</span></div><div class="cell" style="--t:0.4481" title="slot 53 — 0.0132"><span>1.3</span></div><div class="cell" style="--t:0.4695" title="slot 54 — 0.0139"><span>1.4</span></div><div class="cell" style="--t:0.8702" title="slot 55 — 0.0257"><span>2.6</span></div><div class="cell" style="--t:0.7253" title="slot 56 — 0.0214"><span>2.1</span></div><div class="cell" style="--t:0.5277" title="slot 57 — 0.0156"><span>1.6</span></div><div class="cell" style="--t:0.5288" title="slot 58 — 0.0156"><span>1.6</span></div><div class="cell" style="--t:0.5116" title="slot 59 — 0.0151"><span>1.5</span></div><div class="cell" style="--t:0.5729" title="slot 60 — 0.0169"><span>1.7</span></div><div class="cell" style="--t:0.4787" title="slot 61 — 0.0141"><span>1.4</span></div><div class="cell" style="--t:0.6048" title="slot 62 — 0.0178"><span>1.8</span></div><div class="cell" style="--t:1.0000" title="slot 63 — 0.0295"><span>2.9</span></div></div>
+<p class="plot__scale">darkest cell = <b>2.9%</b></p>
+</figure>
+  </div>
+  <p class="note">The target's own map is nearly flat (1.3%–2.9% against 1.6% uniform),
+  with a slight lift on the border and a peak at slot 63 — the tile's last token, which
+  behaves like an attention sink. Run 2 lands on that same slot
+  <b style="color:var(--flag)">84.8%</b> of the time.</p>
+</section>
+
+<hr class="rule">
+
+<section class="section">
+  <h2>Is it choosing the right region?</h2>
+  <div class="tablewrap">
+  <table>
+    <thead><tr>
+      <th>measurement</th><th>Run 1 · k1</th><th>Run 2 · attn-prune</th><th>chance</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>top-1 routing weight <span class="chance">(1.0 = pure hard pick)</span></td>
+          <td>0.9987</td><td>0.9992</td><td>0.0156 / 0.0625</td></tr>
+      <tr><td>pick = the target's most-attended slot</td>
+          <td class="bad">0.6%</td><td>55.9%</td><td>1.6% / 6.2%</td></tr>
+      <tr><td>pick = the largest-magnitude slot</td>
+          <td>2.6%</td><td>28.4%</td><td>1.6% / 6.2%</td></tr>
+      <tr><td>correlation with the target's attention</td>
+          <td>+0.081</td><td>+0.468</td><td>0.000</td></tr>
+      <tr><td>correlation with slot magnitude</td>
+          <td>+0.054</td><td>+0.349</td><td>0.000</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="note">Run 2's pool is 16, not 64, so its chance rates are four times higher.
+  Its apparent agreement with the target is not semantic — both converge on the same
+  fixed corner slot.</p>
+</section>
+
+<hr class="rule">
+
+<section class="section">
+  <h2>What the maps say</h2>
+  <ul class="finds">
+    <li><span class="stat stat--flag">0.6%</span>
+      <p><b>Run 1 agrees with the target less often than random.</b> It hits the
+      target's most-attended slot 0.6% of the time against 1.6% for chance. Instead
+      it has a positional habit: about 40% of its picks land in the tile's top row,
+      concentrated on three slots.</p></li>
+    <li><span class="stat stat--flag">84.8%</span>
+      <p><b>Run 2 collapsed onto one corner.</b> Adding the target-attention pre-filter
+      made it worse, not better: five sixths of all picks are slot 63, the tile's last
+      token. It stopped looking at the image and learned a constant.</p></li>
+    <li><span class="stat">1.86×</span>
+      <p><b>The target barely discriminates either.</b> Its own attention peaks at
+      1.86× uniform on slot 63 and is otherwise flat, so a top-16 pre-filter selects
+      a border-biased set rather than a semantically salient one.</p></li>
+  </ul>
+</section>
+
+<hr class="rule">
+
+<section class="why">
+  <h2>Why training produced this</h2>
+  <p>The compressor is trained by the drafter's next-token loss alone — there is no
+  reconstruction or fidelity term anywhere. Three facts stack up:</p>
+  <ol>
+    <li>The drafter barely uses visual tokens. Training top-1 accuracy with all 832
+      visual tokens is <code>0.6892</code>; with 13 it is <code>0.6895</code>.
+      Identical. So the gradient reaching the routing weights carries almost no
+      information about which region matters.</li>
+    <li>Nothing regularizes the routing. <code>weight_decay = 0.0</code> and no entropy
+      penalty, so <code>‖k_proj‖</code> grows without bound — the raw logit range reached
+      <b>173,616</b> against a temperature of 8. Sharpening always shaves a little loss,
+      and nothing pushes back.</li>
+    <li>With no value projection, a one-hot weight vector makes the "summary" a
+      verbatim copy of one token. The convex combination degenerates to a corner
+      of the simplex.</li>
+  </ol>
+  <p>So this is not a compressor that learned the wrong thing. It is a compressor whose
+  objective never constrained it, drifting to a fixed positional habit while the loss
+  looked fine.</p>
+</section>
+
+<footer>
+  Measured with <code>my_angel/vistoken_heatmap_probe.py</code> on the real
+  SmolVLM-256M-Instruct target, 46 image samples / 626 tiles, checkpoint-66466 of each run.
+</footer>
+
+</div>
