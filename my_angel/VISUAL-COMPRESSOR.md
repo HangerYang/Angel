@@ -1,6 +1,8 @@
 # Visual compression for the SmolVLM EAGLE-3 drafter
 
-Status as of **2026-09-01**. Two runs trained, both evaluated, both a net loss.
+Status as of **2026-09-01**. Two runs trained, both evaluated, both a net loss —
+and §6 explains why: the learned routing collapsed to a one-hot pick, so what
+trained was a row *sampler*, not a compressor.
 This file is the record of what was built, what was measured, and what the
 numbers actually say. It supersedes nothing — `TODO-vistoken-k1.md` (the design)
 and `TODO-attn-prune.md` (the pre-launch probe) are still the source of truth for
@@ -37,6 +39,7 @@ at every depth the target read it at.
 | 8 | **Pre-launch probe** — measured that weighting query positions by image-attention mass is a **no-op** (84.0% of tiles keep an identical row set, mean Jaccard 0.981), because the weights are already flat. Implemented, measured, reverted. Same probe put the honest prior on the prune signal: a tile's top-16 rows hold **0.344** of its score mass vs **0.250** flat — real, but modest. | `my_angel/attn_prune_weighting_probe.py`, commit `31cada4d` |
 | 9 | **Run 2: `vistoken-k1-attn-prune-x64-m16`** — same as run 1 plus `vistoken_prune: {group_size: 64, keep_m: 16, mode: target_attn}`. | `my_angel/eagle/vistoken-k1-attn-prune-x64-m16` |
 | 10 | **Full ATD eval of both**, 8 benchmarks × temp {0,1}, on the same harness as every other arm. | `my_angel/one-layer-results.md` |
+| 11 | **Routing-quality probe** — rebuild the trained compressor from a checkpoint, run the real target on 46 image samples / 626 tiles, and measure what the learned query actually does. This is what found the failure in §6. | `my_angel/vistoken_routing_probe.py` |
 
 ---
 
@@ -167,7 +170,9 @@ roughly double that).
 **Conclusion: more training will not close this.** The compressor preserves the
 argmax and destroys the calibration, and the calibration gap is diverging, not
 converging. A third epoch buys a slightly better compressor of a kind that is
-already known not to help.
+already known not to help — and §6 shows the routing distribution is collapsing
+*further* every epoch, so more training actively makes the compressor worse at
+the one thing it exists to do.
 
 ### The routing barely learned anything
 
@@ -186,7 +191,86 @@ The most concrete symptom, read straight out of `checkpoint-66466/model.safetens
 
 ---
 
-## 6. The unresolved risk in the decode path
+## 6. The failure: it is not compressing, it is hard-selecting one row of 64
+
+`my_angel/vistoken_routing_probe.py`, real SmolVLM-256M target, **46 image
+samples / 626 tiles**, both checkpoints of `vistoken-k1`.
+
+### The routing softmax is completely saturated
+
+| | ckpt-33233 (1 ep) | ckpt-66466 (2 ep) | reference |
+|---|---:|---:|---|
+| effective support `exp(H(w))` | **1.00** | **1.00** | 1 = hard pick, 64 = mean pool |
+| top-1 routing weight | **0.9985** | **0.9987** | uniform = 0.0156 |
+| raw logit range (max−min) | 64,373 | **173,616** | trained `temperature` = **8.0** |
+
+The design intended a *convex combination* of a tile's 64 rows. The optimizer went
+to a **corner of the simplex** instead. Since `VisRowCompressor` deliberately has
+**no value projection**, a one-hot `w` means the "summary" of a tile is a
+**verbatim copy of one of its 64 rows** — the other 63 contribute nothing.
+
+So `vistoken-k1` is not a compressor. It is a learned **row sampler that keeps
+1 row and drops 98.4% of the image**. That it costs only 6.3% acceptance is
+almost impressive; that it never beat the baseline is not surprising.
+
+### Root cause: nothing bounds the logit scale
+
+`temperature = 8.0` is `sqrt(key_dim=64)` — correct for unit-scale keys. But
+`weight_decay = 0.0` (read from `checkpoint-66466/training_args.bin`) and no
+entropy penalty, so `k_proj` is free to grow without limit, and it does: its norm
+went 26.49 → 34.88 between epochs (§5) and the resulting logit range **grew 170%,
+64,373 → 173,616**. Divided by 8, the softmax sees logits ~21,700 wide. The loss
+can always be reduced a little by committing harder, and nothing pushes back.
+
+**This is the precise sense in which the adaptor's training quality is bad, and
+it is the opposite of undertrained.** The model is still learning (§5) while the
+routing distribution has already collapsed and is collapsing further every epoch.
+
+### Un-saturating it would not rescue it — the query direction carries no signal
+
+Re-softmaxing the *same trained logits* at higher temperature, against the
+target's own attention over the same rows (ckpt-66466):
+
+| temperature | `exp(H)` | Pearson r(w, target score) | top-16 Jaccard |
+|---:|---:|---:|---:|
+| 8 (trained) | 1.00 | 0.0813 | 0.2218 |
+| 32 | 1.01 | 0.0815 | 0.2244 |
+| 128 | 1.04 | 0.0822 | 0.2387 |
+| 512 | 1.16 | 0.0844 | 0.2620 |
+| 2048 | 1.88 | 0.0965 | 0.2606 |
+| | | | *chance = 0.1429* |
+
+At 256x the trained temperature the correlation moves from 0.081 to 0.097. **The
+learned query direction is essentially uninformative about what the target
+reads.** Fixing the temperature alone would turn a hard pick of an arbitrary row
+into a soft average weighted by an arbitrary direction.
+
+### Is the picked row at least sensible?
+
+- **It is content-dependent, not a fixed habit.** The same tile index picks the
+  same row only **20.6%** of the time across different images; 57 of the 64 row
+  slots get used (effective 24.6).
+- **But it disagrees with the target.** Top-16 Jaccard against the target's own
+  attention ranking is **0.222** against a chance value of 0.143, and r = 0.081.
+  So it is choosing on *something*, and that something is nearly orthogonal to
+  what the target model actually reads out of the tile.
+- The selected row is **cos 0.820** from the plain tile mean, i.e. it is
+  meaningfully different from the mean — it is not accidentally reproducing the
+  averaging null.
+
+Both checkpoints tell the same story, and epoch 2 is *worse* than epoch 1 on every
+axis that matters: more collapsed (effective distinct rows 29.0 → 24.6), further
+from the mean (cos 0.832 → 0.820), logit range up 170%.
+
+Reproduce:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python my_angel/vistoken_routing_probe.py --n 48
+```
+
+---
+
+## 7. The unresolved risk in the decode path
 
 `TODO-vistoken-k1.md` flagged one thing to check on the first real run, and **it
 was never checked.** In the compact prefill,
@@ -214,7 +298,7 @@ Verifying it costs one instrumented run and would remove the last alternative to
 
 ---
 
-## 7. Why the speed argument does not work either
+## 8. Why the speed argument does not work either
 
 Even at neutral acceptance, compression would not have paid. Throughput went
 **down** 7.4%. The image rows only cost the drafter in **prefill**, which happens
@@ -228,38 +312,55 @@ representation-quality idea, not an efficiency idea.
 
 ---
 
-## 8. What "plan 2" would be
+## 9. What "plan 2" would be
 
 There is **no Plan 2 / Idea 2 recorded anywhere in this repo** — grep for
 `idea 2|plan 2|second idea` across `feature/vistoken-attn-prune`,
 `feature/visual-compression`, `main` and `feature/branch-distillation` returns only
 the `# TODO — visual row compression (Idea 1)` heading. The design doc's forward
-plan is an ablation list, not a second idea:
+plan was an ablation list, not a second idea. §6 changes what is worth running
+from that list.
 
-| candidate | what it settles | cost |
-|---|---|---|
-| **Offline routing-entropy probe** on the trained k=1 checkpoint | Whether the learned query is doing anything at all, or has collapsed to a mean pool. `ref_mix` being uniform is already suggestive. | ~30 min GPU, no training |
-| `query_mode: "mean"` at k=1 | The null baseline. If plain averaging matches the learned compressor, the learned-query design is dead. | 1 training run |
-| `num_queries: 4` / `16` | Whether k=1 is simply too aggressive — 13–17 rows for a whole image. The τ curve should peak, not saturate. | 1–2 runs |
-| `vistoken_prune: {mode: "random"}` | Separates "pruning at all helps" from "the target-attention signal helps". | 1 run |
-| Instrument `seq_lens` / cache holes (§6) | Closes the last decode-path alternative explanation. | 1 eval run |
+### Ruled out by §6, do not spend GPU time on these
 
-**Recommendation.** Run the offline routing-entropy probe *first* — it is the only
-item that costs no training, and combined with the uniform `ref_mix` it can kill or
-rescue the whole line in an afternoon. If the routing has collapsed to a mean pool,
-`num_queries: 4/16` is the only ablation worth the GPU time; if it has not, then
-the compressor is making a real but wrong choice and `query_mode: "mean"` is the
-comparison that matters.
+- **`query_mode: "mean"` as a null.** It was the right experiment *before* the
+  probe. Now we know the learned routing is a one-hot pick with r = 0.08 against
+  the target's attention, so "does averaging beat this?" is no longer an open
+  question worth a 4-hour run — it is the same question as "is an arbitrary
+  single row worse than the tile mean?", and the answer only matters if the
+  learned path is repaired first.
+- **`vistoken_prune: {mode: "random"}`.** The prune feeds a selector that then
+  hard-picks one row anyway. Pruning 64 → 16 before a one-hot pick explains the
+  observed +0.5% τ (noise). The ablation would measure a stage that is not the
+  bottleneck.
 
-Set against the alternative use of the same GPUs: `branch_change_top1_w01`
-(**+4.0% τ, +3.9% tok/s** over `banded_mix_fc_3.1`) is a working direction with
-several unexplored knobs, while visual compression is at **−5.5% τ** after two full
-runs. That asymmetry, not any single number above, is the argument for treating
-vistoken as a probe to close out rather than a line to extend.
+### The two things actually worth doing
+
+| # | what | why | cost |
+|---|---|---|---|
+| 1 | **Repair the routing and retrain k=1**: normalize the dot product (`q·k / (‖q‖‖k‖)`, or a LayerNorm before `k_proj`), and/or put weight decay on the compressor group, and/or add an entropy floor on `w`. `weight_decay=0.0` today, so nothing bounds `‖k_proj‖`. | Without this, every other vistoken run repeats the same collapse — the failure is in the objective's geometry, not in `k`. | 1 training run |
+| 2 | **`num_queries: 4` / `16` after the repair** | k=1 gives the drafter 13–17 rows for a whole image. Even a *correct* summarizer may not fit an image into that. Run it only after (1); with a one-hot router, raising k just samples k arbitrary rows. | 1–2 runs |
+
+`seq_lens` / cache-hole instrumentation (§7) stays worth one cheap eval run
+whenever a vistoken checkpoint is next evaluated, since it is the only remaining
+alternative explanation for the decode gap.
+
+### The honest framing
+
+The probe converts "visual compression does not work" into something sharper:
+**it was never tested.** What trained was a row *sampler*, not a compressor. That
+is a real bug with a known fix, and it is the one argument for spending another
+run here.
+
+Against that: `branch_change_top1_w01` is at **+4.0% τ, +3.9% tok/s** over
+`banded_mix_fc_3.1` with several unexplored knobs, while vistoken is at **−5.5% τ**
+after two full runs and needs a third just to reach a fair test. If only one run is
+affordable, item (1) is the one that buys information — it either produces a real
+compressor or retires the idea on evidence rather than on a bug.
 
 ---
 
-## 9. Reproducing
+## 10. Reproducing
 
 ```bash
 # train (4 GPUs, ~4h, 2 epochs, 66,466 steps)
