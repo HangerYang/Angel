@@ -1,6 +1,9 @@
 # TODO — target-attention row pruning (vistoken-k1 + x64/m16)
 
-Status: **ready to train, one run.** Written 2026-08-31.
+Status: **trained and evaluated — no effect.** Written 2026-08-31; outcome
+recorded 2026-09-01 in **`my_angel/VISUAL-COMPRESSOR.md`**. The prune beats plain
+`vistoken-k1` by +0.5% tau at temp 0, inside run-to-run noise, and stays ~5% below
+the no-compressor baseline. The `mode="random"` ablation was never run.
 
 Config: `angelslim/compressor/speculative/train/configs/`
 `smolvlm-256m-eagle3-vistoken-k1-attn-prune-x64-m16.json` — vistoken k=1 plus

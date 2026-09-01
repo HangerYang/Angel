@@ -1,6 +1,11 @@
 # TODO — visual row compression (Idea 1), k=1
 
-Status: **implemented, not yet launched.** Written 2026-08-20.
+Status: **launched, trained, evaluated — a net loss.** Written 2026-08-20;
+outcome recorded 2026-09-01 in **`my_angel/VISUAL-COMPRESSOR.md`**, which is now
+the results record. Read that first; this file remains the design rationale.
+Short version: `vistoken-k1` is `banded_mix_fc_3.1` + the compressor and lands at
+tau 2.557 vs 2.706 (temp 0, 8-benchmark mean) — **-5.5%** — with the whole loss on
+image benchmarks and MATH-500 at parity.
 
 One cross-attention layer compresses each image tile's 64 target rows to k, in
 target-aux-HS space, so the drafter's single attention layer routes over 13-17
