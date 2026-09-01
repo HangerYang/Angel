@@ -75,7 +75,3 @@ third_party/HiViS/**/__pycache__/
 # Local nested repository checkouts; preserved via manifest/patches
 ViSpec/
 third_party/HiViS/
-
-# Vendored HiViS: upstream benchmark index files (12MB, byte-identical to
-# upstream). Fetch them per HiViS/README.md 1.1 if you need HiViS's own eval.
-HiViS/hivis/evaluation/data/

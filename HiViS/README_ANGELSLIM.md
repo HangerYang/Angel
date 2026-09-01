@@ -27,7 +27,9 @@ loader plus five glue points; the arithmetic is AngelSlim's, executed by HiViS.
 | `hivis/model/kv_cache.py` | resolve `config.text_config` and the decoder-layer path for `Idefics3ForConditionalGeneration` |
 | `run_angelslim_eval.py` | **new** — acceptance-length / throughput harness |
 
-Everything else under `hivis/` is upstream, byte for byte.
+Everything else under `hivis/` is upstream, byte for byte -- including
+`hivis/evaluation/data/`, the metadata for the five benchmarks HiViS does not
+pull from the Hub (see "Datasets" below).
 
 ## The five things that had to be bridged
 
@@ -110,7 +112,26 @@ python run_angelslim_eval.py --draft $CKPT --n 40 --max_new_tokens 1024 \
     --naive --out ../results_naive.json
 ```
 
-`--dataset` accepts `opendatalab/OmniDocBench` (default) and `MMMU/MMMU`.
+### Datasets
+
+`run_angelslim_eval.py --dataset` accepts exactly two, both fetched from the
+Hub: `opendatalab/OmniDocBench` (default) and `MMMU/MMMU` (History / test).
+Anything else raises. OmniDocBench is our choice, not HiViS's -- it matches
+what the vLLM eval runs, which is what makes the acceptance numbers comparable
+across the two backends.
+
+HiViS's own harness (`hivis/evaluation/benchmark_data.py`, `load_benchmark`)
+covers eleven, and this port does not use any of them yet:
+
+| Source | Benchmarks |
+|---|---|
+| Hub, automatic | `ScienceQA` `ChartQA` `MathVista` `DocVQA` `vqav2` `mmmu` |
+| local images required | `gqa` `textvqa` `mme` `mmvet` `seedbench` |
+
+The second row needs image directories downloaded per HiViS README section 1.1;
+the JSON/JSONL metadata for them is already vendored under
+`hivis/evaluation/data/`. Pointing `run_angelslim_eval.py` at `load_benchmark`
+would make all eleven available -- a small change, not yet made.
 
 ## Results
 
