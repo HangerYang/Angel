@@ -23,10 +23,9 @@ the highest-numbered one produces.
 
 Not part of the vLLM chain:
 
-- `hivis/hivis-local-smolvlm.patch` — local SmolVLM changes for the nested
-  `third_party/HiViS` checkout. It lives in a subdirectory precisely so
-  `apply_vllm_patches.sh` does not try it against vLLM (it only scans top-level
-  `*.patch`).
+- HiViS is no longer patched from here. The vendored checkout at `HiViS/`
+  carries its SmolVLM + AngelSlim-EAGLE3 changes in-tree; see
+  `HiViS/README_ANGELSLIM.md`.
 - `eagle_gist.py.txt` + `GIST_PATCH_NOTES.md` — oracle gist conditioning, applied
   by hand; see the notes. Not wired into the chain.
 
