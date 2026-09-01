@@ -1,0 +1,22 @@
+{
+  "samples": 32,
+  "positions": 28613,
+  "near_miss_positions": 1632,
+  "norm_ratio": {
+    "baseline": 0.35430091217744586,
+    "branch_change": 0.4614635622676681
+  },
+  "abs_ratio_error": {
+    "baseline": 0.6576383667541486,
+    "branch_change": 0.5519480654129795
+  },
+  "cosine": {
+    "baseline": 0.14464122360097428,
+    "branch_change": 0.30614738239377154
+  },
+  "norms": {
+    "target_delta": 399.61113365023743,
+    "baseline_delta": 138.91049579545563,
+    "branch_change_delta": 197.910930222156
+  }
+}

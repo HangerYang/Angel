@@ -1,0 +1,27 @@
+{
+  "samples": 32,
+  "scorable_positions": 28613,
+  "near_miss_positions": 1632,
+  "near_miss_bucket_counts": {
+    "low": {
+      "count": 588,
+      "share_of_near_misses": 0.3602941176470588,
+      "near_miss_rate_within_bucket": 0.024457199900174694
+    },
+    "medium": {
+      "count": 261,
+      "share_of_near_misses": 0.15992647058823528,
+      "near_miss_rate_within_bucket": 0.14285714285714285
+    },
+    "high": {
+      "count": 783,
+      "share_of_near_misses": 0.4797794117647059,
+      "near_miss_rate_within_bucket": 0.2853498542274053
+    }
+  },
+  "all_position_bucket_counts": {
+    "low": 24042,
+    "medium": 1827,
+    "high": 2744
+  }
+}

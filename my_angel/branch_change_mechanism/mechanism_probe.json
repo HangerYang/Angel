@@ -1,0 +1,38 @@
+{
+  "samples": 32,
+  "positions": 28613,
+  "baseline_near_miss_positions": 1632,
+  "baseline_near_miss_rate": 0.05703701114877853,
+  "delta_alignment": {
+    "mse_baseline": 5.647920643582063,
+    "mse_branch_change": 4.408181955416997,
+    "cos_baseline": 0.14464122360097428,
+    "cos_branch_change": 0.30614738239377154,
+    "top10_overlap_baseline": 0.05888480455705933,
+    "top10_overlap_branch_change": 0.07867647225365919
+  },
+  "near_miss_repair": {
+    "teacher_top1_rank_baseline": 162.93173198482933,
+    "teacher_top1_rank_branch_change": 64.0960809102402,
+    "teacher_top1_logit_baseline": 7.912562779017857,
+    "teacher_top1_logit_branch_change": 9.240169173094777,
+    "branch_change_top1_correct_on_baseline_near_miss": 0.3647281921618205
+  },
+  "ambiguity_buckets": {
+    "low": {
+      "positions": 24042.0,
+      "top1_agreement_baseline": 0.8827052657848765,
+      "top1_agreement_branch_change": 0.9549538307961069
+    },
+    "medium": {
+      "positions": 1827.0,
+      "top1_agreement_baseline": 0.6562671045429667,
+      "top1_agreement_branch_change": 0.776135741652983
+    },
+    "high": {
+      "positions": 2744.0,
+      "top1_agreement_baseline": 0.42747813411078717,
+      "top1_agreement_branch_change": 0.42784256559766765
+    }
+  }
+}
