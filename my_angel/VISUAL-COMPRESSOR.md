@@ -312,14 +312,58 @@ representation-quality idea, not an efficiency idea.
 
 ---
 
-## 9. What "plan 2" would be
+## 9. Plan 2, and what is worth running next
 
-There is **no Plan 2 / Idea 2 recorded anywhere in this repo** — grep for
-`idea 2|plan 2|second idea` across `feature/vistoken-attn-prune`,
-`feature/visual-compression`, `main` and `feature/branch-distillation` returns only
-the `# TODO — visual row compression (Idea 1)` heading. The design doc's forward
-plan was an ablation list, not a second idea. §6 changes what is worth running
-from that list.
+### It exists, it is on `mess`, and it already ran
+
+"Plan 2" — *first train the compressor on its own so that the **target model**
+still runs correctly on the compressed tokens, then hand it to the drafter* — is
+the **qsampler** line. It is not recorded under that name (grep for
+`idea 2|plan 2` returns only the `Idea 1` heading), but the code and results are
+on branch `mess`:
+
+- `tools/train_qsampler.py` — freezes the vision tower, connector, text model and
+  `lm_head`; compresses each tile's 64 connector rows to N; **scatters the
+  compressed rows back into the `<image>` slots and runs the frozen target LM on
+  them** (`run_text_branch`); trains on `KL(target_full ‖ target_compressed)` over
+  the text positions plus a hidden-state cosine term. That is exactly the
+  target-invariance objective.
+- Results are on disk: `output/qsampler-n{1,4,8,16}`, `logs/qsampler_n*.log`,
+  2 epochs each, ~21 min on 4 GPUs.
+
+| N per tile | compression | eval KL | **target top-1 agreement** | hidden cos |
+|---:|---:|---:|---:|---:|
+| 1 | 64x | 0.4043 | **79.4%** | 0.9439 |
+| 4 | 16x | 0.2740 | 82.8% | 0.9632 |
+| 8 | 8x | 0.2201 | 84.3% | 0.9726 |
+| 16 | 4x | 0.1930 | **85.2%** | 0.9763 |
+
+Read the third column as *how often the target model, fed compressed visual
+tokens, still predicts its own original next token*. Even at 4x compression it
+disagrees with itself **15% of the time**; at 64x — the ratio `vistoken-k1` uses —
+**20%**. Eval flattens after ~step 1000, so more epochs buy nothing.
+
+**Two caveats before using these numbers as a verdict on vistoken.**
+
+1. **Different space.** qsampler compresses *connector output in LM embedding
+   space* (before the target LM). vistoken compresses *aux hidden states across 9
+   layers* (after it). `TODO-vistoken-k1.md` dropped qsampler for exactly this
+   reason — it is not even used as an init.
+2. **Different requirement.** The fixed test-time setup is that the **target reads
+   the full image** and only the *draft* sees compressed rows. So target-invariance
+   is a proxy for "did the compression keep the information the LM needs", not the
+   deployment condition. A drafter can tolerate more loss than the target can.
+
+With those caveats, the qsampler sweep is still the best available prior on how
+much a tile can be squeezed at all, and it says **64x is the expensive end of the
+curve**: going 4x → 64x costs 5.8 points of target agreement while the curve is
+still clearly falling. That is an independent argument for `num_queries: 4/16`
+over `k=1`, alongside §6.
+
+### The rest of the forward plan
+
+The design doc's remaining items were an ablation list. §6 changes what is worth
+running from it.
 
 ### Ruled out by §6, do not spend GPU time on these
 
@@ -339,7 +383,7 @@ from that list.
 | # | what | why | cost |
 |---|---|---|---|
 | 1 | **Repair the routing and retrain k=1**: normalize the dot product (`q·k / (‖q‖‖k‖)`, or a LayerNorm before `k_proj`), and/or put weight decay on the compressor group, and/or add an entropy floor on `w`. `weight_decay=0.0` today, so nothing bounds `‖k_proj‖`. | Without this, every other vistoken run repeats the same collapse — the failure is in the objective's geometry, not in `k`. | 1 training run |
-| 2 | **`num_queries: 4` / `16` after the repair** | k=1 gives the drafter 13–17 rows for a whole image. Even a *correct* summarizer may not fit an image into that. Run it only after (1); with a one-hot router, raising k just samples k arbitrary rows. | 1–2 runs |
+| 2 | **`num_queries: 4` / `16` after the repair** | k=1 gives the drafter 13–17 rows for a whole image. Even a *correct* summarizer may not fit an image into that — the qsampler sweep above measures the same curve in a different space and 64x sits at its expensive end. Run it only after (1); with a one-hot router, raising k just samples k arbitrary rows. | 1–2 runs |
 
 `seq_lens` / cache-hole instrumentation (§7) stays worth one cheap eval run
 whenever a vistoken checkpoint is next evaluated, since it is the only remaining
