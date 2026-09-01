@@ -44,11 +44,30 @@ _ANGELSLIM_ROOT_ENV = "ANGELSLIM_ROOT"
 _DRAFT_PKG = "angelslim.compressor.speculative.inference.models.eagle3.draft"
 
 
+def _default_root():
+    """Walk up from this file looking for the repo that contains `angelslim/`.
+
+    HiViS is vendored inside the AngelSlim checkout, so the repo root is a
+    couple of levels up -- but not at a fixed absolute path, since this runs on
+    several machines. Fall back to the cwd's repo if the layout ever changes.
+    """
+    here = os.path.abspath(os.path.dirname(__file__))
+    for candidate in (here, os.getcwd()):
+        while True:
+            if os.path.isdir(os.path.join(candidate, "angelslim")):
+                return candidate
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            candidate = parent
+    return here
+
+
 def load_angelslim_draft_module(angelslim_root=None):
     """Import the AngelSlim inference drafter without running angelslim/__init__."""
     import importlib
 
-    root = angelslim_root or os.environ.get(_ANGELSLIM_ROOT_ENV) or "/home/hyang/Angel"
+    root = angelslim_root or os.environ.get(_ANGELSLIM_ROOT_ENV) or _default_root()
     if not os.path.isdir(os.path.join(root, "angelslim")):
         raise RuntimeError(
             "Could not find an angelslim checkout at %r. Pass angelslim_root= or set %s."

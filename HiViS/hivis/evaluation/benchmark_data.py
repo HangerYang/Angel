@@ -19,6 +19,23 @@ _HF_SPECS = {
     "DocVQA": ("lmms-lab-encoder/DocVQA", "DocVQA", "test"),
 }
 
+# Benchmarks we added so an AngelSlim drafter and a HiViS/ViSpec drafter can be
+# measured on the same rows. These are sampled FIRST-N, not shuffled, because
+# tools/vllm_offline_eagle3_vlm_batch.py samples first-N -- keeping the same
+# rows is what makes a PyTorch number comparable to a vLLM number. Do not
+# "fix" them to use SEED.
+_ANGELSLIM_SPECS = {
+    "omnidocbench": ("opendatalab/OmniDocBench", None, "train"),
+    "mmmu_history": ("MMMU/MMMU", "History", "test"),
+}
+
+# Byte-identical to _OCR_PROMPT in tools/vllm_offline_eagle3_vlm_batch.py.
+_ANGELSLIM_OCR_PROMPT = (
+    "Perform an OCR task on the provided image. Extract the text accurately "
+    "and provide a detailed explanation of the process. Ensure the response "
+    "is comprehensive and well-structured."
+)
+
 _IMG_REF_RE = re.compile(r"<image\s*(\d+)\s*>", flags=re.IGNORECASE)
 _OCR_SUFFIX = " Perform an OCR task on the provided image. Please extract the text accurately and provide a detailed explanation of the process. Ensure the response is comprehensive and well-structured."
 
@@ -115,8 +132,21 @@ def _load_seedbench(sample_count):
     return dataset.cast_column("image", Image())
 
 
+def supported_benchmarks():
+    """Every name load_benchmark accepts."""
+    return sorted(
+        list(_ANGELSLIM_SPECS)
+        + list(_HF_SPECS)
+        + ["gqa", "mme", "mmvet", "seedbench", "vqav2", "textvqa", "mmmu"]
+    )
+
+
 def load_benchmark(name, sample_count=SAMPLE_COUNT):
     """Load and deterministically sample one supported benchmark."""
+    if name in _ANGELSLIM_SPECS:
+        repo_id, config_name, split = _ANGELSLIM_SPECS[name]
+        dataset = load_dataset(repo_id, config_name, split=split)
+        return dataset.select(range(min(sample_count, len(dataset))))
     if name in _HF_SPECS:
         repo_id, config_name, split = _HF_SPECS[name]
         dataset = load_dataset(repo_id, config_name, split=split)
@@ -202,7 +232,16 @@ def _prepare_mmmu(row):
 def prepare_inputs(model, dataset, index, dataset_name, truncation=False):
     """Convert one benchmark row into processor inputs on the model device."""
     row = dataset[index]
-    if dataset_name == "ScienceQA":
+    if dataset_name == "omnidocbench":
+        messages, image = _message(_ANGELSLIM_OCR_PROMPT), row["image"]
+    elif dataset_name == "mmmu_history":
+        question = _IMG_REF_RE.sub("", row["question"]).strip()
+        messages = _message(
+            f"Answer this question: {question} "
+            "Then describe the image in detail to justify your answer."
+        )
+        image = row["image_1"]
+    elif dataset_name == "ScienceQA":
         choices = " ".join(f"({chr(65 + i)}) {choice}" for i, choice in enumerate(row["choices"]))
         messages, image = _message(f"{row['question']} {choices}"), row["image"]
     elif dataset_name == "vqav2":

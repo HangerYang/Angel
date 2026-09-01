@@ -25,9 +25,10 @@ loader plus five glue points; the arithmetic is AngelSlim's, executed by HiViS.
 | `hivis/model/model_hivis.py` | `draft_method="angelslim_eagle3"`; aux-hidden-state capture; SmolVLM target backbone swap; shared AR baseline path |
 | `hivis/model/utils_hivis.py` | SmolVLM prefill embeds; angelslim branches in `initialize_tree` / `generate_initial_tree` / `update_inference_inputs` |
 | `hivis/model/kv_cache.py` | resolve `config.text_config` and the decoder-layer path for `Idefics3ForConditionalGeneration` |
-| `run_angelslim_eval.py` | **new** — acceptance-length / throughput harness |
+| `hivis/evaluation/benchmark_data.py` | `omnidocbench` + `mmmu_history` (our vLLM-matched rows) and `supported_benchmarks()` |
+| `run_angelslim_eval.py` | **new** — acceptance-length / throughput harness, either drafter family × any benchmark |
 
-Everything else under `hivis/` is upstream, byte for byte -- including
+Everything else under `hivis/` is upstream, byte for byte — including
 `hivis/evaluation/data/`, the metadata for the five benchmarks HiViS does not
 pull from the Hub (see "Datasets" below).
 
@@ -91,12 +92,50 @@ Acceptance also matches the vLLM reference. Under chain decoding (K=4,
 this harness reports 2.913. Acceptance is not degraded by the port, which was
 the requirement.
 
+## Environment
+
+Nothing here is tied to a particular environment manager. What the code needs is
+a **Python 3.9+ interpreter with HiViS's own dependencies** (`requirements.txt`,
+notably `transformers` 4.5x — *not* 5.x, whose `Cache` objects this fork's
+`modeling_llama_kv` does not speak) and `HiViS/` importable.
+
+Pick whichever the machine already uses:
+
+```bash
+# uv
+uv venv && uv pip install -r requirements.txt
+source .venv/bin/activate
+
+# conda / mamba
+conda create -n hivis python=3.9 && conda activate hivis
+pip install -r requirements.txt
+
+# or any interpreter you already have
+```
+
+Then, from `HiViS/`:
+
+```bash
+python run_angelslim_eval.py ...
+```
+
+or from anywhere:
+
+```bash
+PYTHONPATH=/path/to/HiViS python /path/to/HiViS/run_angelslim_eval.py ...
+```
+
+Only two paths are environment-sensitive and both are overridable, never
+hardcoded at call time:
+
+- `ANGELSLIM_ROOT` — where to find the `angelslim` source tree. Left unset it
+  is discovered by walking up from this file (HiViS is vendored inside the
+  AngelSlim checkout), so it needs setting only if the two live apart.
+- `--base` / `--draft` — take local paths or Hub repo ids interchangeably.
+
 ## Running
 
 ```bash
-conda activate hivis
-cd HiViS
-
 CKPT=../dataset/angelslim-smolvlm-eagle3-artifacts/weight/branch-distill-top1-w01/checkpoint-66466
 
 # tree decoding (EAGLE-2 style)
@@ -112,26 +151,60 @@ python run_angelslim_eval.py --draft $CKPT --n 40 --max_new_tokens 1024 \
     --naive --out ../results_naive.json
 ```
 
-### Datasets
+## Running *their* model on *our* benchmarks
 
-`run_angelslim_eval.py --dataset` accepts exactly two, both fetched from the
-Hub: `opendatalab/OmniDocBench` (default) and `MMMU/MMMU` (History / test).
-Anything else raises. OmniDocBench is our choice, not HiViS's -- it matches
-what the vLLM eval runs, which is what makes the acceptance numbers comparable
-across the two backends.
+`--draft_method` selects the drafter family and `--dataset` the rows; the two are
+independent, so all four combinations work through one script:
 
-HiViS's own harness (`hivis/evaluation/benchmark_data.py`, `load_benchmark`)
-covers eleven, and this port does not use any of them yet:
+```bash
+# HiViS's published drafter, on the benchmark our vLLM eval uses
+python run_angelslim_eval.py --draft_method hivis \
+    --base Qwen/Qwen2.5-VL-7B-Instruct \
+    --draft Irisssme/HiViS-Qwen2.5-VL-7B-Instruct \
+    --dataset omnidocbench --n 40 --max_new_tokens 1024 \
+    --total_token 60 --depth 5 --top_k 10 --out ../results_hivis_omni.json
 
-| Source | Benchmarks |
-|---|---|
-| Hub, automatic | `ScienceQA` `ChartQA` `MathVista` `DocVQA` `vqav2` `mmmu` |
-| local images required | `gqa` `textvqa` `mme` `mmvet` `seedbench` |
+# ViSpec's, likewise
+python run_angelslim_eval.py --draft_method vispec \
+    --base Qwen/Qwen2.5-VL-3B-Instruct \
+    --draft JLKang/ViSpec-Qwen2.5-VL-3B-Instruct --dataset omnidocbench ...
 
-The second row needs image directories downloaded per HiViS README section 1.1;
-the JSON/JSONL metadata for them is already vendored under
-`hivis/evaluation/data/`. Pointing `run_angelslim_eval.py` at `load_benchmark`
-would make all eleven available -- a small change, not yet made.
+# ...and ours on one of theirs
+python run_angelslim_eval.py --draft $CKPT --dataset DocVQA ...
+```
+
+`--base` must be the target the drafter was trained against — a drafter is tied
+to its target's hidden size, vocabulary and `d2t` map, so mixing them is a shape
+error at best and silent garbage at worst. The script does not guess it.
+
+**What this does and does not license you to compare.** Two different drafters
+on the same rows, in this harness, share a backend and a decoding loop, so their
+τ and their speedup-over-own-baseline are comparable. Their *absolute* tok/s is
+not: HiViS's checkpoint drives Qwen2.5-VL-7B and ours drives SmolVLM-256M, so
+the tok/s columns are 7B numbers next to 256M numbers. Always quote speedup
+against each model's own `--naive` run in the same configuration.
+
+## Datasets
+
+`--dataset` accepts thirteen names, all resolved by
+`hivis/evaluation/benchmark_data.py`:
+
+| Source | Benchmarks | Sampling |
+|---|---|---|
+| ours, Hub | `omnidocbench` (default) `mmmu_history` | **first N, unshuffled** |
+| HiViS, Hub | `ScienceQA` `ChartQA` `MathVista` `DocVQA` `vqav2` `mmmu` | shuffled, seed 42 |
+| HiViS, local images | `gqa` `textvqa` `mme` `mmvet` `seedbench` | shuffled, seed 42 |
+
+The last row needs image directories downloaded per HiViS README section 1.1;
+the JSON/JSONL metadata is already vendored under `hivis/evaluation/data/`.
+
+`omnidocbench` and `mmmu_history` are ours, added so a HiViS or ViSpec drafter
+can be measured on the rows our vLLM eval uses. They deliberately sample
+**first-N and unshuffled**, because `tools/vllm_offline_eagle3_vlm_batch.py`
+does — same rows is the whole reason a PyTorch τ can be held next to a vLLM τ.
+Do not "fix" them to use the seed-42 shuffle the HiViS benchmarks use; that
+silently breaks the cross-backend comparison and every number in the table
+below.
 
 ## Results
 
