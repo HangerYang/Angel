@@ -141,10 +141,23 @@ target, single A-series GPU. All rows share one backbone and one loop.
 | | τ (accept. length) | tok/s | speedup | avg output |
 |---|---:|---:|---:|---:|
 | autoregressive baseline | 1.000 | 34.17 | 1.00× | 565.4 |
+| **chain** · `baseline_1layer` (stock EAGLE-3) | 2.589 | 65.92 | 1.93× | 549.1 |
+| chain · `banded-mix-fc-3.1` | 2.727 | 68.47 | 2.00× | 502.3 |
+| chain · `branch-distill-top1-w01` | **2.913** | **72.33** | **2.12×** | 594.4 |
+| **tree** · `baseline_1layer` (stock EAGLE-3) | 3.610 | 85.08 | 2.49× | 532.3 |
 | tree · `branch-distill-top1-w01` | 3.907 | 86.13 | 2.52× | 512.1 |
 | tree · `banded-mix-fc-3.1` | 3.927 | 89.30 | 2.61× | 524.7 |
-| chain · `branch-distill-top1-w01` | 2.913 | 72.33 | 2.12× | 594.4 |
-| chain · `banded-mix-fc-3.1` | 2.727 | 68.47 | 2.00× | 502.3 |
+
+`baseline_1layer` is the stock EAGLE-3 drafter (`fused_fc`, 3 aux streams, no
+`fc_norm`, no `norm_output`) trained for the same 66466 steps on the same data —
+the honest ablation denominator. Against it:
+
+| | Δτ | Δ speedup |
+|---|---:|---:|
+| chain · `branch-distill-top1-w01` | **+0.324 (+12.5 %)** | +0.19× (1.93→2.12) |
+| chain · `banded-mix-fc-3.1` | +0.138 (+5.3 %) | +0.07× |
+| tree · `branch-distill-top1-w01` | +0.297 (+8.2 %) | +0.03× |
+| tree · `banded-mix-fc-3.1` | +0.317 (+8.8 %) | +0.12× |
 
 ### Reading the numbers
 
@@ -153,11 +166,17 @@ target, single A-series GPU. All rows share one backbone and one loop.
   0.714. It is an OCR task: hard boilerplate up front, easy transcription after.
   Any τ quoted from this benchmark is meaningless without the output length
   next to it. A short run reads as a regression when it is not.
-- **The ranking flips between modes.** Chain puts `branch-distill` ahead by
-  +0.186; tree puts it behind by 0.020 (noise). Branch distillation trains
-  exactly the top-1 quality that a 10-candidate first tree level dilutes.
-  Worth saying out loud in the paper rather than reporting only the mode that
-  favours the method.
+- **Both band models beat stock EAGLE-3 in both modes**, by 5–12 % acceptance.
+  That gap is the one the paper should claim.
+- **The ranking *between the two band models* flips between modes.** Chain puts
+  `branch-distill` ahead of `banded-mix-fc-3.1` by +0.186; tree puts it behind
+  by 0.020 (noise). Branch distillation trains exactly the top-1 quality that a
+  10-candidate first tree level dilutes, so its advantage is real under chain
+  decoding — what it was trained for — and washes out under tree. Worth saying
+  out loud rather than reporting only the mode that favours the method.
+- **Acceptance gains compress into speedup gains.** +12.5 % τ buys +10 % tok/s
+  under chain; under tree, +8 % τ buys ~1 %. Eager attention makes the target
+  forward dominate, so a longer accepted run has less to win back.
 
 ## Limitations
 
