@@ -26,12 +26,28 @@ RUNS = [
     (BASELINE, "my_angel/no_eagle_baseline/atd_temp{t}"),
     ("baseline_1layer", "my_angel/eagle/baseline_1layer/rerun_atd/temp{t}"),
     ("banded_mix_fc_3.1", "my_angel/eagle/smolvlm-256m-eagle3-banded-mix-fc-3.1/rerun_atd/temp{t}"),
+    ("banded_mix_wide_3.1", "my_angel/eagle/smolvlm-256m-eagle3-banded-mix-wide-3.1/rerun_atd/temp{t}"),
+    ("vistoken_k1", "my_angel/eagle/vistoken-k1/rerun_atd/temp{t}"),
+    ("vistoken_k1_attn_prune_x64_m16", "my_angel/eagle/vistoken-k1-attn-prune-x64-m16/rerun_atd/temp{t}"),
+    ("branch_distill_top1_w01", "my_angel/eagle/branch-distill-top1-w01/rerun_atd/temp{t}"),
+    ("branch_ratio_t02_top1_w01", "my_angel/eagle/branch-ratio-t02-top1-w01/rerun_atd/temp{t}"),
     ("branch_change_top1_w01", "my_angel/eagle/branch-change-top1-w01/rerun_atd/temp{t}"),
+    ("branch_change_top1_w01_steps2", "my_angel/eagle/branch-change-top1-w01-steps2/rerun_atd/temp{t}"),
+    ("branch_change_top1_w03", "my_angel/eagle/branch-change-top1-w03/rerun_atd/temp{t}"),
+    ("branch_change_deltaweight_w01", "my_angel/eagle/branch-change-deltaweight-w01/rerun_atd/temp{t}"),
+    ("branch_change_top2_curr_r33k", "my_angel/eagle/branch-change-top2-curr-r33k/rerun_atd/temp{t}"),
+    ("branch_change_top2_curr_synth_r33k", "my_angel/eagle/branch-change-top2-curr-synth-r33k/rerun_atd/temp{t}"),
 ]
 DRAFTS = [r for r in RUNS if r[0] != BASELINE]
 
-# Superseded short-prompt roots: used only for the output-length ratio table.
-RAW_BASELINE_ROOT = "my_angel/no_eagle_baseline/temp{t}"
+# Superseded short-prompt (`raw`) target-only sweep. Its result tree was deleted
+# 2026-08-31 — only the ATD sweep is kept — so the avg output tokens it produced
+# are frozen here, purely to keep the ratio table that motivated the prompt change.
+RAW_BASELINE_OUT_TOK = {
+    "MMStar": 8.8375, "MMMU": 45.0125, "OmniDocBench": 416.275,
+    "MATH-500": 566.625, "textvqa": 17.825, "chartqa": 88.4375,
+    "mathvista": 11.4, "COCO-Caption": 484.9375,
+}
 
 # How answer_then_describe touches each benchmark's prompt.
 ATD_TREATMENT = {
@@ -137,9 +153,21 @@ L = [
     "| `no_eagle_baseline` | target only, no speculative decoding |",
     "| `baseline_1layer` | stock EAGLE-3: 3 aux layers, 3H→H fusion FC, 2H layer 0 |",
     "| `banded_mix_fc_3.1` | 9 aux layers → 3 learned band mixes → 3H→H FC, EAGLE 3.1 |",
+    "| `banded_mix_wide_3.1` | same 3 band mixes, **no** FC: 4H layer 0 `[emb｜band0｜band1｜seed]` |",
+    "| `vistoken_k1` | `banded_mix_fc_3.1` + learned-query row compression: each tile's 64 visual rows → k=1 summary |",
+    "| `vistoken_k1_attn_prune_x64_m16` | `vistoken_k1` + target-attention row pruning ahead of the "
+    "compressor: score each 64-row tile by the target's own q\u00b7k and keep the top M=16 rows |",
+    "| `branch_distill_top1_w01` | `banded_mix_fc_3.1` + branch-aware distillation on the full teacher "
+    "distribution at the forked token (draft top-1 vs teacher top-3, w=0.1, 1 step) |",
+    "| `branch_ratio_t02_top1_w01` | branch fork gated by a teacher-probability *ratio* threshold (t=0.2) instead of top-3 membership |",
     "| `branch_change_top1_w01` | `banded_mix_fc_3.1` + branch-change distillation: where the draft's "
     "top-1 is not the teacher's but sits in the teacher's top-3, fork one draft step onto that "
-    "token and match the teacher's centered-logit *delta* (w=0.1, 1 step). The default. |",
+    "token and match the teacher's centered-logit *delta* (w=0.1, 1 step). **The default.** |",
+    "| `branch_change_top1_w01_steps2` | same, but the branch fires at two rollout steps (`branch_distill_steps=2`) |",
+    "| `branch_change_top1_w03` | same, w=0.3 |",
+    "| `branch_change_deltaweight_w01` | same, w=0.1, but the branch loss is weighted per token by the teacher delta magnitude |",
+    "| `branch_change_top2_curr_r33k` | top-2 fork with a curriculum, resumed from `checkpoint-33233` of `banded_mix_fc_3.1` |",
+    "| `branch_change_top2_curr_synth_r33k` | as above plus synthetic branch tokens |",
     "", "## Prompt", "",
     "Every benchmark uses the long prompt: the model answers first and then justifies,",
     "so outputs are long enough for speculative decoding to pay. The question text",
@@ -189,10 +217,10 @@ L += ["", "### Why the long prompt (target-only, temp 0)", "",
       "reason for the change:", "",
       "| benchmark | short-prompt out tok | long-prompt out tok | ratio |", "|---|---:|---:|---:|"]
 for ds in DS:
-    r, a = cell(RAW_BASELINE_ROOT, 0, ds), cell(_base_root, 0, ds)
+    r, a = RAW_BASELINE_OUT_TOK.get(ds), cell(_base_root, 0, ds)
     if r and a:
-        L.append(f"| {ds} | {r['avg_output_tokens']:.1f} | {a['avg_output_tokens']:.1f} | "
-                 f"**{a['avg_output_tokens'] / r['avg_output_tokens']:.2f}x** |")
+        L.append(f"| {ds} | {r:.1f} | {a['avg_output_tokens']:.1f} | "
+                 f"**{a['avg_output_tokens'] / r:.2f}x** |")
 
 open(OUT, "w").write("\n".join(L) + "\n")
 total = len(RUNS) * len(DS) * len(TEMPS)
