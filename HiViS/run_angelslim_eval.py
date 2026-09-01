@@ -47,6 +47,18 @@ ap.add_argument("--total_token", type=int, default=60)
 ap.add_argument("--depth", type=int, default=5)
 ap.add_argument("--top_k", type=int, default=10)
 ap.add_argument("--device", default="cuda:0")
+ap.add_argument("--max_pixels", type=int, default=None,
+                help="cap the image resolution the processor emits, in pixels "
+                     "(Qwen2.5-VL: ~1 visual token per 28x28 px). Its default "
+                     "turns one OmniDocBench page into ~16.3k tokens, and this "
+                     "harness's attention is eager/quadratic, so a 7B target "
+                     "OOMs on a 24GB card. 1605632 gives ~2k tokens. Changes "
+                     "what the model sees -- hold it fixed across compared runs.")
+ap.add_argument("--cache_len", type=int, default=None,
+                help="cap the preallocated static KV cache (default: the model's "
+                     "max_position_embeddings). Qwen2.5-VL's 128k default costs "
+                     "~7.3GB and OOMs a 7B target on a 24GB card; 4096 is ample "
+                     "for these prompts. Must be >= prompt + max_new_tokens.")
 ap.add_argument("--out", default=None)
 ap.add_argument("--naive", action="store_true",
                 help="autoregressive baseline in the same harness (speedup denominator)")
@@ -59,6 +71,15 @@ model = EaModel.from_pretrained(
     torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map=a.device,
 )
 model.eval()
+model.cache_max_len = a.cache_len
+if a.max_pixels is not None:
+    image_processor = getattr(model.processor, "image_processor", None)
+    if image_processor is None:
+        raise SystemExit("--max_pixels: this processor has no image_processor")
+    image_processor.max_pixels = a.max_pixels
+    if isinstance(getattr(image_processor, "size", None), dict):
+        image_processor.size["longest_edge"] = a.max_pixels
+    print("max_pixels ->", a.max_pixels)
 print("drafter:", type(model.ea_layer).__name__,
       "| method:", a.draft_method, "| aux layers:", getattr(model, "aux_layer_ids", None))
 
@@ -66,6 +87,18 @@ dataset = load_benchmark(a.dataset, sample_count=a.n)
 rows, all_acc = [], []
 for i in range(len(dataset)):
     inputs = prepare_inputs(model, dataset, i, a.dataset)
+    prompt_len = inputs["input_ids"].shape[1]
+    if a.cache_len is not None and prompt_len + a.max_new_tokens > a.cache_len:
+        # The cache is preallocated, so overflowing it surfaces deep inside
+        # KVCache as "start (0) + length (N) exceeds dimension size". Say what
+        # is actually wrong. Qwen2.5-VL does not downsample image tokens the way
+        # SmolVLM does -- one OmniDocBench page is ~16k visual tokens.
+        raise SystemExit(
+            "--cache_len %d is too small for prompt %d (row %d) + --max_new_tokens %d. "
+            "Use --cache_len %d or more."
+            % (a.cache_len, prompt_len, i, a.max_new_tokens,
+               prompt_len + a.max_new_tokens)
+        )
     torch.cuda.synchronize(); t0 = time.time()
     if a.naive:
         out_ids, new_token, idx = model.naivegenerate(

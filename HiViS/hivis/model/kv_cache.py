@@ -66,7 +66,16 @@ class KVCache:
         return torch.narrow(self.data, 2, 0, self.current_length)
 
 
-def initialize_past_key_values(model):
+def initialize_past_key_values(model, max_len=None):
+    """Preallocate the static KV cache.
+
+    `max_len` caps the sequence dimension. Upstream always sizes it at
+    config.max_position_embeddings, which is fine at 8k (SmolVLM) and fatal at
+    128k (Qwen2.5-VL): 28 layers x 2 x 4 kv-heads x 128000 x 128 in bf16 is
+    ~7.3GB of cache on top of ~16GB of weights, so a 7B target OOMs on a 24GB
+    card before it generates a single token. Pass a cap >= prompt +
+    max_new_tokens instead. None keeps upstream behaviour.
+    """
     """
     Initialize past key and value states for a given transformer model.
 
@@ -89,6 +98,12 @@ def initialize_past_key_values(model):
     config = model.config
     if not hasattr(config, "num_hidden_layers") and hasattr(config, "text_config"):
         config = config.text_config
+    cache_len = max_len or config.max_position_embeddings
+    if cache_len > config.max_position_embeddings:
+        raise ValueError(
+            "max_len=%d exceeds the model's max_position_embeddings=%d"
+            % (cache_len, config.max_position_embeddings)
+        )
     _layers = None
     for _path in (("model", "text_model", "layers"), ("model", "layers"), ("layers",)):
         _obj = model
@@ -117,7 +132,7 @@ def initialize_past_key_values(model):
                 startnum * 2,
                 batch_size,
                 config.num_key_value_heads,
-                config.max_position_embeddings,
+                cache_len,
                 config.hidden_size // config.num_attention_heads,
                 device=startdevice,
                 dtype=model.dtype,
@@ -130,7 +145,7 @@ def initialize_past_key_values(model):
         startnum * 2,
         batch_size,
         config.num_key_value_heads,
-        config.max_position_embeddings,
+        cache_len,
         config.hidden_size // config.num_attention_heads,
         device=startdevice,
         dtype=model.dtype,

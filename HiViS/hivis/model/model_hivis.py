@@ -98,6 +98,9 @@ class EaModel(nn.Module):
             bias=True
         # AngelSlim EAGLE-3: the drafter carries its own config and weights, and
         # needs the target's aux-layer hidden states rather than the last layer.
+        # Cap for the preallocated static KV cache; None = max_position_embeddings.
+        # See initialize_past_key_values -- a 128k default OOMs a 7B target.
+        self.cache_max_len = None
         self.aux_layer_ids = None
         if draft_method == ANGELSLIM_EAGLE3:
             from .angelslim_drafter import build_drafter
@@ -454,7 +457,7 @@ class EaModel(nn.Module):
                 past_key_values,
                 past_key_values_data,
                 current_length_data,
-            ) = initialize_past_key_values(self.base_model)
+            ) = initialize_past_key_values(self.base_model, self.cache_max_len)
             self.past_key_values = past_key_values
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
@@ -594,7 +597,7 @@ class EaModel(nn.Module):
                 past_key_values,
                 past_key_values_data,
                 current_length_data,
-            ) = initialize_past_key_values(self.base_model)
+            ) = initialize_past_key_values(self.base_model, self.cache_max_len)
             self.past_key_values = past_key_values
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
@@ -731,7 +734,7 @@ class EaModel(nn.Module):
                 past_key_values,
                 past_key_values_data,
                 current_length_data,
-            ) = initialize_past_key_values(self.base_model)
+            ) = initialize_past_key_values(self.base_model, self.cache_max_len)
             self.past_key_values = past_key_values
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
@@ -857,7 +860,7 @@ class EaModel(nn.Module):
                 past_key_values,
                 past_key_values_data,
                 current_length_data,
-            ) = initialize_past_key_values(self.base_model)
+            ) = initialize_past_key_values(self.base_model, self.cache_max_len)
             self.past_key_values = past_key_values
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
