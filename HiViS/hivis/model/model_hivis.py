@@ -285,10 +285,6 @@ class EaModel(nn.Module):
                 base_model_path, **kwargs
             )
 
-        configpath=os.path.join(ea_model_path,"config.json")
-        if not os.path.exists(configpath):
-            configpath = hf_hub_download(ea_model_path, "config.json")
-
         try:
             load_model_path=os.path.join(ea_model_path, "pytorch_model.bin")
             if not os.path.exists(load_model_path):
@@ -301,6 +297,45 @@ class EaModel(nn.Module):
             if not os.path.exists(load_model_path):
                 load_model_path = hf_hub_download(ea_model_path, "model.safetensors")
             ea_layer_state_dict = load_file(load_model_path)
+
+        configpath=os.path.join(ea_model_path,"config.json")
+        if not os.path.exists(configpath):
+            if os.path.isdir(ea_model_path):
+                # accelerate's per-epoch checkpoints (hivis/train/main_mix.py)
+                # save tensors only, never a config.json. A hand-copied config
+                # from another run silently mismatches the moment hidden_size,
+                # intermediate_size or layer count differs -- so derive it from
+                # this checkpoint's own weight shapes instead, plus the
+                # attention hyperparams a hivis/eagle/vispec drafter always
+                # shares with its target (it's a K-layer clone of it). Written
+                # to disk so this only has to happen once per checkpoint.
+                target_config = getattr(base_model.config, "text_config", base_model.config)
+                n_layers = len({
+                    k.split(".")[1] for k in ea_layer_state_dict if k.startswith("layers.")
+                })
+                cfg_dict = {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "vocab_size": ea_layer_state_dict["embed_tokens.weight"].shape[0],
+                    "hidden_size": ea_layer_state_dict["embed_tokens.weight"].shape[1],
+                    "intermediate_size": ea_layer_state_dict["layers.0.mlp.gate_proj.weight"].shape[0],
+                    "num_hidden_layers": n_layers,
+                    "num_attention_heads": target_config.num_attention_heads,
+                    "num_key_value_heads": getattr(
+                        target_config, "num_key_value_heads", target_config.num_attention_heads
+                    ),
+                    "hidden_act": getattr(target_config, "hidden_act", "silu"),
+                    "rms_norm_eps": getattr(target_config, "rms_norm_eps", 1e-5),
+                    "rope_theta": getattr(target_config, "rope_theta", 10000.0),
+                    "max_position_embeddings": getattr(
+                        target_config, "max_position_embeddings", 32768
+                    ),
+                    "bias": "fc.bias" in ea_layer_state_dict,
+                }
+                with open(configpath, "w") as f:
+                    json.dump(cfg_dict, f, indent=2)
+            else:
+                configpath = hf_hub_download(ea_model_path, "config.json")
         model = cls(
             base_model,
             base_model_path,
