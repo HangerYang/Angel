@@ -96,6 +96,12 @@ class EaModel(nn.Module):
             bias=con["bias"]
         except:
             bias=True
+        # Training (hivis/train/cnets_res.Model) defaults bias=True and never
+        # reads config.json's "bias". SmolVLM's copied config says false, so
+        # the saved tensors (fc.bias present) disagree with the json. Trust
+        # the checkpoint.
+        if "fc.weight" in ea_layer_state_dict:
+            bias = "fc.bias" in ea_layer_state_dict
         # AngelSlim EAGLE-3: the drafter carries its own config and weights, and
         # needs the target's aux-layer hidden states rather than the last layer.
         # Cap for the preallocated static KV cache; None = max_position_embeddings.
