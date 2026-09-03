@@ -327,6 +327,37 @@ generates on `omnidocbench` under `--max_pixels 1605632 --cache_len 8192`
 (τ ≈ 3.4 on a two-prompt wiring check — a smoke test, not a result; the
 published table below is the only measured comparison).
 
+### Evaluating a checkpoint you trained with `hivis/train/main_mix.py`
+
+`main_mix.py` checkpoints its stages via `accelerate.save_state`, which writes
+`model.safetensors` + `optimizer.bin` + `scheduler.bin` per epoch into
+`<stage>/state_<N>/` — but never a `config.json`. Point `--draft` straight at
+one of those `state_N` directories; `draft_method` stays the default `hivis`
+(same architecture `cnets_hivis.Model` loads for `Irisssme/HiViS-...` above):
+
+```bash
+python run_angelslim_eval.py --draft_method hivis \
+    --base HuggingFaceTB/SmolVLM-256M-Instruct \
+    --draft ../output/hivis_official/<run>/stage1/state_20 \
+    --dataset omnidocbench --n 40 --max_new_tokens 1024 \
+    --total_token 5 --depth 4 --top_k 1 --out ../results_hivis_smolvlm.json
+```
+
+The missing `config.json` is not an error: `EaModel.from_pretrained` detects
+it, derives one from the checkpoint's own tensor shapes (`embed_tokens.weight`,
+`layers.0.mlp.gate_proj.weight`, the count of `layers.N.*` keys) plus the
+target's attention hyperparams (`num_attention_heads`, `num_key_value_heads`,
+`rope_theta`, `rms_norm_eps` — a hivis/eagle/vispec drafter is always a
+K-layer clone of its target, so these are shared, not guessed), and writes it
+into the checkpoint directory so this only happens once per checkpoint. A
+hand-copied config from a different run is worse than none: any mismatch in
+`hidden_size`/`intermediate_size`/layer count is a silent dimension error at
+load time instead of a missing-file error before load.
+
+If `--draft` instead points at a directory that already has a `config.json`
+(the run's final `save_pretrained` output, not a raw `state_N`), that file is
+used as-is and nothing is synthesized.
+
 **What this licenses you to compare.** Two drafters on the same rows in this
 harness share a backend and a decoding loop, so their τ and their
 speedup-over-own-baseline are comparable. Their **absolute tok/s is not**:
