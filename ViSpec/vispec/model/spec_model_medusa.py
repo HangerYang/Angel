@@ -135,8 +135,18 @@ class SpecModel(nn.Module):
 
         configpath = os.path.join(spec_model_path, "config.json")
         if not os.path.exists(configpath):
-            # configpath = hf_hub_download(spec_model_path, "config.json")
-            configpath = "./vispec/train/llava_1.6_7B_config.json"
+            # This used to fall back to ./vispec/train/llava_1.6_7B_config.json,
+            # which silently builds a LLaVA-7B-shaped draft for whatever
+            # checkpoint you passed -- a wrong-architecture eval that reports
+            # numbers instead of failing. Training writes config.json beside
+            # every state_N, so a missing one means the path is wrong (the
+            # cpdir itself rather than one of its state_N subdirs, say).
+            raise FileNotFoundError(
+                f"No config.json in {spec_model_path}. Point --spec-model-path at a "
+                f"checkpoint directory (e.g. <cpdir>/state_20), not the cpdir itself; "
+                f"if this checkpoint predates the config copy, copy the draft config "
+                f"used to train it (vispec/train/*_config.json) in as config.json."
+            )
 
         try:
             load_model_path = os.path.join(spec_model_path, "pytorch_model.bin")

@@ -118,6 +118,52 @@ accelerate launch --multi_gpu --mixed_precision=bf16 -m vispec.train.main_mtp \
 LLaVA-Pretrain, which is **not on this machine**. Use the commands above
 instead, or edit its stage 1.1/1.2 to call the allocation script here.
 
+## Resuming, and evaluating what you trained
+
+**Stage chaining.** Stage 2.2 picks up stage 2.1 through
+`--loadpath <ckpt_stage1>/state_N/model.safetensors`, loaded with
+`strict=False` (`main_mtp.py:578`). Non-strict is required, not sloppiness:
+stage 1 has no `imadpt.*` weights, so the ImgAdaptor has to start fresh. The
+cost is that a genuinely wrong checkpoint also loads without complaint.
+
+**Resume is partial.** Both stages auto-detect the highest `state_N` in
+`--cpdir`, load those weights, set `begin_epoch`, and fast-forward the LR
+scheduler by `begin_epoch * len(train_loader)` steps. But `accelerator.save_state`
+writes optimizer and scheduler state that is **never read back** —
+`accelerator.load_state(...)` is commented out at `main.py:508`. So a resume
+restores weights and the learning-rate position, while Adam's moment estimates
+restart from zero. Expect a transient at the resume point; it is not seamless.
+
+**Evaluating your own checkpoint.** Point `--spec-model-path` at one
+`state_N` directory, not at the cpdir:
+
+```bash
+python -m vispec.evaluation.gen_spec_answer_coco_caption \
+  --base-model-path HuggingFaceTB/SmolVLM-256M-Instruct \
+  --spec-model-path vispec_data/smolvlm/ckpt_stage2/state_20 \
+  --num-q 2 --depth 3 --top-k 8 --total-token 30 --use-ours=True \
+  --model-id test --bench-name results/spec/ --temperature 0.0
+```
+
+Training copies the draft config in beside each checkpoint
+(`main.py:708`, `main_mtp.py:821`), so `state_N/` already has both
+`config.json` and `model.safetensors` and this works as-is.
+
+Two things were fixed here to keep it that way:
+
+- `spec_model{,_ours,_medusa}.py` used to fall back to a hardcoded
+  `./vispec/train/llava_1.6_7B_config.json` when `config.json` was missing —
+  silently building a LLaVA-7B-shaped draft for whatever checkpoint you passed
+  and reporting numbers rather than failing. It now raises `FileNotFoundError`
+  naming the likely cause.
+- `run_smolvlm.sh` stage 3 defaulted `SPEC_DIR` to the cpdir, which contains
+  neither file. It now defaults to `${CKPT_STAGE2}/${STAGE2_EPOCH_STATE}` and
+  checks both files exist before launching.
+
+**HiViS's harness cannot eval a SmolVLM ViSpec draft.** `--draft-method vispec`
+there still trips the `cnets_*.py` embed_tokens loader gap described in
+`README_vispec_eval.md`. Use ViSpec's own evaluation scripts for SmolVLM.
+
 ## Environment
 
 `ViSpec/.venv` (gitignored by ViSpec's own `.gitignore`), built with uv:

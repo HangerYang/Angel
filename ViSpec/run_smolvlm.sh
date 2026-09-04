@@ -36,6 +36,7 @@ LOG_DIR="vispec_data/smolvlm/logs"
 START=0
 END=67999
 STAGE1_EPOCH_STATE="state_20"
+STAGE2_EPOCH_STATE="state_20"
 
 NUM_Q=2
 DEPTH=3
@@ -124,7 +125,14 @@ fi
 # ─── Stage 3: evaluation + speedup ────────────────────────────────────────────
 if run_stage 3; then
   echo "=== Stage 3: evaluation (COCO caption, GPU ${GPU_IDS[0]}) ==="
-  SPEC_DIR="${SPEC_DIR:-${CKPT_STAGE2}}"
+  # Must be one checkpoint directory, not the cpdir: the draft's config.json and
+  # model.safetensors live in each state_N, and the cpdir holds only those dirs.
+  SPEC_DIR="${SPEC_DIR:-${CKPT_STAGE2}/${STAGE2_EPOCH_STATE}}"
+  if [[ ! -f "${SPEC_DIR}/config.json" || ! -f "${SPEC_DIR}/model.safetensors" ]]; then
+    echo "Stage 3: ${SPEC_DIR} is not a checkpoint dir (needs config.json + model.safetensors)." >&2
+    echo "Set SPEC_DIR to one, e.g. SPEC_DIR=${CKPT_STAGE2}/state_10 bash run_smolvlm.sh 3" >&2
+    exit 1
+  fi
   BASE_OUT="${RESULT_DIR}/coco_caption_test/smolvlm_baseline"
   SPEC_OUT="${RESULT_DIR}/coco_caption_test/smolvlm_spec"
 
