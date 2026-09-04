@@ -134,35 +134,22 @@ writes optimizer and scheduler state that is **never read back** —
 restores weights and the learning-rate position, while Adam's moment estimates
 restart from zero. Expect a transient at the resume point; it is not seamless.
 
-**Evaluating your own checkpoint.** Point `--spec-model-path` at one
-`state_N` directory, not at the cpdir:
+**Evaluation happens in HiViS, not here.** ViSpec's own evaluation harness
+(`vispec/evaluation/`, `spec_model*.py`, its benchmark data and `run_smolvlm.sh`
+stage 3) has been **removed from this tree** — everything is evaluated through
+`hivis.evaluation.ge_hivis_answer` so all draft methods share one harness and
+one set of numbers. `run_smolvlm.sh` now covers data generation and training
+only.
 
-```bash
-python -m vispec.evaluation.gen_spec_answer_coco_caption \
-  --base-model-path HuggingFaceTB/SmolVLM-256M-Instruct \
-  --spec-model-path vispec_data/smolvlm/ckpt_stage2/state_20 \
-  --num-q 2 --depth 3 --top-k 8 --total-token 30 --use-ours=True \
-  --model-id test --bench-name results/spec/ --temperature 0.0
-```
+Training writes `config.json` beside each checkpoint (`main.py:708`,
+`main_mtp.py:821`), so a `state_N/` directory is self-describing for whatever
+loads it.
 
-Training copies the draft config in beside each checkpoint
-(`main.py:708`, `main_mtp.py:821`), so `state_N/` already has both
-`config.json` and `model.safetensors` and this works as-is.
-
-Two things were fixed here to keep it that way:
-
-- `spec_model{,_ours,_medusa}.py` used to fall back to a hardcoded
-  `./vispec/train/llava_1.6_7B_config.json` when `config.json` was missing —
-  silently building a LLaVA-7B-shaped draft for whatever checkpoint you passed
-  and reporting numbers rather than failing. It now raises `FileNotFoundError`
-  naming the likely cause.
-- `run_smolvlm.sh` stage 3 defaulted `SPEC_DIR` to the cpdir, which contains
-  neither file. It now defaults to `${CKPT_STAGE2}/${STAGE2_EPOCH_STATE}` and
-  checks both files exist before launching.
-
-**HiViS's harness cannot eval a SmolVLM ViSpec draft.** `--draft-method vispec`
-there still trips the `cnets_*.py` embed_tokens loader gap described in
-`README_vispec_eval.md`. Use ViSpec's own evaluation scripts for SmolVLM.
+**A SmolVLM ViSpec draft cannot be evaluated yet.** See
+`README_vispec_eval.md`: HiViS's `--draft-method vispec` copies the target's
+embedding table into the draft, and that loader does not understand SmolVLM's
+checkpoint layout. Producing a SmolVLM ViSpec checkpoint is therefore ahead of
+being able to score it.
 
 ## Environment
 
