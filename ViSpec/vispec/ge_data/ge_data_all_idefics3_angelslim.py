@@ -49,7 +49,8 @@ parser.add_argument(
     "--image-root",
     type=str,
     default="/home/hyang/Angel/dataset/raw/images",
-    help="Root that the records' relative image paths (coco/..., textvqa/...) hang off.",
+    help="Root for relative image paths (coco/..., textvqa/...). Unused when "
+         "the records carry inline base64, as train_path_b64.jsonl does.",
 )
 args = parser.parse_args()
 
@@ -57,6 +58,8 @@ import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)[1:-1]
 
+import base64
+import io as _io
 import json
 
 import torch
@@ -99,12 +102,25 @@ def split_content(content):
     return "\n".join(texts).strip(), images
 
 
-def resolve_image_path(root, rel):
-    for candidate in (rel, os.path.join("images", rel)):
+def load_image_ref(ref, root):
+    """Load one image reference, whichever form this jsonl uses.
+
+    The same folder ships both: `train_path.jsonl` carries relative paths
+    (`coco/...`, resolved under --image-root) and `train_path_b64.jsonl`
+    carries inline `data:image/...;base64,` URIs. Accepting both means either
+    file works here, and matches what HiViS's `load_image_field` accepts, so
+    the two pipelines can be pointed at the same data.
+    """
+    if ref.startswith("data:image/"):
+        _, _, payload = ref.partition(",")
+        with Image.open(_io.BytesIO(base64.b64decode(payload))) as opened:
+            return opened.convert("RGB").copy()
+    for candidate in (ref, os.path.join("images", ref)):
         path = os.path.join(root, candidate)
         if os.path.exists(path):
-            return path
-    return os.path.join(root, rel)
+            return Image.open(path).convert("RGB")
+    # Absolute paths, or a root that already includes the prefix.
+    return Image.open(ref if os.path.isabs(ref) else os.path.join(root, ref)).convert("RGB")
 
 
 def build_text_messages(record):
@@ -135,21 +151,21 @@ def build_multimodal_prompt(record):
     conversation = [
         {"role": "system", "content": [{"type": "text", "text": VISPEC_SYSTEM_PROMPT}]}
     ]
-    image_paths = []
+    image_refs = []
     for turn in record["conversations"]:
         if turn.get("role") != "user":
             continue
         text, images = split_content(turn["content"])
         content = [{"type": "text", "text": text}]
-        for rel in images:
+        for ref in images:
             content.append({"type": "image"})
-            image_paths.append(resolve_image_path(args.image_root, rel))
+            image_refs.append(ref)
         content.append({"type": "text", "text": VISPEC_LENGTH_INSTRUCTION})
         conversation.append({"role": "user", "content": content})
-    if not image_paths:
+    if not image_refs:
         return None, []
     prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
-    return prompt, image_paths
+    return prompt, image_refs
 
 
 def build_loss_mask(messages, input_ids):
@@ -207,10 +223,10 @@ def generate_text_sample(record):
 def generate_multimodal_sample(record):
     """ViSpec's rollout capture: generate, then keep the whole span with its
     image rows intact and an `image_mask` marking them."""
-    prompt, image_paths = build_multimodal_prompt(record)
+    prompt, image_refs = build_multimodal_prompt(record)
     if prompt is None:
         return None
-    images = [Image.open(path).convert("RGB") for path in image_paths]
+    images = [load_image_ref(ref, args.image_root) for ref in image_refs]
     inputs = processor(images=images, text=prompt, return_tensors="pt").to(model.device)
 
     outs = model.generate(

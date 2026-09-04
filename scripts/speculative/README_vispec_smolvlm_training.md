@@ -59,9 +59,28 @@ so `vispec.train.main` and `main_mtp` consume them unmodified.
 structure as ViSpec's other allocation scripts, but carrying the jsonl path,
 the image root and both output dirs through to the workers.
 
-Image paths in the records are relative (`coco/...`, `textvqa/...`) and resolve
-under `--image-root`, default `/home/hyang/Angel/dataset/raw/images` — verified
-present for all 58,483 coco + 8,088 textvqa references.
+### Which jsonl to point at
+
+That folder ships the same records twice, and the two pipelines historically
+wanted different ones:
+
+| file | images | ViSpec | HiViS |
+|---|---|---|---|
+| `train_path.jsonl` (0.65 GB) | relative paths (`coco/...`) | yes | **no** |
+| `train_path_b64.jsonl` (15.5 GB) | inline `data:image/...;base64,` | yes | yes |
+
+The generator here accepts **both** forms, so either file works: relative paths
+resolve under `--image-root` (default `/home/hyang/Angel/dataset/raw/images`,
+verified present for all 58,483 coco + 8,088 textvqa references), and data URIs
+are decoded inline. Verified equivalent — the same records generated from both
+files produce **bit-identical visual embedding rows** (832 image rows each).
+Prefer `train_path.jsonl`; it is 24x smaller for the same content.
+
+HiViS cannot use `train_path.jsonl`: its `common.py:load_image_field` opens the
+reference verbatim with no root, so a relative path fails — and the failure is
+caught and printed, leaving `image=None` while the record continues, i.e. it
+degrades to a silently broken sample rather than an error. Point HiViS at
+`train_path_b64.jsonl`.
 
 ## Running it
 
