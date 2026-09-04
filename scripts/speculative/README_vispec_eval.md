@@ -8,19 +8,43 @@ vectors that cross-attend over the image embeddings and squeeze them into
 the draft the full multimodal sequence untouched) and `hivis` (prunes the image
 rows outright).
 
-There are **two independent harnesses** in this tree. Pick by what you have:
+Evaluation runs through **one harness only**: `hivis.evaluation.ge_hivis_answer`,
+with `--draft-method {eagle, hivis, vispec, angelslim_eagle3}`. ViSpec's own
+evaluation code has been removed from `ViSpec/` so there is a single place
+numbers come from. `ViSpec/` is kept for what HiViS cannot do — *training* a
+ViSpec draft (`HiViS/hivis/train/` has no ViSpec code at all).
 
-| | `HiViS/` | `ViSpec/` |
+## What actually loads, per draft method and target
+
+Verified by constructing each draft against each target (2026-09-04):
+
+| draft method | Qwen2.5-VL | SmolVLM-256M |
 |---|---|---|
-| entry point | `hivis.evaluation.ge_hivis_answer --draft-method vispec` | `vispec.evaluation.gen_spec_answer_*` |
-| can train a ViSpec draft | **no** | yes (`vispec.train.main` + `main_mtp`) |
-| models wired up | Qwen2.5-VL, LLaVA, SmolVLM/Idefics3 | Qwen2.5-VL, LLaVA, SmolVLM/Idefics3 |
-| benchmarks | ChartQA, ScienceQA, MathVista, DocVQA, vqav2, textvqa, gqa, mme, mmvet, seedbench, mmmu | COCO-caption, gqa, mme, mmvet, sqa, textvqa, seedbench, vizwiz, vqav2, … |
+| `hivis` | works | **works** |
+| `angelslim_eagle3` | untested | **works** |
+| `eagle` | works | fails — `FileNotFoundError` |
+| `vispec` | loads (generation loop unexercised) | fails — `IsADirectoryError` |
 
-Use `HiViS/` to compare ViSpec against HiViS/EAGLE on the same benchmark
-harness. Use `ViSpec/` when you need to *train* a draft — HiViS has no ViSpec
-training code at all (`HiViS/hivis/train/` has zero references to it), so
-through that path you can only load someone else's checkpoint.
+The split is not about the target — it is about whether the draft method copies
+the **target's** embedding table into the draft at construction.
+`model_hivis.py:136` passes `path=base_model_name_or_path` for `eagle` and
+`vispec` only, which turns on `load_emb`; `hivis` and `angelslim_eagle3` never
+touch it and so never hit the loader below. That is why SmolVLM has been
+evaluated successfully all along on those two.
+
+That loader (`cnets_{eagle,hivis,vispec}.py`) assumes the target ships a
+sharded `model.safetensors.index.json` and names the table
+`model.embed_tokens.weight` or `language_model.model.embed_tokens.weight`.
+SmolVLM-256M ships **one unsharded `model.safetensors`** and calls it
+**`model.text_model.embed_tokens.weight`**, so every branch misses:
+`cnets_eagle`/`cnets_hivis` have no fallback and raise `FileNotFoundError`;
+`cnets_vispec` falls back to `AutoModelForImageTextToText` and then tries
+`m.language_model.model.embed_tokens` / `m.model.embed_tokens`, neither of
+which exists on Idefics3, and ends in `torch.load(<a directory>)`.
+
+Fixing it is one loader: enumerate the checkpoint's keys and take the
+non-vision `*embed_tokens.weight`, which covers Qwen (`model.embed_tokens.weight`)
+and SmolVLM alike without branching per family. Not done.
 
 ## The vendored `ViSpec/` folder
 
@@ -120,33 +144,20 @@ end; run one dataset before trusting a batch of numbers.
 
 ## SmolVLM status
 
-Two things had to be true for SmolVLM to work here, and only one of them is.
+The image-token-id bug is fixed. `utils_hivis.py` used to pick the id with
+`151655 if model.is_qwen_vl else 32000` — Qwen2.5-VL's, else LLaVA's. SmolVLM's
+is **49190**, so it matched neither: nothing was pruned and the drafter was
+handed ~800 image rows it had never seen in training, which read as a dead
+checkpoint (tau pinned at 1.000) rather than a dead code path. The id is now
+read off the target's own config. On a real SmolVLM prompt the matched image
+rows go from 0 to 1088 out of 1141 tokens.
 
-**Fixed (already on this branch).** `utils_hivis.py` used to pick the image
-token id with `151655 if model.is_qwen_vl else 32000` -- Qwen2.5-VL's id, else
-LLaVA's. SmolVLM's is **49190**, so it hit neither: the image mask came out
-all-False and the `ImgAdaptor` never saw a single image row, with no error
-raised. The `hivis` draft method had the same bug via
-`prune_image_tokens(..., 32000)`, which is what pinned acceptance at exactly
-tau=1.0 on every SmolVLM prompt. `_target_image_token_id()` now reads the id
-off the target's own config (`image_token_id`, falling back to the nested
-`text_config`, then 32000).
-
-**Still open.** The draft's `embed_tokens` loader in `cnets_vispec.py`
-(and `cnets_eagle.py`, `cnets_hivis.py`) assumes the target ships a sharded
-`model.safetensors.index.json` and names the table `model.embed_tokens.weight`
-or `language_model.model.embed_tokens.weight`. SmolVLM-256M ships **one
-unsharded `model.safetensors`** and calls it
-**`model.text_model.embed_tokens.weight`**. `cnets_vispec.py` falls back to
-`AutoModelForImageTextToText` and then tries `m.language_model.model.embed_tokens`
-/ `m.model.embed_tokens`, neither of which exists on Idefics3;
-`cnets_eagle.py` and `cnets_hivis.py` have no fallback at all. Loading a
-SmolVLM draft through any of the three will fail here until that loader learns
-the unsharded + per-family-key case.
+What remains is the embedding loader described above, which gates `eagle` and
+`vispec` on SmolVLM but not `hivis` or `angelslim_eagle3`.
 
 And regardless: **no SmolVLM ViSpec checkpoint exists yet.** Producing one
-means running `ViSpec/run_smolvlm.sh` stages 1–2, which needs LLaVA-Pretrain
-at `LLAVA_DATA_PATH`.
+means running `ViSpec/run_smolvlm.sh` after pointing its data stage at the
+AngelSlim jsonl — see `README_vispec_smolvlm_training.md` (on the baseline branch).
 
 ## Not to be confused with
 
