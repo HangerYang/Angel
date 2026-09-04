@@ -35,6 +35,13 @@ parser.add_argument('--topk', type=int, default=10)
 parser.add_argument('--topk_w', type=float, default=1.0)
 parser.add_argument('--forward_num_total', type=int, default=3)
 parser.add_argument('--ckpt_path', type=str, default='checkpoints/stage1')
+parser.add_argument(
+    '--resume_from', type=str, default=None,
+    help="A state_N directory written by a previous run of THIS script. Restores "
+         "model, optimizer, LR scheduler and RNG and continues at epoch N+1. "
+         "Unlike --ckpt_path, which only copies stage 1's weights into a fresh "
+         "optimizer, this continues the same run. --ckpt_path is ignored when "
+         "this is set.")
 parser.add_argument('--num-epochs', dest='num_epochs', type=int, default=10)
 parser.add_argument('--max-len', dest='max_len', type=int, default=4096)
 parser.add_argument(
@@ -445,6 +452,12 @@ model = Model(
 
 import safetensors
 
+if args.resume_from is not None and args.ckpt_path is not None:
+    # --resume_from restores the weights too, and does it after prepare(); doing
+    # the stage-1 load first would only be overwritten.
+    print(f"--resume_from is set, ignoring --ckpt_path {args.ckpt_path}")
+    args.ckpt_path = None
+
 if args.ckpt_path is not None: 
     ea_model_path = args.ckpt_path
     
@@ -493,8 +506,29 @@ else:
         model, head, optimizer, train_loader, test_loader
     )
 
+start_epoch = 0
+if args.resume_from is not None:
+    if not os.path.isdir(args.resume_from):
+        raise SystemExit(f"--resume_from: no such directory {args.resume_from}")
+    accelerator.load_state(args.resume_from)
+    # save_state runs AFTER the epoch's training loop, so state_N means "epoch N
+    # is finished" and the first epoch still owed is N+1.
+    tag = os.path.basename(os.path.normpath(args.resume_from))
+    if not tag.startswith("state_") or not tag[len("state_"):].isdigit():
+        raise SystemExit(
+            f"--resume_from: expected a directory named state_<N>, got {tag!r}. "
+            "The epoch to continue from is read off that name.")
+    start_epoch = int(tag[len("state_"):]) + 1
+    if accelerator.is_local_main_process:
+        print(f"resumed from {args.resume_from}: continuing at epoch {start_epoch}"
+              f" of {num_epochs + 1}")
+    if start_epoch > num_epochs:
+        raise SystemExit(
+            f"nothing to do: {tag} already completes --num-epochs {num_epochs} "
+            f"(the loop runs epochs 0..{num_epochs}). Raise --num-epochs to extend.")
+
 import time
-for epoch in range(num_epochs + 1):
+for epoch in range(start_epoch, num_epochs + 1):
     top_3acc = [0 for _ in range(3)]
     correct = 0
     total = 0
@@ -604,7 +638,15 @@ for epoch in range(num_epochs + 1):
         print(f'Train speed: {batches_per_sec:.2f} batches/s')
 
         # wandb.log({"train/epochacc": correct / total, "train/epochloss": epoch_loss})
-        accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")
+
+    # Every rank, not just the main one: save_state writes the shared tensors
+    # from the main process anyway, but each rank writes its OWN
+    # random_states_<rank>.pkl. Called under is_local_main_process (as it was)
+    # only rank 0's is written, and every other rank silently fails to restore
+    # its RNG on resume -- load_accelerator_state swallows that in a
+    # try/except. Checkpoints written before this change still resume, minus
+    # the RNG.
+    accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")
 
 
     # if (epoch + 1) % train_config["save_freq"]:

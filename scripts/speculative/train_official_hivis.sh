@@ -149,7 +149,6 @@ run_stage2() {
     --configpath "$CONFIG_PATH"
     --text-data-dir "$TEXT_CKPT_DIR/non_code"
     --multimodal-data-dir "$MULTIMODAL_CKPT_DIR"
-    --ckpt_path "$STAGE1_CKPT"
     --cpdir "$STAGE2_DIR"
     --lr "$LR"
     --bs "$BS_STAGE2"
@@ -160,6 +159,16 @@ run_stage2() {
     --topk "$TOPK"
     --topk_w "$TOPK_W"
   )
+  # RESUME_FROM continues a stage-2 run from one of its OWN state_<N> dirs
+  # (model + optimizer + LR scheduler + RNG, restarting at epoch N+1). Without
+  # it stage 2 starts fresh from STAGE1_CKPT's weights, which is what a first
+  # run wants. The two are mutually exclusive -- the trainer ignores
+  # --ckpt_path when --resume_from is given -- so only one is ever passed.
+  if [[ -n "${RESUME_FROM:-}" ]]; then
+    args+=(--resume_from "$RESUME_FROM")
+  else
+    args+=(--ckpt_path "$STAGE1_CKPT")
+  fi
   [[ -n "$DDP_BACKEND" ]] && args+=(--ddp-backend "$DDP_BACKEND")
   CUDA_VISIBLE_DEVICES="$GPU_CSV" accelerate launch -m "${ACCELERATE_MULTI_GPU_ARGS[@]}" --mixed_precision=bf16 hivis.train.main_mix_topk_dyn_res "${args[@]}"
 }

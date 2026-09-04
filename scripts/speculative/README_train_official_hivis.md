@@ -182,7 +182,8 @@ calling the script (or prefixing the call, e.g. `VAR=val bash ...`).
 | `CONFIG_PATH` | per-`MODEL` (table above) | draft model config JSON |
 | `OUTPUT_ROOT` | `output/hivis_official/<MODEL>` | parent dir for checkpoints |
 | `STAGE1_DIR` / `STAGE2_DIR` | `$OUTPUT_ROOT/stage1` / `stage2` | per-stage checkpoint dirs |
-| `STAGE1_CKPT` | `$STAGE1_DIR/state_0` | stage 1 checkpoint stage 2 loads |
+| `STAGE1_CKPT` | `$STAGE1_DIR/state_0` | stage 1 checkpoint stage 2 loads. **The default is the 1-epoch state**, not the last one — `state_N` is written after epoch N, so `STAGE1_EPOCHS=2` leaves `state_0/1/2` and this points at the weakest. Set it explicitly. |
+| `RESUME_FROM` | *(unset)* | a stage-2 `state_<N>` to continue at epoch N+1, optimizer/scheduler/RNG intact. Mutually exclusive with `STAGE1_CKPT`; when set, `STAGE1_CKPT` is not passed |
 | `GPUS` | `0 1 2 3` | space-separated GPU indices |
 | `DDP_BACKEND` | *(unset → nccl)* | `nccl` \| `gloo` |
 | `START` / `END` | `0` / `1000000000000` | row-range slice, pre-shuffle; `END` is clamped to the file's real row count in `allocation.py`, so the huge sentinel just means "everything" |
@@ -200,31 +201,49 @@ calling the script (or prefixing the call, e.g. `VAR=val bash ...`).
 
 ## Resuming / continuing from a checkpoint
 
-**There is no true resume.** Neither `main_mix.py` (stage 1) nor
-`main_mix_topk_dyn_res.py` (stage 2) ever calls `accelerator.load_state()` —
-each only calls `accelerator.save_state(output_dir=f"{cpdir}/state_{epoch}")`
-once per full pass (so `--num-epochs N` actually writes `state_0` through
-`state_N`, i.e. N+1 checkpoints — see the loop `for epoch in range(num_epochs
-+ 1)`). There is no `--resume` flag on either script, and the optimizer/LR
-scheduler state saved inside each `state_*/` (`optimizer.bin`,
-`scheduler.bin`, `random_states_0.pkl`) is never read back by either script.
-Concretely: **you cannot pick up a stage 1 or stage 2 run mid-training with
-its optimizer/LR-schedule state intact.**
+**Stage 2 can now resume; stage 1 still cannot.** Each script calls
+`accelerator.save_state(output_dir=f"{cpdir}/state_{epoch}")` once per full
+pass, so `--num-epochs N` writes `state_0` through `state_N`, i.e. N+1
+checkpoints — see the loop `for epoch in range(num_epochs + 1)`. `state_N`
+therefore means "epoch N is finished".
 
-What *is* supported is weight-chaining stage 1 → stage 2, and only in that
-direction:
+- **Stage 2** takes `--resume_from <state_N>` (env `RESUME_FROM` through
+  `train_official_hivis.sh`). It calls `accelerator.load_state()` after
+  `prepare()`, restoring model, optimizer, LR scheduler and RNG, and continues
+  at epoch N+1. Keep `--num-epochs` at whatever the original run used, or
+  raise it to extend; the script refuses a checkpoint that already completes
+  it. `--ckpt_path` is ignored when `--resume_from` is given.
+- **Stage 1** still has no load path of any kind — no `--resume_from`, no
+  `--ckpt_path`. It always builds `Model(config, load_emb=True,
+  path=base_model_path)` from scratch. Continuing stage 1 for more epochs
+  would need the same treatment stage 2 just got.
+
+Two limits on the stage-2 resume:
+
+- **Epoch granularity only.** A run killed mid-epoch restarts that epoch.
+  Mid-epoch resume would need a saved step counter plus
+  `accelerate.skip_first_batches`.
+- **A different GPU count is not an equivalent resume.** `total_steps` is a
+  fixed 800000 so the LR schedule's shape does not depend on world size, but
+  how many optimizer steps an epoch takes does, so the run advances along that
+  schedule at a different rate than before.
+
+Checkpoints written before this change hold only `random_states_0.pkl`,
+because `save_state` used to run under `if accelerator.is_local_main_process`.
+They still resume — `load_accelerator_state` swallows the missing per-rank
+file in a `try/except` — but ranks other than 0 do not restore their RNG, and
+it says so only at `logger.info`. Checkpoints written from now on have one
+file per rank.
+
+Separately from resuming, weight-chaining stage 1 → stage 2 works as it always
+did, and is what a *first* stage-2 run wants:
 
 - `main_mix_topk_dyn_res.py` (stage 2) takes `--ckpt_path <dir>`, loads
   `<dir>/model.safetensors` via `safetensors.torch.load_file` +
   `model.load_state_dict(..., strict=True)`, **before** `accelerator.prepare`
   — so it's a fresh optimizer/scheduler seeded with stage 1's model weights,
   not a resume.
-- `main_mix.py` (stage 1) has **no `--ckpt_path` argument at all** — it
-  always builds `Model(config, load_emb=True, path=base_model_path)` from
-  scratch, so there is no built-in way to continue stage 1 itself for more
-  epochs from an existing `state_N/`. Doing that would require patching
-  `main_mix.py` to add the same `--ckpt_path` load stage 2 already has,
-  before its `accelerator.prepare` call.
+- `main_mix.py` (stage 1) has **no `--ckpt_path` argument at all**, as above.
 
 ### Recipe: continue from our SmolVLM-256M stage1(20ep) checkpoint into stage2
 
