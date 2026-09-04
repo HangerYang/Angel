@@ -128,18 +128,12 @@ for i in range(len(dataset)):
     torch.cuda.synchronize(); dt = time.time() - t0
     tau = sum(x + 1 for x in acc) / max(len(acc), 1) if acc else 1.0
     all_acc += acc
-    generated_ids = out_ids[0, prompt_len:].tolist()
     rows.append({
         "index": i,
         "tokens": int(new_token), "rounds": len(acc), "tau": tau, "time": dt,
         "prompt_tokens": int(prompt_len),
-        "generated_text": tokenizer.decode(generated_ids, skip_special_tokens=True),
-        "generated_ids": generated_ids,
-        # Per-round accepted counts (drafted tokens that survived verification,
-        # excluding the always-free bonus). The distribution, not just its mean,
-        # is what separates "accepts a little every round" from "accepts a lot
-        # sometimes" -- two very different drafters with the same tau.
-        "accept_lengths": [int(x) for x in acc],
+        "generated_text": tokenizer.decode(
+            out_ids[0, prompt_len:], skip_special_tokens=True),
         "row": row_metadata(dataset[i]),
     })
     print("  [%d] tokens=%d rounds=%d tau=%.3f  %.2fs" % (i, new_token, len(acc), tau, dt))

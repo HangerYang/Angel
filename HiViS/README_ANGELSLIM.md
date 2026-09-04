@@ -410,8 +410,6 @@ that silently breaks the cross-backend comparison and every number below.
     "index": 0, "tokens": 1028, "rounds": 322, "tau": 3.193, "time": 12.70,
     "prompt_tokens": 1034,
     "generated_text": "...",       // what the run actually produced
-    "generated_ids": [/* ... */],
-    "accept_lengths": [3, 0, 1, 5, /* ... */],   // per round, bonus excluded
     "row": {}                      // the benchmark row's JSON-able fields
   }],
   "cfg": {}                        // every CLI flag, for provenance
@@ -425,8 +423,10 @@ here and a vLLM run can be read by the same code. Two fields go beyond it:
   speculative depth `k`. The same τ can come from a short chain that almost
   always lands or a long one that usually breaks at depth 1, and only this
   curve separates them. It is where an under-trained drafter shows itself:
-  depth 1 stays close to a well-trained one while depth 3+ collapses.
-- **`accept_lengths`** is the same information unaggregated, per round.
+  depth 1 stays close to a well-trained one while depth 3+ collapses. It is
+  kept aggregated on purpose -- the per-round accept counts it is computed
+  from run to tens of thousands of entries per file and say nothing the curve
+  does not.
 
 `generated_text` is kept because greedy speculative decoding is **not** lossless
 here — on SmolVLM-256M only about half of 40 prompts reproduce the `--naive`
