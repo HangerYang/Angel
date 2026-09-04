@@ -84,6 +84,24 @@ print("drafter:", type(model.ea_layer).__name__,
       "| method:", a.draft_method, "| aux layers:", getattr(model, "aux_layer_ids", None))
 
 dataset = load_benchmark(a.dataset, sample_count=a.n)
+tokenizer = getattr(model.processor, "tokenizer", None) or model.processor
+
+
+def row_metadata(row):
+    """Everything about a benchmark row that is worth keeping beside the
+    generation -- the question and the gold answer, so two runs can be diffed
+    on what they actually produced, not only on tau. Images and any other
+    non-JSON value are dropped; the row schema differs per benchmark, so this
+    keeps whatever scalar/list fields there are rather than naming them."""
+    keep = {}
+    for k, v in row.items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            keep[k] = v
+        elif isinstance(v, list) and all(isinstance(x, (str, int, float)) for x in v):
+            keep[k] = v
+    return keep
+
+
 rows, all_acc = [], []
 for i in range(len(dataset)):
     inputs = prepare_inputs(model, dataset, i, a.dataset)
@@ -110,7 +128,20 @@ for i in range(len(dataset)):
     torch.cuda.synchronize(); dt = time.time() - t0
     tau = sum(x + 1 for x in acc) / max(len(acc), 1) if acc else 1.0
     all_acc += acc
-    rows.append({"tokens": int(new_token), "rounds": len(acc), "tau": tau, "time": dt})
+    generated_ids = out_ids[0, prompt_len:].tolist()
+    rows.append({
+        "index": i,
+        "tokens": int(new_token), "rounds": len(acc), "tau": tau, "time": dt,
+        "prompt_tokens": int(prompt_len),
+        "generated_text": tokenizer.decode(generated_ids, skip_special_tokens=True),
+        "generated_ids": generated_ids,
+        # Per-round accepted counts (drafted tokens that survived verification,
+        # excluding the always-free bonus). The distribution, not just its mean,
+        # is what separates "accepts a little every round" from "accepts a lot
+        # sometimes" -- two very different drafters with the same tau.
+        "accept_lengths": [int(x) for x in acc],
+        "row": row_metadata(dataset[i]),
+    })
     print("  [%d] tokens=%d rounds=%d tau=%.3f  %.2fs" % (i, new_token, len(acc), tau, dt))
 
 tau = sum(x + 1 for x in all_acc) / max(len(all_acc), 1) if all_acc else 1.0
@@ -120,6 +151,31 @@ print("\n%s | %s | total_token=%d depth=%d top_k=%d"
       % (a.draft_method, a.dataset, a.total_token, a.depth, a.top_k))
 print("mean acceptance length = %.4f over %d rounds | %.2f tok/s | avg out %.1f"
       % (tau, len(all_acc), total_tok / total_time, total_tok / len(rows)))
+# Acceptance rate at each speculative position, the way vLLM's
+# `acceptance_rates` reports it: fraction of rounds in which at least k drafted
+# tokens were accepted, k = 1..max. A tau can be reached either by a short
+# chain that almost always lands or a long one that usually breaks at depth 1,
+# and only this curve tells those apart.
+max_k = max(all_acc) if all_acc else 0
+acceptance_rates = [
+    sum(1 for x in all_acc if x >= k) / len(all_acc) for k in range(1, max_k + 1)
+] if all_acc else []
+
 if a.out:
-    json.dump({"tau": tau, "rounds": len(all_acc), "tok_per_s": total_tok / total_time,
-               "per_prompt": rows, "cfg": vars(a)}, open(a.out, "w"), indent=2)
+    json.dump({
+        "metrics": {
+            "draft": a.draft, "draft_method": a.draft_method, "base": a.base,
+            "dataset": a.dataset, "num_prompts": len(rows),
+            "total_token": a.total_token, "depth": a.depth, "top_k": a.top_k,
+            "max_new_tokens": a.max_new_tokens, "naive": a.naive, "temperature": 0.0,
+            "tau": tau, "rounds": len(all_acc),
+            "tok_per_s": total_tok / total_time,
+            "total_output_tokens": total_tok, "total_time_s": total_time,
+            "avg_input_tokens": sum(r["prompt_tokens"] for r in rows) / max(len(rows), 1),
+            "avg_output_tokens": total_tok / max(len(rows), 1),
+            "acceptance_rates": acceptance_rates,
+        },
+        # Kept for the older readers that indexed these at the top level.
+        "tau": tau, "rounds": len(all_acc), "tok_per_s": total_tok / total_time,
+        "per_prompt": rows, "cfg": vars(a),
+    }, open(a.out, "w"), indent=2, ensure_ascii=False)

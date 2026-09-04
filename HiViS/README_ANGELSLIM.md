@@ -393,13 +393,47 @@ that silently breaks the cross-backend comparison and every number below.
 
 ```json
 {
-  "tau": 2.9123,          // mean acceptance length over all rounds
-  "rounds": 1346,         // total speculation rounds across all prompts
-  "tok_per_s": 72.80,     // total tokens / total wall time
-  "per_prompt": [{"tokens": 1028, "rounds": 322, "tau": 3.193, "time": 12.70}],
-  "cfg": {}               // every CLI flag, for provenance
+  "metrics": {
+    "draft": "...", "draft_method": "angelslim_eagle3", "base": "...",
+    "dataset": "mmmu_history", "num_prompts": 40,
+    "total_token": 60, "depth": 5, "top_k": 10,
+    "max_new_tokens": 1024, "naive": false, "temperature": 0.0,
+    "tau": 2.9123,                 // mean acceptance length over all rounds
+    "rounds": 1346,                // total speculation rounds across all prompts
+    "tok_per_s": 72.80,            // total tokens / total wall time
+    "total_output_tokens": 41120, "total_time_s": 564.8,
+    "avg_input_tokens": 1033.9, "avg_output_tokens": 1028.0,
+    "acceptance_rates": [0.80, 0.69, 0.54, 0.35, 0.29, 0.22]
+  },
+  "tau": 2.9123, "rounds": 1346, "tok_per_s": 72.80,   // also at top level, unchanged
+  "per_prompt": [{
+    "index": 0, "tokens": 1028, "rounds": 322, "tau": 3.193, "time": 12.70,
+    "prompt_tokens": 1034,
+    "generated_text": "...",       // what the run actually produced
+    "generated_ids": [/* ... */],
+    "accept_lengths": [3, 0, 1, 5, /* ... */],   // per round, bonus excluded
+    "row": {}                      // the benchmark row's JSON-able fields
+  }],
+  "cfg": {}                        // every CLI flag, for provenance
 }
 ```
+
+`metrics` mirrors what `tools/vllm_offline_eagle3_vlm_batch.py` writes, so a run
+here and a vLLM run can be read by the same code. Two fields go beyond it:
+
+- **`acceptance_rates[k-1]`** is the fraction of rounds that survived to
+  speculative depth `k`. The same τ can come from a short chain that almost
+  always lands or a long one that usually breaks at depth 1, and only this
+  curve separates them. It is where an under-trained drafter shows itself:
+  depth 1 stays close to a well-trained one while depth 3+ collapses.
+- **`accept_lengths`** is the same information unaggregated, per round.
+
+`generated_text` is kept because greedy speculative decoding is **not** lossless
+here — on SmolVLM-256M only about half of 40 prompts reproduce the `--naive`
+run's text exactly, and the mean common prefix is 29–44% of it. Every arm
+therefore measures τ over its own continuation, so a τ gap between two runs is
+partly a gap between two different texts. Keeping the text is what makes that
+checkable instead of invisible.
 
 A **round** is one speculate-then-verify cycle. τ is
 `mean(accepted_count + 1)` over rounds — the `+1` is the token the target
@@ -505,6 +539,7 @@ Three independent checks, in increasing scope:
 | `--cache_len N is too small for prompt M` | visual tokens; a Qwen2.5-VL page is ~16.3k | raise `--cache_len` to the number the message names |
 | `start (0) + length (N) exceeds dimension size` | same, but from inside `KVCache` | you are on an older revision without the preflight check |
 | `ValueError: too many values to unpack (expected 4)` | `topK_genrate` returned AngelSlim's 5-tuple | the `HiViSInterfaceMixin` trim was bypassed |
+| τ = 1.000 on *every* prompt with `--draft_method hivis`/`vispec` | before the `_target_image_token_id` fix, the visual span was pruned with a hardcoded id (32000, LLaVA's) — on SmolVLM (49190) nothing was pruned and the drafter got ~800 image rows it never saw in training | fixed in `utils_hivis.py`; check you are on this revision |
 | missing `rotary_emb.inv_freq` keys | derived buffers, not weights | already filtered from the strict check |
 
 ## Limitations
@@ -517,9 +552,13 @@ Three independent checks, in increasing scope:
 - Only `banded_mix_fc` and `fused_fc` injection modes are wired up.
   `build_drafter` raises `NotImplementedError` on anything else rather than
   loading a drafter that silently computes the wrong thing.
-- SmolVLM / Idefics3 targets only for the *angelslim* path. The Qwen2.5-VL
-  branch raises if aux capture is requested. HiViS's and ViSpec's own drafters
-  run on Qwen normally — that path is upstream's and untouched.
+- SmolVLM / Idefics3 aux capture is only for the *angelslim* path; the
+  Qwen2.5-VL branch raises if it is requested. HiViS's and ViSpec's own drafters
+  now also run on SmolVLM: upstream pruned the visual span with a hardcoded
+  32000 (LLaVA's image token) for every non-Qwen target, which silently pruned
+  nothing on SmolVLM's 49190 and pinned τ at 1.000. `_target_image_token_id`
+  reads the id off the target's own config instead. ViSpec's branch still
+  hardcodes 32000 for its `image_mask`, so ViSpec on SmolVLM is untested.
 - Single-layer drafters only; `build_drafter` raises if `num_hidden_layers != 1`.
 - Batch size 1 throughout, greedy only in the measured configurations.
 

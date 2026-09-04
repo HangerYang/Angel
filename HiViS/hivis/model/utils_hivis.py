@@ -37,6 +37,25 @@ def build_mask(input_ids: torch.Tensor):
 
     return mask
 
+
+def _target_image_token_id(model, default=32000):
+    """The image placeholder id of whatever target this EaModel wraps.
+
+    Upstream hardcodes 32000 (LLaVA) for every non-Qwen target. SmolVLM /
+    Idefics3 uses 49190, so on that target nothing was pruned and a HiViS
+    drafter -- whose whole premise is that it never sees the visual span --
+    was handed ~800 image rows it was never trained on. Acceptance pinned at
+    exactly tau=1.0 on every prompt.
+    """
+    cfg = getattr(getattr(model, "base_model", model), "config", None)
+    for holder in (cfg, getattr(cfg, "text_config", None)):
+        if holder is None:
+            continue
+        tok = getattr(holder, "image_token_id", None)
+        if tok is not None:
+            return int(tok)
+    return default
+
 def prune_image_tokens(
     input_ids: torch.LongTensor,
     embeds: torch.Tensor,
@@ -344,7 +363,7 @@ def initialize_tree(
         draft_input_ids = input_ids
         draft_embeds = input_embeds
         draft_hidden_states = hidden_states
-        image_token_id = 151655 if model.is_qwen_vl else 32000
+        image_token_id = 151655 if model.is_qwen_vl else _target_image_token_id(model)
         image_mask = draft_input_ids == image_token_id
         draft_input_embeds = draft_embeds
     else:
@@ -380,7 +399,7 @@ def initialize_tree(
                     input_ids=input_ids,
                     embeds=input_embeds,
                     hidden_states=hidden_states,
-                    image_token_id=32000,
+                    image_token_id=_target_image_token_id(model),
                 )
             )
 
