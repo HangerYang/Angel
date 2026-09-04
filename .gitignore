@@ -80,5 +80,4 @@ my_angel/**/worker.pids
 third_party/HiViS/**/__pycache__/
 
 # Local nested repository checkouts; preserved via manifest/patches
-ViSpec/
 third_party/HiViS/

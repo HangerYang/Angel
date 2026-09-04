@@ -58,6 +58,9 @@ class EaModel(nn.Module):
         self.architecture = base_model.config.architectures[0]
         self.is_qwen_vl = self.architecture == "Qwen2_5_VLForConditionalGeneration"
         self.is_smolvlm = self.architecture == "Idefics3ForConditionalGeneration"
+        # Resolved off the FULL VLM config (embed_model), not the text backbone
+        # rebound below -- the text tower's config carries no image token.
+        self.image_token_id = resolve_image_token_id(self.embed_model.config)
         if draft_method not in DRAFT_MODELS:
             raise ValueError(f"Unsupported draft method: {draft_method}. Choose from {sorted(DRAFT_MODELS)}")
         self.draft_method = draft_method

@@ -37,6 +37,29 @@ def build_mask(input_ids: torch.Tensor):
 
     return mask
 
+# LLaVA-family configs that predate an explicit image-token field. Every model
+# wired up here does expose one, so this only ever backs a hand-built config.
+IMAGE_TOKEN_ID_FALLBACK = 32000
+
+
+def resolve_image_token_id(config, default=IMAGE_TOKEN_ID_FALLBACK):
+    """The `<image>` placeholder id for a VLM, read from that model's own config.
+
+    Families name it differently and the values are nowhere near each other
+    (Qwen2.5-VL 151655, SmolVLM/Idefics3 49190, LLaVA 32000), so branching on
+    the architecture and hardcoding a constant per branch fails silently the
+    moment a model lands outside those branches: the image mask comes out
+    all-False, the visual span is never compressed or pruned, and the draft
+    still runs -- just as a plain EAGLE forward on the full sequence, with no
+    error to notice.
+    """
+    for attr in ("image_token_id", "image_token_index"):
+        value = getattr(config, attr, None)
+        if value is not None:
+            return int(value)
+    return default
+
+
 def prune_image_tokens(
     input_ids: torch.LongTensor,
     embeds: torch.Tensor,
@@ -336,7 +359,7 @@ def initialize_tree(
         draft_input_ids = input_ids
         draft_embeds = input_embeds
         draft_hidden_states = hidden_states
-        image_token_id = 151655 if model.is_qwen_vl else 32000
+        image_token_id = model.image_token_id
         image_mask = draft_input_ids == image_token_id
         draft_input_embeds = draft_embeds
     else:
@@ -361,7 +384,7 @@ def initialize_tree(
                 embeds=input_embeds,
                 hidden_states=hidden_states,
                 text_position_ids=text_position_ids,
-                image_token_id=151655,
+                image_token_id=model.image_token_id,
             )
         else:
             draft_input_ids, draft_embeds, draft_hidden_states = (
@@ -369,7 +392,7 @@ def initialize_tree(
                     input_ids=input_ids,
                     embeds=input_embeds,
                     hidden_states=hidden_states,
-                    image_token_id=32000,
+                    image_token_id=model.image_token_id,
                 )
             )
 
