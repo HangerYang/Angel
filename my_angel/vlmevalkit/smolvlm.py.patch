@@ -1,0 +1,59 @@
+diff --git a/vlmeval/vlm/smolvlm.py b/vlmeval/vlm/smolvlm.py
+index c7d420b..a94899e 100644
+--- a/vlmeval/vlm/smolvlm.py
++++ b/vlmeval/vlm/smolvlm.py
+@@ -1,8 +1,14 @@
++import os
+ import os.path as osp
+ import warnings
+ 
+ import torch
+-from PIL import Image
++from PIL import Image, ImageFile
++
++# A few benchmark PNGs (AI2D, DocVQA) are stored truncated. PIL raises on those
++# by default, which aborts the whole dataset run; decoding what is there is what
++# every other harness does with them.
++ImageFile.LOAD_TRUNCATED_IMAGES = True
+ 
+ from ..smp import splitlen
+ from .base import BaseModel
+@@ -18,6 +24,10 @@ class SmolVLM(BaseModel):
+         assert osp.exists(model_path) or splitlen(model_path) == 2
+ 
+         self.processor = AutoProcessor.from_pretrained(model_path)
++        edge = os.environ.get("SMOLVLM_LONGEST_EDGE")
++        if edge:
++            self.processor.image_processor.size = {"longest_edge": int(edge)}
++            warnings.warn(f"image processor longest_edge overridden to {edge}")
+         self.model = Idefics3ForConditionalGeneration.from_pretrained(
+             model_path, torch_dtype=torch.float32, device_map="cuda"
+         )
+@@ -27,6 +37,13 @@ class SmolVLM(BaseModel):
+         warnings.warn(
+             f"Following kwargs received: {self.kwargs}, will use as generation config."
+         )
++        # Post-encoder row selection. None unless SMOLVLM_TOKEN_SELECT is set, so
++        # the three pixel arms (full / 320 / 64) run byte-identical code.
++        from .smolvlm_select import build_selector
++
++        self.row_selector = build_selector()
++        if self.row_selector is not None:
++            warnings.warn(f"visual row selection: {self.row_selector.summary()}")
+         torch.cuda.empty_cache()
+ 
+     def generate_inner(self, message, dataset=None):
+@@ -93,6 +110,13 @@ class SmolVLM(BaseModel):
+         )
+         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+ 
++        if self.row_selector is not None:
++            from .smolvlm_select import generate_selected
++
++            return generate_selected(
++                self.model, self.processor, inputs, self.row_selector, self.kwargs
++            ).strip()
++
+         generated_ids = self.model.generate(**inputs, **self.kwargs)
+         generated_text = self.processor.batch_decode(
+             generated_ids[:, inputs["input_ids"].size(1):], skip_special_tokens=True
