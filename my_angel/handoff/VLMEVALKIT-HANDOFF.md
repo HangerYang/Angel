@@ -14,8 +14,10 @@ is architectural, not a bug: Idefics3 *upscales* every image to `longest_edge`
 before tiling, so the extra 768 crop rows are interpolation artefacts with no
 independent information in them. Selecting among them cannot beat resampling.
 
-So the training-free line is closed. The open line is a **trained Q-Former**,
-and one is already trained but never benchmarked (§6).
+So the training-free line is closed. The open line is a **trained compressor over a
+frozen target** — the target model is never fine-tuned, which rules out most of
+the published literature (§6, Related work). One such compressor is already
+trained here and has never been benchmarked.
 
 ---
 
@@ -329,63 +331,98 @@ Consequences:
    Without them a Q-Former win is unattributable.
 4. Only then consider the global (non-per-tile) variant.
 
-### Related work — trained (non-training-free) visual compression
+### Related work — trained compressors under a FROZEN target
 
-Checked 2026-09-08. arXiv ids given only where confirmed from the source page;
-entries without one still need the citation looked up before use.
+**Standing constraint: the target model is frozen. Only the compressor is
+trained.** Most of the visual-compression literature does not respect this — it
+trains the projector *and* the LLM together, so the reported numbers are not
+comparable to anything measured here. The list below is split by whether a
+method survives that constraint.
 
-**Survey / index to start from**
-- *A Survey of Token Compression for Efficient MLLMs* — arXiv **2507.20198**
-  (TMLR 2026). Companion list:
-  `github.com/cokeshao/Awesome-Multimodal-Token-Compression`. Also
-  `github.com/daixiangzi/Awesome-Token-Compress`.
+Checked 2026-09-08. arXiv ids only where confirmed from the source page.
 
-**Query/resampler projectors — the family QSampler belongs to**
-- **BLIP-2 Q-Former** — the original: N learned queries cross-attend over frozen
-  vision features. QSampler is this, per-tile, in the LM's embedding space.
+#### A. Directly compatible — frozen backbone, compressor-only training
+
+- **BLIP-2 Q-Former** — the precedent for the whole setting: a resampler trained
+  against a **frozen** image encoder and a **frozen** LLM. QSampler is this idea,
+  per-tile, in the LM's embedding space. Cite it for the setting, not the numbers.
+- **VisionSelector** — arXiv **2510.16598**. Explicitly plug-and-play: the
+  pretrained MLLM backbone stays **frozen**, only the selector trains — 16.87M
+  parameters, trained at a fixed 20% retention budget, evaluated across
+  architectures (e.g. LLaVA-OneVision-1.5-8B). **The closest published match to
+  our setup and the natural baseline to reproduce**: end-to-end learnable
+  selection, so it is the trained answer to the same question DivPrune answers
+  training-free.
+- **EvoComp** — arXiv **2604.17087**. A lightweight compressor between the
+  alignment module and the LLM, emitting retention probabilities over visual
+  tokens; stated to require **no fine-tuning of the vision encoder, the
+  alignment module, or the LLM**. Same slot in the pipeline as QSampler.
+- *(ours)* **QSampler** — §6. Frozen SmolVLM, trained to target-invariance
+  (KL + layer-26 cosine). Already satisfies the constraint by construction.
+
+The existence of A is the point: with a frozen target, a trained compressor
+still reaches top1_agree 0.852 at N=16 on our own data, and BLIP-2 shows a
+frozen LLM will accept a learned token distribution at all. The setting is not
+exotic.
+
+#### B. Architecture reusable, recipe is not
+
+These are drop-in projector designs. The **module** can be trained with the
+target frozen; the **papers** tune the LLM as well, so do not quote their
+accuracy as a baseline — reproduce them in our setting or omit the number.
+
 - **Honeybee** (C-Abstractor / D-Abstractor) — arXiv **2312.06742**, CVPR 2024.
-  Argues a plain Q-Former destroys *locality*; uses convolution (C-Abstractor)
-  or deformable attention (D-Abstractor) to keep spatial structure while making
-  the token budget freely settable. **The most direct architectural critique of
-  what we have** — QSampler's learned 8×8 key positional embedding is the weaker
-  version of this fix, and C-Abstractor is the obvious ablation to add.
-- **TokenPacker** — coarse-to-fine projector: downsample, point-to-region
-  cross-attention, cross-layer fusion. (id not verified)
-- **DeCo** — arXiv **2405.20985**. Decouples *token compression* from *semantic
-  abstraction*, and argues the Q-Former conflates them and underperforms plain
-  adaptive pooling at the same budget. **Read before trusting a Q-Former win** —
-  it predicts our `g_pool` control could be competitive, which is exactly why
-  §6 step 3 insists on running it.
+  Argues a plain Q-Former destroys *locality*, and restores it with convolution
+  or deformable attention while keeping the token budget freely settable. **The
+  sharpest architectural critique of what we have** — QSampler's learned 8×8 key
+  positional embedding is a weaker version of the same fix. C-Abstractor is the
+  ablation to add.
+- **DeCo** — arXiv **2405.20985**. Decouples token compression from semantic
+  abstraction, and argues the Q-Former conflates the two and **loses to plain
+  adaptive pooling** at equal budget. Read before believing any Q-Former win:
+  it predicts our `g_pool` control is competitive, and those cells are empty.
+- **TokenPacker** — coarse-to-fine projector (downsample → point-to-region
+  cross-attention → cross-layer fusion). (id not verified)
 
-**Extreme budgets (relevant to the 16/8-token downstream goal)**
-- **LLaVA-Mini** — arXiv **2501.03895**, ICLR 2025. **1** vision token vs
-  LLaVA-1.5's 576, at comparable accuracy. Key idea: vision tokens matter mostly
-  in the *early* LLM layers, where they fuse into text; so do that fusion
-  *before* the LLM ("modality pre-fusion") and then compress hard. This is the
-  strongest published evidence that the 43.04 → 51.42 recovery is achievable,
-  and its diagnosis is directly testable on SmolVLM.
-- **Victor** — learnable *register* tokens appended after the visual tokens; the
-  visual tokens are dropped after a few layers and reasoning continues on the
-  registers alone. Reported >96% of VQA accuracy with **8** registers (~1% of
-  the tokens). (id not verified)
+#### C. Ruled out — they require training the target
 
-**Elastic / multi-budget training — worth copying regardless of method**
-- **Matryoshka Query Transformer (MQT)** — NeurIPS 2024. One model, token count
-  chosen at inference: each step trains on the first *m* of M latent queries,
-  *m* sampled randomly. **This would collapse our whole n1/n4/n8/n16 sweep into a
-  single training run** and give the 16/8/4 budgets for free. Cheap to adopt —
-  it is a sampling change in the training loop, not a new architecture.
+Listed so nobody re-derives them. Their *diagnoses* may still be usable; their
+methods are not.
 
-**Other recent, unread**
-- *VisionSelector* — arXiv **2510.16598**, end-to-end learnable selection.
-- *LaCo* — arXiv **2507.02279**, layer-wise compression.
-- *Vision Remember* — arXiv **2506.03928**, resampling to recover lost detail.
-- *Learning Compact Vision Tokens* — arXiv **2506.07138**.
+- **LLaVA-Mini** — arXiv **2501.03895**, ICLR 2025. 1 vision token vs 576. But
+  "modality pre-fusion" inserts LLM blocks ahead of the backbone and the whole
+  model is trained. **Unusable as a method here.** Its finding is still worth
+  citing and is cheap to test on SmolVLM: vision tokens matter mainly in the
+  *early* LLM layers, where they fuse into text.
+- **Victor** — learnable *register* tokens; visual tokens are dropped after a
+  few layers and reasoning continues on ~8 registers (>96% of VQA accuracy).
+  The registers are processed by the LLM, so the LLM must be trained to use
+  them. Out. (id not verified)
+- **MQT (Matryoshka Query Transformer)** — NeurIPS 2024. Trained jointly with
+  LLaVA, so the method is out — **but the training trick transfers unchanged**:
+  each step uses only the first *m* of *M* latent queries, *m* random, giving one
+  model that serves any budget at inference. Applied to QSampler this collapses
+  the whole n1/n4/n8/n16 sweep into a single run and yields 16/8/4 for free. It
+  is a sampling change in the training loop, nothing more.
 
-**How this changes the plan:** §6's step 2 should train with MQT-style query
-dropout (one run, all budgets), and the ablation set should be
-`{QSampler, C-Abstractor, adaptive pooling}` at matched budget — DeCo's claim is
-that the third one is hard to beat, and our `g_pool` cells are currently empty.
+#### Index / unread
+
+- Survey: *A Survey of Token Compression for Efficient MLLMs* — arXiv
+  **2507.20198** (TMLR 2026). Lists:
+  `github.com/cokeshao/Awesome-Multimodal-Token-Compression`,
+  `github.com/daixiangzi/Awesome-Token-Compress`.
+- *Are We Using the Right Benchmark: An Evaluation Framework for Visual Token
+  Compression* — arXiv **2510.07143**. Read this before finalising the table;
+  it is about exactly the measurement question §5 ran into.
+- *IPCV* — arXiv **2512.18747**. *LaCo* — arXiv **2507.02279**. *Vision
+  Remember* — arXiv **2506.03928**. *Learning Compact Vision Tokens* — arXiv
+  **2506.07138**.
+
+**How this changes the plan:** the baseline set becomes
+`{VisionSelector, C-Abstractor, adaptive pooling}` at matched budget — the first
+is the only published method that already runs under our constraint, the second
+is the architectural challenger, the third is DeCo's warning. Train with
+MQT-style query dropout so one run covers 64/16/8/4.
 
 ### Failure mode to design against
 
