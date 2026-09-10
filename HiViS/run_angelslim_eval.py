@@ -27,12 +27,29 @@ a comparison of kernel stacks. See README_ANGELSLIM.md.
         --base Qwen/Qwen2.5-VL-7B-Instruct \
         --draft Irisssme/HiViS-Qwen2.5-VL-7B-Instruct --dataset omnidocbench
 """
-import argparse, json, time
+import argparse, json, random, time
+import numpy as np
 import torch
 from hivis.model.model_hivis import EaModel
 from hivis.evaluation.benchmark_data import (
-    load_benchmark, prepare_inputs, supported_benchmarks,
+    load_benchmark, prepare_inputs, row_message_and_image, supported_benchmarks,
 )
+
+
+def setup_seed(seed):
+    """Verbatim from hivis/evaluation/ge_hivis_answer.py."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def truncate_list(values, stop_token_id):
+    """Verbatim from hivis/evaluation/ge_hivis_answer.py."""
+    if stop_token_id not in values:
+        return values
+    return values[: values.index(stop_token_id) + 1]
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--base", default="HuggingFaceTB/SmolVLM-256M-Instruct",
@@ -42,7 +59,25 @@ ap.add_argument("--draft_method", default="angelslim_eagle3",
                 choices=["angelslim_eagle3", "hivis", "vispec", "eagle"])
 ap.add_argument("--dataset", default="omnidocbench", choices=supported_benchmarks())
 ap.add_argument("--n", type=int, default=4)
-ap.add_argument("--max_new_tokens", type=int, default=256)
+# Protocol defaults are HiViS's own (hivis/evaluation/ge_hivis_answer.py
+# build_parser), so a number from here is comparable to one from there. The
+# only deliberate departure is --device: HiViS uses device_map="auto".
+ap.add_argument("--max_new_tokens", type=int, default=500,
+                help="HiViS's --max-new-token default.")
+ap.add_argument("--max_input_tokens", type=int, default=4000,
+                help="skip a prompt longer than this, as HiViS does. Its 80 "
+                     "samples are the first 80 that FIT, not the first 80 rows.")
+ap.add_argument("--warmup", type=int, default=3,
+                help="untimed prompts before the measured loop. HiViS runs 3; "
+                     "without them the first prompt carries CUDA init (472ms "
+                     "against 84-100ms steady state, measured on SmolVLM-256M).")
+ap.add_argument("--seed", type=int, default=42, help="HiViS's --seed default.")
+ap.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"],
+                help="bfloat16, matching the AngelSlim side and every arm already "
+                     "measured. NOT aligned to HiViS's evaluators, which load "
+                     "float16 -- HiViS itself trains in bf16 and model_hivis.py "
+                     "casts pixel_values to bf16 regardless of model dtype, so "
+                     "its own fp16 eval is the inconsistent one.")
 ap.add_argument("--total_token", type=int, default=60)
 ap.add_argument("--depth", type=int, default=5)
 ap.add_argument("--top_k", type=int, default=10)
@@ -59,16 +94,43 @@ ap.add_argument("--cache_len", type=int, default=None,
                      "max_position_embeddings). Qwen2.5-VL's 128k default costs "
                      "~7.3GB and OOMs a 7B target on a 24GB card; 4096 is ample "
                      "for these prompts. Must be >= prompt + max_new_tokens.")
+# Drafter-side image-row reduction. The TARGET always prefills the full image;
+# these only change what the drafter is handed, and must match how the
+# checkpoint was trained or the number measures the mismatch instead.
+ap.add_argument("--draft_image_reduce", choices=["pool", "subset", "short"], default=None,
+                help="pool/subset: reduce the full forward's image rows by "
+                     "--draft_image_factor. short: a SECOND target forward at "
+                     "--draft_image_edge whose image rows replace them.")
+ap.add_argument("--draft_image_control",
+                choices=["zero", "shuffle", "random", "wrong", "drop"], default=None,
+                help="Corrupt the drafter's image rows without changing their "
+                     "count, ids or positions -- a control for whether the "
+                     "drafter reads the image at all.")
+ap.add_argument("--draft_image_control_seed", type=int, default=0)
+ap.add_argument("--draft_image_factor", type=int, default=4,
+                help="pool/subset only; matches VISTOKEN_FACTOR at training time.")
+ap.add_argument("--draft_image_edge", type=int, default=None,
+                help="short only; the processor longest_edge for the second "
+                     "forward. Matches VISTOKEN_SHORT_EDGE at training time "
+                     "(1024 -> 320 rows, 512 -> 64).")
+ap.add_argument("--draft_image_token_id", type=int, default=None,
+                help="defaults to the target config's image token id.")
+ap.add_argument("--draft_image_root", default=None,
+                help="checkout holding the training-side reduction code "
+                     "(short_image.py, reduce_vlm_image_rows). Separate from "
+                     "the drafter's own root; defaults to $ANGELSLIM_TRAIN_ROOT.")
 ap.add_argument("--out", default=None)
 ap.add_argument("--naive", action="store_true",
                 help="autoregressive baseline in the same harness (speedup denominator)")
 a = ap.parse_args()
+setup_seed(a.seed)
+DTYPE = getattr(torch, a.dtype)
 
 model = EaModel.from_pretrained(
     base_model_path=a.base, ea_model_path=a.draft,
     total_token=a.total_token, depth=a.depth, top_k=a.top_k,
     draft_method=a.draft_method,
-    torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map=a.device,
+    torch_dtype=DTYPE, low_cpu_mem_usage=True, device_map=a.device,
 )
 model.eval()
 model.cache_max_len = a.cache_len
@@ -82,6 +144,25 @@ if a.max_pixels is not None:
     print("max_pixels ->", a.max_pixels)
 print("drafter:", type(model.ea_layer).__name__,
       "| method:", a.draft_method, "| aux layers:", getattr(model, "aux_layer_ids", None))
+
+reducer = None
+if a.draft_image_reduce is not None:
+    from hivis.model.draft_image_rows import DraftImageReducer
+    from hivis.model.utils_hivis import _target_image_token_id
+
+    img_tok = a.draft_image_token_id or _target_image_token_id(model)
+    reducer = DraftImageReducer(
+        a.draft_image_reduce, img_tok,
+        factor=a.draft_image_factor, longest_edge=a.draft_image_edge,
+        control=a.draft_image_control, control_seed=a.draft_image_control_seed,
+        target_path=a.base, processor=model.processor,
+        aux_layer_ids=model.aux_layer_ids,
+        device=model.base_model.device, dtype=DTYPE,
+        angelslim_root=a.draft_image_root,
+    )
+    model.draft_image_reducer = reducer
+    print("draft image rows: %s (factor=%s edge=%s image_token_id=%d)"
+          % (a.draft_image_reduce, a.draft_image_factor, a.draft_image_edge, img_tok))
 
 dataset = load_benchmark(a.dataset, sample_count=a.n)
 tokenizer = getattr(model.processor, "tokenizer", None) or model.processor
@@ -102,49 +183,123 @@ def row_metadata(row):
     return keep
 
 
-rows, all_acc = [], []
-for i in range(len(dataset)):
-    inputs = prepare_inputs(model, dataset, i, a.dataset)
-    prompt_len = inputs["input_ids"].shape[1]
-    if a.cache_len is not None and prompt_len + a.max_new_tokens > a.cache_len:
-        # The cache is preallocated, so overflowing it surfaces deep inside
-        # KVCache as "start (0) + length (N) exceeds dimension size". Say what
-        # is actually wrong. Qwen2.5-VL does not downsample image tokens the way
-        # SmolVLM does -- one OmniDocBench page is ~16k visual tokens.
-        raise SystemExit(
-            "--cache_len %d is too small for prompt %d (row %d) + --max_new_tokens %d. "
-            "Use --cache_len %d or more."
-            % (a.cache_len, prompt_len, i, a.max_new_tokens,
-               prompt_len + a.max_new_tokens)
-        )
-    torch.cuda.synchronize(); t0 = time.time()
+def generate(inputs):
+    """One generation, speculative or not, returning a uniform tuple."""
     if a.naive:
         out_ids, new_token, idx = model.naivegenerate(
             inputs, temperature=0.0, max_new_tokens=a.max_new_tokens, log=True)[:3]
-        acc = []
-    else:
-        out_ids, new_token, idx, acc = model.eagenerate(
-            inputs, temperature=0.0, max_new_tokens=a.max_new_tokens, log=True)
-    torch.cuda.synchronize(); dt = time.time() - t0
-    tau = sum(x + 1 for x in acc) / max(len(acc), 1) if acc else 1.0
-    all_acc += acc
-    rows.append({
-        "index": i,
-        "tokens": int(new_token), "rounds": len(acc), "tau": tau, "time": dt,
-        "prompt_tokens": int(prompt_len),
-        "generated_text": tokenizer.decode(
-            out_ids[0, prompt_len:], skip_special_tokens=True),
-        "row": row_metadata(dataset[i]),
-    })
-    print("  [%d] tokens=%d rounds=%d tau=%.3f  %.2fs" % (i, new_token, len(acc), tau, dt))
+        return out_ids, new_token, idx, []
+    return model.eagenerate(
+        inputs, temperature=0.0, max_new_tokens=a.max_new_tokens, log=True)
 
-tau = sum(x + 1 for x in all_acc) / max(len(all_acc), 1) if all_acc else 1.0
+
+def hivis_text(out_ids, prompt_len):
+    """Decode the way hivis/evaluation does: clamp ids past the vocab, cut at
+    the first EOS, then decode with its spacing flags. The old path here
+    decoded the whole tail with default flags, which keeps whatever the run
+    emitted after EOS -- and a speculative round emits several tokens at once,
+    so it routinely overshoots."""
+    gen = out_ids[0][prompt_len:].clone()
+    gen[gen > tokenizer.vocab_size] = 0
+    ids = truncate_list(gen.tolist(), tokenizer.eos_token_id)
+    return ids, tokenizer.decode(
+        ids, skip_special_tokens=True,
+        spaces_between_special_tokens=False,
+        clean_up_tokenization_spaces=True)
+
+
+# Untimed warm-up. HiViS's two evaluators disagree on how to do it and this
+# reproduces each rather than tidying the difference away: the speculative side
+# walks prompts 0..2 (ge_hivis_answer.py), the baseline runs prompt 0 three
+# times (ge_baseline_answer_hivis.py). Both re-seed before every call and both
+# prepare with truncation=True, which the measured loop does not.
+for w in range(min(a.warmup, len(dataset)) if not a.naive else a.warmup):
+    warm_index = 0 if a.naive else w
+    torch.manual_seed(0)
+    warm_inputs = prepare_inputs(model, dataset, warm_index, a.dataset, truncation=True)
+    if reducer is not None:
+        reducer.image = row_message_and_image(dataset, warm_index, a.dataset)[1]
+    generate(warm_inputs)
+if a.warmup:
+    print("Warmup done")
+
+rows, all_acc, skipped = [], [], []
+with torch.inference_mode():
+    for i in range(len(dataset)):
+        inputs = prepare_inputs(model, dataset, i, a.dataset)
+        prompt_len = inputs["input_ids"].shape[1]
+        if prompt_len > a.max_input_tokens:
+            # HiViS's wording, so its logs and these are greppable the same way.
+            print("Skipping candidate %d: input length %d exceeds %d"
+                  % (i, prompt_len, a.max_input_tokens), flush=True)
+            skipped.append(i)
+            continue
+        if reducer is not None:
+            reducer.image = row_message_and_image(dataset, i, a.dataset)[1]
+        if a.cache_len is not None and prompt_len + a.max_new_tokens > a.cache_len:
+            # The cache is preallocated, so overflowing it surfaces deep inside
+            # KVCache as "start (0) + length (N) exceeds dimension size". Say what
+            # is actually wrong. Qwen2.5-VL does not downsample image tokens the way
+            # SmolVLM does -- one OmniDocBench page is ~16k visual tokens.
+            raise SystemExit(
+                "--cache_len %d is too small for prompt %d (row %d) + --max_new_tokens %d. "
+                "Use --cache_len %d or more."
+                % (a.cache_len, prompt_len, i, a.max_new_tokens,
+                   prompt_len + a.max_new_tokens)
+            )
+        torch.cuda.synchronize(); t0 = time.time()
+        out_ids, new_token, idx, acc = generate(inputs)
+        torch.cuda.synchronize(); dt = time.time() - t0
+        # Two conventions for the same quantity, both named. `accept_length` from
+        # evaluate_posterior counts the DRAFTED tokens that survived, so a round
+        # emits accept_length + 1. hivis/evaluation reports the mean of
+        # accept_length; EAGLE and every table under my_angel/ report the +1.
+        mean_acc = sum(acc) / len(acc) if acc else None
+        tau = sum(x + 1 for x in acc) / len(acc) if acc else 1.0
+        all_acc += acc
+        decode_ids, text = hivis_text(out_ids, prompt_len)
+        rows.append({
+            "index": i,
+            "tokens": int(new_token), "rounds": len(acc), "tau": tau,
+            "mean_accept_length": mean_acc, "accept_lengths": [int(x) for x in acc],
+            "time": dt, "prompt_tokens": int(prompt_len),
+            # speed.py counts the BASELINE's tokens by re-tokenising its text
+            # rather than by the generation loop. Stored per prompt so that
+            # convention can be reproduced from this file without the model.
+            "retok_tokens": len(tokenizer(text).input_ids) - 1,
+            "generated_text": text,
+            "row": row_metadata(dataset[i]),
+        })
+        print("  [%d] tokens=%d rounds=%d tau=%.3f  %.2fs"
+              % (i, new_token, len(acc), tau, dt))
+
+if reducer is not None and reducer.control_report():
+    print("\n" + reducer.control_report())
+if skipped:
+    # HiViS raises when it cannot reach --target-samples. Same here: a table
+    # whose cells silently rest on different prompt counts is worse than a stop.
+    raise SystemExit(
+        "%d of %d prompts exceeded --max_input_tokens %d (rows %s). HiViS stops "
+        "here rather than report a short sample; raise --max_input_tokens or "
+        "lower --max_pixels if this is expected."
+        % (len(skipped), len(dataset), a.max_input_tokens, skipped))
+
+mean_accept_length = sum(all_acc) / len(all_acc) if all_acc else None
+tau = sum(x + 1 for x in all_acc) / len(all_acc) if all_acc else 1.0
 total_tok = sum(r["tokens"] for r in rows)
 total_time = sum(r["time"] for r in rows)
-print("\n%s | %s | total_token=%d depth=%d top_k=%d"
-      % (a.draft_method, a.dataset, a.total_token, a.depth, a.top_k))
-print("mean acceptance length = %.4f over %d rounds | %.2f tok/s | avg out %.1f"
-      % (tau, len(all_acc), total_tok / total_time, total_tok / len(rows)))
+# micro (sum/sum) and macro (mean of per-prompt rates); speed.py uses macro,
+# and its baseline rate is built from the re-tokenised count.
+tok_per_s = total_tok / total_time
+tok_per_s_macro = sum(r["tokens"] / r["time"] for r in rows) / len(rows)
+tok_per_s_macro_retok = sum(r["retok_tokens"] / r["time"] for r in rows) / len(rows)
+print("\n%s | %s | total_token=%d depth=%d top_k=%d | %s"
+      % (a.draft_method, a.dataset, a.total_token, a.depth, a.top_k, a.dtype))
+print("mean acceptance length = %s (hivis) / %.4f (+1, EAGLE) over %d rounds"
+      % ("n/a" if mean_accept_length is None else "%.4f" % mean_accept_length,
+         tau, len(all_acc)))
+print("%.2f tok/s micro | %.2f macro | %.2f macro re-tokenised | avg out %.1f"
+      % (tok_per_s, tok_per_s_macro, tok_per_s_macro_retok, total_tok / len(rows)))
 # Acceptance rate at each speculative position, the way vLLM's
 # `acceptance_rates` reports it: fraction of rounds in which at least k drafted
 # tokens were accepted, k = 1..max. A tau can be reached either by a short
@@ -162,14 +317,23 @@ if a.out:
             "dataset": a.dataset, "num_prompts": len(rows),
             "total_token": a.total_token, "depth": a.depth, "top_k": a.top_k,
             "max_new_tokens": a.max_new_tokens, "naive": a.naive, "temperature": 0.0,
-            "tau": tau, "rounds": len(all_acc),
-            "tok_per_s": total_tok / total_time,
+            "dtype": a.dtype, "seed": a.seed, "warmup": a.warmup,
+            "max_input_tokens": a.max_input_tokens,
+            # `tau` keeps the +1 convention every table under my_angel/ was
+            # written against; `mean_accept_length` is hivis/evaluation's.
+            "tau": tau, "tau_convention": "accept_length + 1 (EAGLE)",
+            "mean_accept_length": mean_accept_length,
+            "rounds": len(all_acc),
+            "tok_per_s": tok_per_s,
+            "tok_per_s_macro": tok_per_s_macro,
+            "tok_per_s_macro_retok": tok_per_s_macro_retok,
             "total_output_tokens": total_tok, "total_time_s": total_time,
             "avg_input_tokens": sum(r["prompt_tokens"] for r in rows) / max(len(rows), 1),
             "avg_output_tokens": total_tok / max(len(rows), 1),
             "acceptance_rates": acceptance_rates,
         },
         # Kept for the older readers that indexed these at the top level.
-        "tau": tau, "rounds": len(all_acc), "tok_per_s": total_tok / total_time,
+        "tau": tau, "mean_accept_length": mean_accept_length,
+        "rounds": len(all_acc), "tok_per_s": tok_per_s,
         "per_prompt": rows, "cfg": vars(a),
     }, open(a.out, "w"), indent=2, ensure_ascii=False)
