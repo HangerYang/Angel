@@ -927,9 +927,17 @@ class Model(nn.Module):
                             b, img_id_end - img_adapted.shape[0] + 1 : img_id_end
                         ],
                     ]
+                    # The two rows just appended, not the first two ever
+                    # appended. Each pass adds a text block and an adapted image
+                    # block; indexing 0 and 1 re-reads the FIRST image region's
+                    # lengths on every later pass, so trans_mat's n dimension
+                    # stops matching hidden_states. Invisible on a target that
+                    # lays an image down as one contiguous run (Qwen2.5-VL,
+                    # num_ids == 1) and fatal on one that tiles it with markers
+                    # in between (SmolVLM/Idefics3: 13-17 runs for one image).
                     t_m += [
-                        eye_m[img_id_start : img_id_start + h_s[0].shape[0], :],
-                        eye_m[img_id_end - h_s[1].shape[0] : img_id_end, :],
+                        eye_m[img_id_start : img_id_start + h_s[-2].shape[0], :],
+                        eye_m[img_id_end - h_s[-1].shape[0] : img_id_end, :],
                     ]
                     img_id_start = img_id_end
 
