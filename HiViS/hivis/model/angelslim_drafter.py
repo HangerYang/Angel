@@ -173,7 +173,109 @@ class HiViSInterfaceMixin(object):
             off += len(band)
         return torch.cat(mixed, dim=-1)
 
-    def topK_genrate(self, hidden_states, input_ids, inputs_embeds=None, logits_processor=None):
+    # ---- absolute draft positions -------------------------------------
+    # A drafter fed fewer image rows than the target saw was trained on
+    # position ids that are ABSOLUTE and therefore not contiguous: the rows the
+    # reduction removed leave a gap, and every text row after the image keeps
+    # the position the target computed it at. The stock drafter infers
+    # positions from sequence length, which silently closes that gap and shifts
+    # all post-image text down by (rows removed) -- measuring how the drafter
+    # copes with unseen positions rather than how well the reduction works.
+    #
+    # `set_draft_positions` is called once per prompt, from initialize_tree.
+    # Rounds after the first re-enter topK_genrate without positions, so they
+    # are extended from the stored prefill array: past the image the mapping is
+    # a constant offset, absolute = index + gap.
+
+    def _widen_rotary(self, min_len):
+        """Let RoPE be indexed past the sequence length.
+
+        LlamaRotaryEmbedding.forward returns cos_cached[:, :, :seq_len] and
+        apply_rotary_pos_emb then does cos[position_ids]. With contiguous
+        positions the largest index is seq_len-1 and the truncation is
+        invisible; with absolute positions the sequence is SHORTER than its
+        highest position, so indexing runs off the end of the table -- as a
+        device-side assert, not a Python error. Hand back the whole table
+        instead: for contiguous positions this changes nothing, because the
+        rows actually indexed are the same rows.
+        """
+        for module in self.modules():
+            rot = getattr(module, "rotary_emb", None)
+            if rot is None:
+                continue
+            rot._hivis_min_len = max(int(min_len), getattr(rot, "_hivis_min_len", 0))
+            if getattr(rot, "_hivis_widened", False):
+                continue
+
+            def forward(x, seq_len=None, _rot=rot):
+                need = max(int(seq_len or 0), int(getattr(_rot, "_hivis_min_len", 0)))
+                if need > _rot.max_seq_len_cached:
+                    _rot._set_cos_sin_cache(seq_len=need, device=x.device, dtype=x.dtype)
+                return (_rot.cos_cached.to(dtype=x.dtype),
+                        _rot.sin_cached.to(dtype=x.dtype))
+
+            rot.forward = forward
+            rot._hivis_widened = True
+
+    def set_draft_positions(self, position_ids):
+        if position_ids is None:
+            self._draft_positions = None
+            self._position_gap = 0
+            return
+        pos = position_ids.reshape(-1).long()
+        self._draft_positions = pos
+        self._position_gap = int(pos[-1]) + 1 - int(pos.numel())
+        # + the tree depth, which continues past the last prefill position.
+        self._widen_rotary(int(pos[-1]) + 1 + int(getattr(self, "depth", 8)) + 2)
+
+    def _positions_for(self, n, device):
+        base = getattr(self, "_draft_positions", None)
+        if base is None:
+            return None
+        base = base.to(device)
+        if n <= base.numel():
+            return base[:n][None]
+        grown = torch.arange(base.numel(), n, device=device) + self._position_gap
+        return torch.cat([base, grown])[None]
+
+    def _get_initial_hidden(self, hidden_states, input_ids, inputs_embeds=None):
+        """Prefill the draft cache on absolute positions when they were set.
+
+        Also corrects `initial_position_id`, which the caller has just set to
+        the sequence length: the tree levels continue from the last REAL
+        position, which is further along than the row count.
+        """
+        pos = self._positions_for(input_ids.shape[1], input_ids.device)
+        if pos is None:
+            return super(HiViSInterfaceMixin, self)._get_initial_hidden(
+                hidden_states, input_ids, inputs_embeds
+            )
+        if getattr(self, "stable_kv", None) is not None:
+            kv_len = self.stable_kv[0][0].shape[2]
+            outputs = self(
+                hidden_states,
+                input_ids=input_ids[:, kv_len:],
+                inputs_embeds=(inputs_embeds[:, kv_len:] if inputs_embeds is not None else None),
+                past_key_values=self.stable_kv,
+                position_ids=pos[:, kv_len:],
+                use_cache=True,
+            )
+        else:
+            outputs = self(
+                hidden_states,
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                position_ids=pos,
+                use_cache=True,
+            )
+        out_hidden, past_key_values, early_stop_signal = outputs
+        self.initial_position_id = int(pos[0, -1]) + 1
+        return out_hidden[:, -1], past_key_values, early_stop_signal
+
+    def topK_genrate(self, hidden_states, input_ids, inputs_embeds=None,
+                     logits_processor=None, position_ids=None):
+        if position_ids is not None:
+            self.set_draft_positions(position_ids)
         out = super(HiViSInterfaceMixin, self).topK_genrate(
             self.mix_aux(hidden_states), input_ids, inputs_embeds, logits_processor
         )

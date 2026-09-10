@@ -376,6 +376,14 @@ def initialize_tree(
             draft_input_ids = input_ids
             draft_embeds = input_embeds
             draft_hidden_states = hidden_states
+            # ...unless this checkpoint was trained on FEWER image rows than the
+            # target sees. The target's prefill above is untouched and still ran
+            # at full resolution; only what the drafter is handed changes here.
+            reducer = getattr(model, "draft_image_reducer", None)
+            if reducer is not None:
+                reduced = reducer(input_ids, hidden_states)
+                if reduced is not None:
+                    draft_input_ids, draft_hidden_states, new_position_ids = reduced
         elif model.is_qwen_vl:
             seq_length = input_ids.size(1)
             text_position_ids = torch.arange(
@@ -420,6 +428,7 @@ def initialize_tree(
                 draft_ids_with_token,
                 inputs_embeds=None,
                 logits_processor=logits_processor,
+                position_ids=new_position_ids,
             )
         if model.draft_method == "vispec":
             return model.ea_layer.topK_genrate(

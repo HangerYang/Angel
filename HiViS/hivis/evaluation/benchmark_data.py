@@ -229,8 +229,14 @@ def _prepare_mmmu(row):
     return _message(question, len(images)), images
 
 
-def prepare_inputs(model, dataset, index, dataset_name, truncation=False):
-    """Convert one benchmark row into processor inputs on the model device."""
+def row_message_and_image(dataset, index, dataset_name):
+    """The prompt text and the PIL image for one benchmark row.
+
+    Split out of prepare_inputs so a caller that needs the picture itself -- a
+    drafter whose image rows come from a second, lower-resolution target forward
+    -- gets it from the same per-benchmark dispatch, rather than a second copy
+    that can drift out of step with this one.
+    """
     row = dataset[index]
     if dataset_name == "omnidocbench":
         messages, image = _message(_ANGELSLIM_OCR_PROMPT), row["image"]
@@ -273,6 +279,12 @@ def prepare_inputs(model, dataset, index, dataset_name, truncation=False):
     else:
         raise ValueError(f"Unsupported dataset input adapter: {dataset_name}")
 
+    return messages, image
+
+
+def prepare_inputs(model, dataset, index, dataset_name, truncation=False):
+    """Convert one benchmark row into processor inputs on the model device."""
+    messages, image = row_message_and_image(dataset, index, dataset_name)
     prompt = model.processor.apply_chat_template(messages, add_generation_prompt=True)
     return model.processor(
         images=image,
