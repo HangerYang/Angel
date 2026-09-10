@@ -88,13 +88,33 @@ from ..model.cnets import Model
 from ..model.configs import EConfig
 
 if accelerator.is_main_process:
-    import wandb
+    # Neither logger is required to train. wandb here is pinned to another
+    # account's project in offline mode, so its output is unreadable anyway;
+    # tensorboard writes local scalars and is merely nice to have. Missing
+    # either used to stop training at import time.
+    try:
+        import wandb
 
-    wandb.init(project="ess", entity="yuhui-li", mode="offline", config=train_config)
+        wandb.init(project="ess", entity="yuhui-li", mode="offline", config=train_config)
+    except ImportError:
+        class _NoWandb:
+            def log(self, *a, **k): pass
 
-    from torch.utils.tensorboard import SummaryWriter
+        wandb = _NoWandb()
+        print("wandb not installed; metric logging disabled")
 
-    writer = SummaryWriter(log_dir=f"{args.cpdir}/run")
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+
+        writer = SummaryWriter(log_dir=f"{args.cpdir}/run")
+    except ImportError:
+        class _NoWriter:
+            def add_scalar(self, *a, **k): pass
+            def add_scalars(self, *a, **k): pass
+            def close(self): pass
+
+        writer = _NoWriter()
+        print("tensorboard not installed; scalar logging disabled")
 
 try:
     baseconfig = AutoConfig.from_pretrained(args.basepath)

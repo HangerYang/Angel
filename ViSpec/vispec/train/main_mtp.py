@@ -88,9 +88,20 @@ from transformers import (
 from ..model.configs import EConfig
 
 if accelerator.is_main_process:
-    from torch.utils.tensorboard import SummaryWriter
+    # Not required to train; missing tensorboard used to stop training at
+    # import time.
+    try:
+        from torch.utils.tensorboard import SummaryWriter
 
-    writer = SummaryWriter(log_dir=f"{args.cpdir}/run")
+        writer = SummaryWriter(log_dir=f"{args.cpdir}/run")
+    except ImportError:
+        class _NoWriter:
+            def add_scalar(self, *a, **k): pass
+            def add_scalars(self, *a, **k): pass
+            def close(self): pass
+
+        writer = _NoWriter()
+        print("tensorboard not installed; scalar logging disabled")
 
 try:
     baseconfig = AutoConfig.from_pretrained(args.basepath)
