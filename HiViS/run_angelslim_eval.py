@@ -32,7 +32,8 @@ import numpy as np
 import torch
 from hivis.model.model_hivis import EaModel
 from hivis.evaluation.benchmark_data import (
-    load_benchmark, prepare_inputs, row_message_and_image, supported_benchmarks,
+    PROMPT_STYLES, load_benchmark, prepare_inputs, row_message_and_image,
+    set_prompt_style, supported_benchmarks,
 )
 
 
@@ -72,6 +73,17 @@ ap.add_argument("--warmup", type=int, default=3,
                      "without them the first prompt carries CUDA init (472ms "
                      "against 84-100ms steady state, measured on SmolVLM-256M).")
 ap.add_argument("--seed", type=int, default=42, help="HiViS's --seed default.")
+ap.add_argument("--prompt_style", default="raw", choices=list(PROMPT_STYLES),
+                help="answer_then_describe re-wraps the question as 'Answer "
+                     "this question: ... Then describe the image in detail to "
+                     "justify your answer.', which lengthens the output 6-10x. "
+                     "Most of these benchmarks answer in a handful of tokens, "
+                     "and a per-prompt cost dominates there -- a speedup "
+                     "measured on a 5-token answer says almost nothing about "
+                     "the drafter. Changes the task, so accuracy under it is "
+                     "not comparable with published numbers. omnidocbench has "
+                     "no question to re-wrap and mmmu_history already uses "
+                     "this wording; both ignore the flag.")
 ap.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"],
                 help="bfloat16, matching the AngelSlim side and every arm already "
                      "measured. NOT aligned to HiViS's evaluators, which load "
@@ -124,6 +136,7 @@ ap.add_argument("--naive", action="store_true",
                 help="autoregressive baseline in the same harness (speedup denominator)")
 a = ap.parse_args()
 setup_seed(a.seed)
+set_prompt_style(a.prompt_style)
 DTYPE = getattr(torch, a.dtype)
 
 model = EaModel.from_pretrained(
@@ -318,6 +331,7 @@ if a.out:
             "total_token": a.total_token, "depth": a.depth, "top_k": a.top_k,
             "max_new_tokens": a.max_new_tokens, "naive": a.naive, "temperature": 0.0,
             "dtype": a.dtype, "seed": a.seed, "warmup": a.warmup,
+            "prompt_style": a.prompt_style,
             "max_input_tokens": a.max_input_tokens,
             # `tau` keeps the +1 convention every table under my_angel/ was
             # written against; `mean_accept_length` is hivis/evaluation's.

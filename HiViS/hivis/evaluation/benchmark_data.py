@@ -36,6 +36,57 @@ _ANGELSLIM_OCR_PROMPT = (
     "is comprehensive and well-structured."
 )
 
+# Byte-identical to PROMPT_VARIANTS in tools/vllm_offline_eagle3_vlm_batch.py,
+# so a length measured there and one measured here are the same prompt.
+#
+# Most of these benchmarks answer in a handful of tokens, and that is the regime
+# where a per-prompt cost dominates and no drafter can pay for itself -- a
+# speedup measured on a 5-token answer says almost nothing about the drafter.
+# These restructure the whole prompt rather than appending to it, because
+# appending does not work: SmolVLM-256M answers SHORTER when asked politely for
+# an explanation (textvqa 10.3 -> 5.2 output tokens, measured).
+#
+# Two caveats carried over from that file, both measured there:
+#   describe_first lengthens the output but lets the description displace the
+#   answer -- textvqa kept an answer in only 4/10 samples -- so it is not
+#   scoreable against raw. answer_then_describe exists to fix exactly that.
+_PROMPT_VARIANTS = {
+    "detail_prefix":
+        "Answer the following question in detail, explaining your reasoning: {q}",
+    "cot":
+        "{q}\nLet's think step by step and explain the reasoning before "
+        "giving the answer.",
+    "describe_first":
+        "Describe what you see in the image in detail, then answer this "
+        "question: {q}",
+    "min_words": "{q} Please answer with at least 100 words.",
+    "answer_then_describe":
+        "Answer this question: {q} Then describe the image in detail to "
+        "justify your answer.",
+}
+PROMPT_STYLES = ("raw",) + tuple(_PROMPT_VARIANTS)
+
+_PROMPT_STYLE = "raw"
+
+
+def set_prompt_style(style):
+    """`raw` keeps the dataset's own prompt; the rest re-wrap the question."""
+    global _PROMPT_STYLE
+    if style not in PROMPT_STYLES:
+        raise ValueError("prompt style must be one of %s" % (PROMPT_STYLES,))
+    _PROMPT_STYLE = style
+
+
+def _styled(question, raw_text):
+    """`raw_text` under the raw style, the question re-wrapped otherwise.
+
+    A variant REPLACES whatever lengthening suffix the benchmark carries of its
+    own rather than stacking on top of it.
+    """
+    variant = _PROMPT_VARIANTS.get(_PROMPT_STYLE)
+    return raw_text if variant is None else variant.format(q=question.strip())
+
+
 _IMG_REF_RE = re.compile(r"<image\s*(\d+)\s*>", flags=re.IGNORECASE)
 _OCR_SUFFIX = " Perform an OCR task on the provided image. Please extract the text accurately and provide a detailed explanation of the process. Ensure the response is comprehensive and well-structured."
 
@@ -240,7 +291,7 @@ def _prepare_mmmu(row):
     if options:
         question += "\nOptions: " + " ".join(options)
     images = [row.get(f"image_{index}") for index in used if row.get(f"image_{index}") is not None]
-    return _message(question, len(images)), images
+    return _message(_styled(question, question), len(images)), images
 
 
 def row_message_and_image(dataset, index, dataset_name):
@@ -263,31 +314,37 @@ def row_message_and_image(dataset, index, dataset_name):
         image = row["image_1"]
     elif dataset_name == "ScienceQA":
         choices = " ".join(f"({chr(65 + i)}) {choice}" for i, choice in enumerate(row["choices"]))
-        messages, image = _message(f"{row['question']} {choices}"), row["image"]
+        text = f"{row['question']} {choices}"
+        messages, image = _message(_styled(text, text)), row["image"]
     elif dataset_name == "vqav2":
-        messages = _message(row["question"])
+        messages = _message(_styled(row["question"], row["question"]))
         image = row["image"]
     elif dataset_name == "textvqa":
-        messages = _message(row["question"] + _OCR_SUFFIX)
+        messages = _message(_styled(row["question"], row["question"] + _OCR_SUFFIX))
         image = row["image"]
     elif dataset_name == "mme":
-        messages = _message(row["text"].partition("\n")[0])
+        text = row["text"].partition("\n")[0]
+        messages = _message(_styled(text, text))
         image = row["image_data"]
     elif dataset_name == "mmvet":
-        messages = _message(row["question"].partition("\n")[0])
+        text = row["question"].partition("\n")[0]
+        messages = _message(_styled(text, text))
         image = row["image_data"]
     elif dataset_name == "seedbench":
-        messages, image = _message(row["question"]), row["image"]
+        messages, image = _message(_styled(row["question"], row["question"])), row["image"]
     elif dataset_name == "gqa":
-        messages = _message(row["text"].partition("\n")[0])
+        text = row["text"].partition("\n")[0]
+        messages = _message(_styled(text, text))
         image = row["image_data"]
     elif dataset_name == "ChartQA":
-        messages, image = _message(row["query"]), row["image"]
+        messages, image = _message(_styled(row["query"], row["query"])), row["image"]
     elif dataset_name == "MathVista":
-        messages = _message(row["question"] + "\nPlease answer with an explanation.")
+        messages = _message(_styled(
+            row["question"], row["question"] + "\nPlease answer with an explanation."))
         image = row["decoded_image"]
     elif dataset_name == "DocVQA":
-        messages, image = _message(row["question"] + _OCR_SUFFIX), row["image"]
+        messages, image = _message(
+            _styled(row["question"], row["question"] + _OCR_SUFFIX)), row["image"]
     elif dataset_name == "mmmu":
         messages, image = _prepare_mmmu(row)
     else:
