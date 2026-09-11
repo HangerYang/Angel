@@ -38,12 +38,13 @@ OUT=${OUT:-/home/hyang/Angel/my_angel/smolvlm_sweep}
 GPU=${GPU:-0}
 N=${N:-80}
 
-# Eleven of the thirteen names supported_benchmarks() reports.
+# Ten of the thirteen names supported_benchmarks() reports. Excluded:
+#   ChartQA   cannot be run here
 #   gqa       needs eval_data/llava_v1_5_mix665k/images/gqa/images, absent here
 #   seedbench benchmark_data.py reads row["question"]; the jsonl field is "text"
-# Four of the eleven read images from directories git does not track and are
-# therefore NOT portable to another machine: mme, mmvet, textvqa (and gqa).
-BENCHES=${BENCHES:-"textvqa ScienceQA vqav2 mme mmvet MathVista ChartQA mmmu DocVQA mmmu_history omnidocbench"}
+# Three of the ten read images from directories git does not track and are
+# therefore NOT portable to another machine: mme, mmvet, textvqa.
+BENCHES=${BENCHES:-"textvqa ScienceQA vqav2 mme mmvet MathVista mmmu DocVQA mmmu_history omnidocbench"}
 
 # tag|draft_method|checkpoint|extra flags
 # Ordered cheapest first so a short run still covers the important arms.
