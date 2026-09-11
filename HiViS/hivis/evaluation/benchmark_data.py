@@ -59,6 +59,13 @@ def _load_mmmu(sample_count):
     )
 
 
+# Every loader below writes a MACHINE-LOCAL absolute image path into the
+# dataset, and datasets' map fingerprint does not reliably capture the
+# `image_root` a lambda closes over. Two checkouts with different image roots
+# can therefore hash the same and the second one silently reads the first's
+# cached rows -- which surfaces much later as a FileNotFoundError naming a
+# directory that appears nowhere in this repo. These maps are microseconds of
+# string joins; never cache them.
 def _load_gqa(sample_count):
     records = Dataset.from_list(
         _read_jsonl("llava_gqa_testdev_balanced.jsonl")
@@ -68,7 +75,8 @@ def _load_gqa(sample_count):
     )
     image_root = Path(__file__).resolve().parents[2] / "eval_data/llava_v1_5_mix665k/images/gqa/images"
     records = records.map(
-        lambda row: {"image_data": str(image_root / row["image"])}
+        lambda row: {"image_data": str(image_root / row["image"])},
+        load_from_cache_file=False,
     )
     return records.cast_column("image_data", Image())
 
@@ -77,7 +85,10 @@ def _load_textvqa(sample_count):
     with (_DATA_DIR / "TextVQA_0.5.1_test.json").open(encoding="utf-8") as file:
         records = Dataset.from_list(json.load(file)["data"][:sample_count])
     image_root = Path(__file__).resolve().parents[2] / "eval_data/llava_v1_5_mix665k/images/textvqa/test_images"
-    records = records.map(lambda row: {"image": str(image_root / f"{row['image_id']}.jpg")})
+    records = records.map(
+        lambda row: {"image": str(image_root / f"{row['image_id']}.jpg")},
+        load_from_cache_file=False,
+    )
     return records.cast_column("image", Image())
 
 
@@ -88,7 +99,8 @@ def _load_mme(sample_count):
     )
     image_root = _DATA_DIR / "MME_Benchmark_release_version/MME_Benchmark"
     records = records.map(
-        lambda row: {"image_data": str(image_root / row["image"])}
+        lambda row: {"image_data": str(image_root / row["image"])},
+        load_from_cache_file=False,
     )
     return records.cast_column("image_data", Image())
 
@@ -108,7 +120,8 @@ def _load_mmvet(sample_count):
 
     image_root = _DATA_DIR / "mm-vet/images"
     records = records.map(
-        lambda row: {"image_data": str(image_root / row["imagename"])}
+        lambda row: {"image_data": str(image_root / row["imagename"])},
+        load_from_cache_file=False,
     )
     return records.cast_column("image_data", Image())
 
@@ -127,7 +140,8 @@ def _load_seedbench(sample_count):
         range(min(sample_count, len(dataset)))
     )
     dataset = dataset.map(
-        lambda row: {"image": str(image_root / Path(row["image"]).name)}
+        lambda row: {"image": str(image_root / Path(row["image"]).name)},
+        load_from_cache_file=False,
     )
     return dataset.cast_column("image", Image())
 
